@@ -90,8 +90,86 @@ def check_placement(board, design):
 
     issues += check_ep_via_farms(board, design)
     pi_issues, pi_warnings = check_plane_integrity(board)
-    issues += pi_issues
-    return issues, pi_warnings
+    h_issues, h_warnings = check_heights(board, design)
+    return issues + pi_issues + h_issues, pi_warnings + h_warnings
+
+
+# component height defaults by footprint hint (mm), specific before generic
+PKG_HEIGHTS = [
+    ("XAL6060", 6.36), ("CP_Elec_8x10", 10.5), ("CP_Elec", 11.0),
+    ("D_7343", 3.1), ("7343", 3.1), ("PinSocket", 8.7), ("PinHeader", 9.0),
+    ("TerminalBlock", 12.0), ("USB_C", 3.5), ("SOT-223", 1.8),
+    ("SOT-23", 1.2), ("SOT-89", 1.6), ("PowerPAK", 1.1), ("HSOP", 1.7),
+    ("TSSOP", 1.2), ("SOIC", 1.75), ("SO-8", 1.75), ("LQFP", 1.6),
+    ("QFN", 1.0), ("DFN", 0.8), ("SOD-123", 1.2), ("SOD-323", 1.0),
+    ("LED", 0.9), ("0402", 0.5), ("0603", 0.7), ("0805", 0.85),
+    ("1206", 0.95), ("1210", 1.1), ("2010", 0.7), ("2512", 0.7),
+]
+
+
+def check_heights(board, design):
+    """Mechanical ceiling check — courtyard DRC is 2D-blind. The netlist
+    declares "height_zones": [{x,y,w,h,max_height, side: "F"|"B"|"both",
+    exempt: [refs]}] in board-relative mm (a HAT's underside clearance to
+    the Pi, an enclosure lid, a heatsink shadow). Part height comes from
+    the component's "height" key, else the package table; a part inside a
+    zone with UNKNOWN height is a warning ("declare it"), a part TALLER
+    than the ceiling is a blocker. Returns (issues, warnings)."""
+    zones = design.get("height_zones") or []
+    if not zones:
+        return [], []
+    issues, warnings = [], []
+    to = pcbnew.ToMM
+    bb = board.GetBoardEdgesBoundingBox()
+    ox, oy = to(bb.GetLeft()), to(bb.GetTop())
+    comps = {c["ref"]: c for c in design.get("components", [])}
+
+    def part_height(c):
+        if c.get("height") is not None:
+            return float(c["height"])
+        fp_name = c.get("footprint", "")
+        for hint, h in PKG_HEIGHTS:
+            if hint.lower() in fp_name.lower():
+                return h
+        return None
+
+    for fp in board.GetFootprints():
+        ref = fp.GetReference()
+        c = comps.get(ref)
+        if c is None:
+            continue                       # mounting holes etc.
+        side = "B" if fp.GetLayer() == pcbnew.B_Cu else "F"
+        try:
+            cy = fp.GetCourtyard(pcbnew.F_CrtYd if side == "F"
+                                 else pcbnew.B_CrtYd)
+            fbb = (cy.BBox() if cy and cy.OutlineCount() > 0
+                   else fp.GetBoundingBox())
+        except Exception:
+            fbb = fp.GetBoundingBox()
+        fx0, fy0 = to(fbb.GetLeft()) - ox, to(fbb.GetTop()) - oy
+        fx1, fy1 = to(fbb.GetRight()) - ox, to(fbb.GetBottom()) - oy
+        for z in zones:
+            zside = z.get("side", "F")
+            if zside != "both" and zside != side:
+                continue
+            if ref in (z.get("exempt") or []):
+                continue
+            if (fx1 < z["x"] or fx0 > z["x"] + z["w"]
+                    or fy1 < z["y"] or fy0 > z["y"] + z["h"]):
+                continue
+            lim = float(z["max_height"])
+            h = part_height(c)
+            zname = z.get("name", f"height zone @({z['x']},{z['y']})")
+            if h is None:
+                warnings.append(
+                    f"{ref}: inside {zname} (ceiling {lim} mm) but its "
+                    f"height is unknown — declare \"height\" on the part")
+            elif h > lim + 1e-6:
+                issues.append(
+                    f"{ref}: {h} mm tall inside {zname} with a {lim} mm "
+                    f"ceiling ({side} side) — move it out, use a lower "
+                    f"package, or exempt it if it IS the standoff")
+    return issues, warnings
 
 
 def check_plane_integrity(board):

@@ -99,7 +99,17 @@ The single source of truth. Pad-level, hand-authored or generated:
      "path":[["xy",6.4,24.9],["xy",6.4,2.28]]}
   ],
 
-  "antenna_keepout": {"edge":"top","depth":6}   // optional no-fill rule area
+  "antenna_keepout": {"edge":"top","depth":6},  // optional no-fill rule area
+
+  // MECHANICAL CEILINGS — courtyard DRC is 2D-blind. Board-relative mm;
+  // side "F"|"B"|"both". Part height: component "height" key, else a
+  // package table (XAL6060 6.36, CP_Elec 10.5+, PinSocket 8.7, TSSOP 1.2,
+  // 0603 0.7, ...). Taller-than-ceiling = G3 blocker; unknown height
+  // inside a zone = warning. "exempt" for the part that IS the standoff:
+  "height_zones": [
+    {"name":"clearance to Pi", "side":"B", "x":0, "y":0, "w":65, "h":56.5,
+     "max_height":4.0, "exempt":["J5"]}
+  ]
 }
 ```
 

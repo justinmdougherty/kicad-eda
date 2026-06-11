@@ -4,6 +4,9 @@
   "class": 2,
   "board": {"w": 65.0, "h": 56.5, "auto_y": 21.0, "auto_x": 8.5, "auto_w": 23.0, "auto_h": 25.0,
             "auto_b": {"x": 30.0, "y": 26.0, "w": 25.0, "h": 22.0}},
+  "height_zones": [
+    {"name": "clearance to Pi top side", "side": "B", "x": 0, "y": 0, "w": 65.0, "h": 56.5, "max_height": 4.0, "exempt": ["J5"]}
+  ],
   "mounting_holes": {
     "footprint": "MountingHole:MountingHole_2.7mm_M2.5",
     "positions": [[3.5, 3.5], [61.5, 3.5], [3.5, 52.5], [61.5, 52.5]]
