@@ -227,8 +227,13 @@ safe on a finished board, then re-run DRC and re-export:
    (the harness does this automatically for preroute/plane nets).
 3. **DSN plane abstraction lies.** KiCad exports zones as full-rect polygons;
    Freerouting cannot see fill voids, so plane-connected nets can come back
-   with orphan islands. The G4 healer links them; for chronic cases add a
-   netlist preroute stub through the corridor.
+   with orphan islands. Division of labor: G3 statically catches planes that
+   are ALREADY fractured (blocker) or pinched below 1.8 mm (warning) — but
+   the worst case (HAT VBUS_PD) was created by the ROUTER's own via antipads
+   sealing a healthy ≥3 mm corridor, which no static pre-route check can
+   see. That class belongs to the G4 healer (bridge / island-link / BFS maze
+   route), which the `negative_g4_heal` fixture proves on every regression
+   run. For chronic nets, author a corridor preroute.
 4. **Freerouting 2.x is broken headless** (phones home, never routes; also
    re-splits CLI paths on spaces). The server routes from a temp dir and pins
    1.9.0.

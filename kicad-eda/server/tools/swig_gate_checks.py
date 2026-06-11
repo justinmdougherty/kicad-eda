@@ -209,7 +209,10 @@ def check_plane_integrity(board):
             # stitching vias — only the INNER planes ride the DSN export
             continue
         try:
-            polys = z.GetFilledPolysList(layer)
+            polys = pcbnew.SHAPE_POLY_SET(z.GetFilledPolysList(layer))
+            # KiCad stores fills FRACTURED (holes slit into the outline, so
+            # HoleCount()==0) — unfracture or the pinch deflate sees no voids
+            polys.Unfracture()
         except Exception:
             continue
         n_out = polys.OutlineCount()

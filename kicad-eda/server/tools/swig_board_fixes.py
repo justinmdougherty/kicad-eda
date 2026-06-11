@@ -44,6 +44,16 @@ def _dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def _min_clearance(board):
+    """The board's real minimum copper clearance (mm) — margins derived from
+    an assumed 0.15 mm fail DRC on a 0.2 mm-rule project."""
+    try:
+        return max(_to(board.GetDesignSettings().GetSmallestClearanceValue()),
+                   0.15)
+    except Exception:
+        return 0.2
+
+
 def _via_w(v):
     """PCB_VIA pad width. KiCad 10's padstack API asserts (and, headless on
     Windows, WEDGES the process in a wx dialog) when GetWidth() is called
@@ -158,7 +168,8 @@ def heal_micro_gaps(board, drc):
                              pcbnew.F_Cu)
                 width = min((w for w in (a[3], b[3]) if w), default=0.25)
                 if _clear_path(board, nc, a[:2], b[:2],
-                               width / 2 + 0.2, layer):
+                               width / 2 + _min_clearance(board) + 0.05,
+                               layer):
                     t = pcbnew.PCB_TRACK(board)
                     t.SetStart(pcbnew.VECTOR2I(_mm(a[0]), _mm(a[1])))
                     t.SetEnd(pcbnew.VECTOR2I(_mm(b[0]), _mm(b[1])))
@@ -422,7 +433,7 @@ def _try_link(board, net, a, b, layer, width=0.3, bfs=False):
     """Lay a same-net link from a to b on layer — straight, L-shaped, or
     (when bfs=True) maze-routed. Returns True when tracks were added."""
     nc = net.GetNetCode()
-    keep = width / 2 + 0.17                 # 0.15 clearance + a hair
+    keep = width / 2 + _min_clearance(board) + 0.05
     path = None
     for cand in ((a, b),
                  (a, (a[0], b[1]), b),

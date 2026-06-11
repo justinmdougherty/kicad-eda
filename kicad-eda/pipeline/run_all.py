@@ -53,6 +53,96 @@ def _reset_negative_fixture() -> None:
     (dst / "netlist.json").write_text(json.dumps(d, indent=2), encoding="utf-8")
 
 
+def _build_g3_fixture() -> str:
+    """negative_g3: derived from cp2102n — a USB-C FIXED mid-board with its
+    mouth facing the interior (G3 blocker, non-auto) plus a 2x20 THT socket
+    wall across the middle that pinches the +3V3 plane between a fixed cap
+    below and the auto field above (G3 plane warning). Because the mouth
+    blocker stops the run AT G3, this fixture never routes — it proves
+    detection, cheaply, every run."""
+    src = HERE / "cp2102n_uart" / "netlist.json"
+    dst = HERE / "negative_g3"
+    dst.mkdir(exist_ok=True)
+    d = json.loads(src.read_text(encoding="utf-8"))
+    d["title"] = "NEGATIVE TEST - inward connector + plane pinch wall"
+    d["name"] = "negative_g3"
+    d["board"] = {"w": 54.0, "h": 52.0,
+                  "auto_x": 2.0, "auto_y": 2.0, "auto_w": 34.0, "auto_h": 28.0}
+    for c in d["components"]:
+        if c["ref"] == "J1":               # USB-C: mid-board, mouth inward
+            c.update({"x": 45.0, "y": 14.0, "rot": 270})
+        if c["ref"] == "C2":               # +3V3 cap stranded below the wall
+            c.update({"x": 10.0, "y": 46.0})
+    # the wall: pad antipads span ~51 mm, leaving ~1.2 mm fill corridors at
+    # each board edge — under the 1.8 mm pinch radius, so G3 must warn
+    d["components"].append({
+        "ref": "J9", "lib_id": "Connector_Generic:Conn_02x20_Odd_Even",
+        "value": "WALL",
+        "footprint": "Connector_PinSocket_2.54mm:PinSocket_2x20_P2.54mm_Vertical",
+        "x": 27.0, "y": 34.0, "rot": 90, "interior": True})
+    d.setdefault("no_connect", [])
+    d["no_connect"] += [["J9", str(i)] for i in range(1, 41)]
+    (dst / "netlist.json").write_text(json.dumps(d, indent=2),
+                                      encoding="utf-8")
+    return str(dst / "netlist.json")
+
+
+def _fixture_g3() -> tuple[str, dict]:
+    """Run the G3 fixture and assert it fails AT G3 with both findings."""
+    netlist = _build_g3_fixture()
+    rep = rp.run(netlist, 56, 40)
+    g3 = next((g for g in rep.get("gates", []) if g["gate"] == "G3"), {})
+    blockers = " | ".join(g3.get("blockers", []))
+    warnings = " | ".join(g3.get("warnings", []))
+    ok = (not rep.get("PASS")
+          and "mating face" in blockers
+          and "plane on In2.Cu" in warnings)
+    return ("negative_g3", {
+        "status": "PASS" if ok else "FAIL",
+        "gate": "G3*",                     # expected-fail fixture
+        "detail": ("inward-mouth blocker + plane-pinch warning detected"
+                   if ok else f"blockers=[{blockers[:120]}] "
+                              f"warnings=[{warnings[:120]}]")})
+
+
+def _fixture_g4_heal() -> tuple[str, dict]:
+    """Cut the longest signal track on a COPY of the routed lm358 board,
+    then assert the G4 healer (swig_board_fixes) restores DRC to 0
+    unconnected — proves the heal path without invoking the router."""
+    import shutil
+    import subprocess
+    src = HERE / "lm358_buffer"
+    dst = HERE / "negative_g4_heal"
+    dst.mkdir(exist_ok=True)
+    board = dst / "netlist.kicad_pcb"
+    if not (src / "netlist.kicad_pcb").is_file():
+        return ("negative_g4_heal", {"status": "SKIP",
+                                     "detail": "no routed lm358 board"})
+    shutil.copy(src / "netlist.kicad_pcb", board)
+    for ext in (".kicad_pro", ".json"):
+        if (src / f"netlist{ext}").is_file():
+            shutil.copy(src / f"netlist{ext}", dst / f"netlist{ext}")
+    kpy = rp.k._kicad_python()
+    cut = subprocess.run(
+        [kpy, str(rp.SERVER / "tools" / "swig_cut_track.py"), str(board)],
+        capture_output=True, text=True, timeout=120)
+    broken = rp._drc(str(board))
+    if broken["unconnected"] < 1:
+        return ("negative_g4_heal", {
+            "status": "FAIL", "detail": f"cut did not break the board "
+            f"({cut.stdout.strip()[:80]})"})
+    fixes = rp._board_fix(str(board), str(dst / "netlist.json"), "heal")
+    healed = rp._drc(str(board))
+    ok = healed["unconnected"] == 0 and healed["errors"] == 0 and fixes
+    return ("negative_g4_heal", {
+        "status": "PASS" if ok else "FAIL",
+        "gate": "G4*",
+        "detail": (f"cut -> {broken['unconnected']} unconnected -> healed "
+                   f"({len(fixes)} fix(es)) -> {healed['unconnected']}"
+                   if ok else f"unconn {broken['unconnected']} -> "
+                              f"{healed['unconnected']}, fixes={fixes[:2]}")})
+
+
 def main() -> int:
     _reset_negative_fixture()
     results = []
@@ -77,12 +167,20 @@ def main() -> int:
                               for r in rep.get("remediation", [])),
         }))
 
+    # expected-fail fixtures: each must FAIL at its gate with the right
+    # finding (status PASS = the gate caught it)
+    for name, m in (_fixture_g3(), _fixture_g4_heal()):
+        results.append((name, m.pop("status"), m))
+
     print("\n=== REGRESSION MATRIX (gated) ===")
     for folder, status, m in results:
-        blocked = "" if m.get("gate") == "-" else f"  BLOCKED AT {m['gate']}"
+        blocked = ("" if m.get("gate") in ("-", None)
+                   else f"  AT {m['gate']}")
         fixed = f" fixed={m['remediated']}" if m.get("remediated") else ""
+        detail = f"  {m['detail']}" if m.get("detail") else ""
         print(f"  {status:5} {folder:18} erc={m.get('erc')} drc={m.get('drc_err')} "
-              f"unconn={m.get('unconn')} scale={m.get('scale')}{fixed}{blocked}")
+              f"unconn={m.get('unconn')} scale={m.get('scale')}"
+              f"{fixed}{blocked}{detail}")
     allpass = all(s == "PASS" for _, s, _ in results)
     print(f"\nALL PASS: {allpass}")
     print(json.dumps({"all_pass": allpass,
