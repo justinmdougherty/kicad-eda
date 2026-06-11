@@ -6,10 +6,10 @@
   "version": "0.3.0",
   "author": {
     "name": "Justin Dougherty",
-    "url": "https://github.com/dougherty-labs"
+    "url": "https://github.com/justinmdougherty"
   },
-  "homepage": "https://github.com/dougherty-labs/kicad-eda",
-  "repository": "https://github.com/dougherty-labs/kicad-eda",
+  "homepage": "https://github.com/justinmdougherty/kicad-eda",
+  "repository": "https://github.com/justinmdougherty/kicad-eda",
   "license": "MIT",
   "keywords": ["kicad", "pcb", "eda", "schematic", "gerber", "autorouting", "hardware", "electronics"],
   "mcpServers": "./.mcp.json",
