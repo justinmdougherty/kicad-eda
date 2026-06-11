@@ -89,6 +89,26 @@ def _board_fix(pcb: str, netlist: str, mode: str) -> list:
     return []
 
 
+def _emc_stitch(pcb: str, emc: dict) -> dict:
+    """Run the EMC ground-stitching pass (perimeter via fence + interior
+    grid) on the routed board under KiCad's Python."""
+    kpy = k._kicad_python()
+    script = SERVER / "tools" / "emc_stitch.py"
+    if not kpy or not script.is_file():
+        return {"ok": False, "reason": "emc_stitch unavailable"}
+    r = subprocess.run(
+        [kpy, str(script), pcb, str(emc.get("max_freq_hz", 0)),
+         "fence" if emc.get("fence_only") else "grid"],
+        capture_output=True, text=True, timeout=600)
+    for line in reversed(r.stdout.strip().splitlines()):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except Exception:
+                break
+    return {"ok": False, "reason": r.stderr[-300:]}
+
+
 def _courtyard_drc(pcb: str) -> dict:
     """Placement-stage DRC: count only courtyard violations (routing-dependent
     types are G4's job and would false-flag an unrouted board)."""
@@ -263,6 +283,30 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
         report["autoroute"] = route_rep
         wc = _gate_check("routed", pcb, netlist)
         g4 = gates.g4_layout(route_rep, drc_rep, wc["issues"], wc["warnings"])
+
+    # ---- EMC post-pass (opt-in via netlist "emc": {"stitch": true, ...}):
+    # perimeter GND via fence + interior stitching grid (Ott/Montrose,
+    # lambda/20 pitch from max_freq_hz), then re-DRC — the pass is
+    # clearance-aware but the gate trusts measurements, not intentions.
+    emc = design.get("emc") or {}
+    if g4["passed"] and emc.get("stitch"):
+        er = _emc_stitch(pcb, emc)
+        report["emc"] = er
+        notes = []
+        if er.get("ok"):
+            notes.append(f"EMC stitching: {er.get('vias_added')} GND vias "
+                         f"(fence {er.get('fence')}, interior "
+                         f"{er.get('interior')}, pitch {er.get('pitch_mm')} mm)")
+            drc_rep = _drc(pcb)
+            report["drc"] = drc_rep
+        else:
+            notes.append(f"EMC stitching FAILED: {er.get('reason')}")
+        if emc.get("teardrops"):
+            notes.append("teardrops requested but KiCad's teardrop generator "
+                         "has no headless API — generate in the GUI "
+                         "(Edit > Edit Teardrops) before fab if required")
+        g4 = gates.g4_layout(route_rep, drc_rep, wc["issues"],
+                             wc["warnings"] + notes)
     report["gates"].append(g4)
     if not g4["passed"]:
         return _halt(report)

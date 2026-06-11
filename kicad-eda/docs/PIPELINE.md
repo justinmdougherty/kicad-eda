@@ -106,6 +106,13 @@ The single source of truth. Pad-level, hand-authored or generated:
 
   "antenna_keepout": {"edge":"top","depth":6},  // optional no-fill rule area
 
+  // EMC POST-PASS (opt-in, runs after G4 passes, then re-DRCs):
+  // perimeter GND via fence + interior stitching grid (Ott/Montrose).
+  // Pitch = guided lambda/20 from max_freq_hz, else a fixed 3 mm.
+  // NOTE: "teardrops" only emits a reminder — KiCad's teardrop generator
+  // has no headless API; generate in the GUI before fab if required.
+  "emc": {"stitch": true, "max_freq_hz": 0, "fence_only": false},
+
   // MECHANICAL CEILINGS — courtyard DRC is 2D-blind. Board-relative mm;
   // side "F"|"B"|"both". Part height: component "height" key, else a
   // package table (XAL6060 6.36, CP_Elec 10.5+, PinSocket 8.7, TSSOP 1.2,
@@ -230,7 +237,10 @@ safe on a finished board, then re-run DRC and re-export:
 9. **Two-sided placement:** PTH obstacles (THT pads, thermal-via farms) exist
    on BOTH faces — carve `auto_b` away from them or G3 reports
    "PTH inside courtyard".
-10. **HAT/fixed-board pattern:** fixed connector coordinates + `auto_x/y/w/h`
+10. **No headless teardrops.** KiCad 10's teardrop generator is not exposed
+    to SWIG at all — `"emc": {"teardrops": true}` can only remind you to
+    generate them in the GUI (Edit → Edit Teardrops) before fab.
+11. **HAT/fixed-board pattern:** fixed connector coordinates + `auto_x/y/w/h`
     free field + hand-placed power chain + preroutes is the proven recipe for
     a dense fixed-outline board.
 
