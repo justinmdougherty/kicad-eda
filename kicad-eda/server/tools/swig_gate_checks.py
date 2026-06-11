@@ -498,6 +498,82 @@ def check_routed_widths(board, pro_path, design=None):
     return issues
 
 
+def check_diff_pairs(board, design):
+    """Differential pairs must be ROUTED as pairs. Declared in net_specs:
+    "USB_DP": {"diff_pair": "USB_DM", "dp_tol_mm": 1.5, "dp_gap_mm": 1.0}.
+    Measures (a) intra-pair length mismatch and (b) the fraction of each
+    net's length that runs coupled (within dp_gap of its partner).
+
+    WARNING-grade by design: Freerouting cannot pair-route, so a blocker
+    would make every diff-pair board unbuildable headless — but a pair
+    routed as two independent meanders must never pass silently. For real
+    high-speed pairs, preroute them as a pair and let these numbers verify.
+    Returns warnings list."""
+    import math
+    warnings = []
+    to = pcbnew.ToMM
+    specs = design.get("net_specs", {})
+    seen = set()
+    for net_a, s in specs.items():
+        net_b = s.get("diff_pair")
+        if not net_b or tuple(sorted((net_a, net_b))) in seen:
+            continue
+        seen.add(tuple(sorted((net_a, net_b))))
+        tol = float(s.get("dp_tol_mm", 1.5))
+        gap = float(s.get("dp_gap_mm", 1.0))
+        segs = {}
+        for name in (net_a, net_b):
+            segs[name] = [t for t in board.GetTracks()
+                          if t.GetClass() == "PCB_TRACK"
+                          and t.GetNetname() == name]
+        if not segs[net_a] or not segs[net_b]:
+            continue                      # unrouted / plane-carried
+
+        def length(name):
+            return sum(to(t.GetLength()) for t in segs[name])
+
+        la, lb = length(net_a), length(net_b)
+        if abs(la - lb) > tol:
+            warnings.append(
+                f"diff pair {net_a}/{net_b}: length mismatch "
+                f"{abs(la - lb):.2f} mm ({la:.2f} vs {lb:.2f}) exceeds "
+                f"{tol} mm — add serpentine or preroute the pair")
+
+        def seg_pts(t):
+            s_, e_ = t.GetStart(), t.GetEnd()
+            return ((to(s_.x), to(s_.y)), (to(e_.x), to(e_.y)))
+
+        def dist_pt_seg(p, a, b):
+            ax, ay = a
+            vx, vy = b[0] - ax, b[1] - ay
+            L2 = vx * vx + vy * vy
+            if L2 < 1e-12:
+                return math.hypot(p[0] - ax, p[1] - ay)
+            t_ = max(0.0, min(1.0, ((p[0] - ax) * vx + (p[1] - ay) * vy) / L2))
+            return math.hypot(p[0] - (ax + t_ * vx), p[1] - (ay + t_ * vy))
+
+        other = [seg_pts(t) for t in segs[net_b]]
+        coupled = total = 0.0
+        for t in segs[net_a]:
+            (x0, y0), (x1, y1) = seg_pts(t)
+            ln = math.hypot(x1 - x0, y1 - y0)
+            if ln < 1e-6:
+                continue
+            total += ln
+            mid = ((x0 + x1) / 2, (y0 + y1) / 2)
+            d = min((dist_pt_seg(mid, a, b) for a, b in other), default=1e9)
+            if d <= gap + 0.2:            # gap is edge-ish; small slack
+                coupled += ln
+        frac = coupled / total if total else 0.0
+        if frac < 0.7:
+            warnings.append(
+                f"diff pair {net_a}/{net_b}: only {frac:.0%} of the routed "
+                f"length runs coupled (within {gap} mm of its partner) — "
+                f"the pair is routed as two independent traces; preroute it "
+                f"as a pair for impedance/EMI integrity")
+    return warnings
+
+
 def check_via_ampacity(board, design):
     """High-current nets must not bottleneck at a layer transition: the via
     barrels on the net (taken together) must carry the net's specified
@@ -583,6 +659,7 @@ def main():
         pro = pcb.rsplit(".", 1)[0] + ".kicad_pro"
         issues = check_routed_widths(board, pro, design)
         issues += check_via_ampacity(board, design)
+        warnings += check_diff_pairs(board, design)
     else:
         issues = [f"unknown mode {mode}"]
     print(json.dumps({"issues": issues, "warnings": warnings}))

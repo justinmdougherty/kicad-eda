@@ -247,8 +247,8 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     # gate re-tested — re-routing is never required for them.
     drc_rep = _drc(pcb)
     report["drc"] = drc_rep
-    widths = _gate_check("routed", pcb, netlist)["issues"]
-    g4 = gates.g4_layout(route_rep, drc_rep, widths)
+    wc = _gate_check("routed", pcb, netlist)
+    g4 = gates.g4_layout(route_rep, drc_rep, wc["issues"], wc["warnings"])
     for rnd in (1, 2):
         if g4["passed"]:
             break
@@ -261,8 +261,8 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
         report["drc"] = drc_rep
         route_rep = {**route_rep, "unconnected": drc_rep["unconnected"]}
         report["autoroute"] = route_rep
-        widths = _gate_check("routed", pcb, netlist)["issues"]
-        g4 = gates.g4_layout(route_rep, drc_rep, widths)
+        wc = _gate_check("routed", pcb, netlist)
+        g4 = gates.g4_layout(route_rep, drc_rep, wc["issues"], wc["warnings"])
     report["gates"].append(g4)
     if not g4["passed"]:
         return _halt(report)

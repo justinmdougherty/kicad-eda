@@ -82,7 +82,12 @@ The single source of truth. Pad-level, hand-authored or generated:
   // via size) and the G4 ampacity checks:
   "net_specs": {
     "5V_PI":  {"voltage":5.0, "current":4.0},
-    "RF_OUT": {"impedance":50}          // RF: controlled-impedance class
+    "RF_OUT": {"impedance":50},         // RF: controlled-impedance class
+    // diff pairs: G4 measures intra-pair length mismatch (dp_tol_mm,
+    // default 1.5) and the coupled fraction (within dp_gap_mm, default
+    // 1.0; <70% flags). WARNING-grade: Freerouting cannot pair-route —
+    // preroute real high-speed pairs as a pair and let the numbers verify.
+    "USB_DP": {"diff_pair":"USB_DM"}
   },
 
   // PREROUTES — designer-authored fat copper laid before the router runs.

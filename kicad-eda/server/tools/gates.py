@@ -124,8 +124,9 @@ def g3_placement(board_rep: dict, courtyard_drc: dict,
                     "pre-route hard gate", blockers, warnings, tasks)
 
 
-def g4_layout(route_rep: dict, drc: dict, width_issues: list) -> dict:
-    blockers, warnings, tasks = [], [], []
+def g4_layout(route_rep: dict, drc: dict, width_issues: list,
+              check_warnings: list | None = None) -> dict:
+    blockers, warnings, tasks = [], list(check_warnings or []), []
     unc = route_rep.get("unconnected")
     if unc is None:
         why = route_rep.get("error", "router produced no result")
