@@ -48,7 +48,13 @@ def _world_mouth(fp):
     return ((0.0, 1.0 if dy > 0 else -1.0), bb)
 
 
-def check_placement(board, design):
+def check_placement(board, design, routed=False):
+    """routed=True re-validates a cached ROUTED board: plane integrity is
+    skipped — it is a PRE-route check (its premise is "the router will trust
+    the DSN plane rectangle and return the net broken"); on a routed board
+    the plane is legitimately carved by via antipads and any stranded
+    islands are already tied by healed tracks, proven by DRC unconnected=0
+    at G4. Every other placement check still applies to the artifact."""
     issues = []
     to = pcbnew.ToMM
     bb = board.GetBoardEdgesBoundingBox()
@@ -89,7 +95,7 @@ def check_placement(board, design):
                           "no-fill rule area exists on the board")
 
     issues += check_ep_via_farms(board, design)
-    pi_issues, pi_warnings = check_plane_integrity(board)
+    pi_issues, pi_warnings = ([], []) if routed else check_plane_integrity(board)
     h_issues, h_warnings = check_heights(board, design)
     return issues + pi_issues + h_issues, pi_warnings + h_warnings
 
@@ -658,6 +664,8 @@ def main():
     warnings = []
     if mode == "placement":
         issues, warnings = check_placement(board, design)
+    elif mode == "placement_routed":
+        issues, warnings = check_placement(board, design, routed=True)
     elif mode == "routed":
         pro = pcb.rsplit(".", 1)[0] + ".kicad_pro"
         issues = check_routed_widths(board, pro, design)

@@ -267,7 +267,10 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
         report["route_cache"] = "hit"
         board_rep = cached.get("board_rep") or {"ok": True}
         cy = _courtyard_drc(pcb)
-        pl = _gate_check("placement", pcb, netlist)
+        # the cached artifact is ROUTED — re-validate with the routed variant
+        # (plane integrity is a pre-route check; G4's DRC re-run below proves
+        # the net connectivity the plane check exists to predict)
+        pl = _gate_check("placement_routed", pcb, netlist)
         g3 = gates.g3_placement(board_rep, cy, pl["issues"], pl["warnings"])
         route_rep = {"cached": True,
                      "pack_scale": cached.get("pack_scale"),
@@ -297,6 +300,14 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
                              f"the fixed board -> restored routed board at "
                              f"pack_scale {scale}"]})
             break
+        if rb.get("ok") and trep.get("ep_via_parts"):
+            # self-remediate the G3 EP check: footprints without a
+            # ...ThermalVias variant get an IPC-7093 via farm dropped
+            # under the EP before the placement review runs
+            farm = _board_fix(pcb, netlist, "ep_vias")
+            if farm:
+                report.setdefault("remediation", []).append(
+                    {"gate": "G3", "round": attempt, "applied": farm})
         cy = _courtyard_drc(pcb) if rb.get("ok") else {"courtyard_violations": 0}
         pl = (_gate_check("placement", pcb, netlist) if rb.get("ok")
               else {"issues": [], "warnings": []})
