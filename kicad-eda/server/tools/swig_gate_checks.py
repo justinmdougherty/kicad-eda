@@ -87,6 +87,50 @@ def check_placement(board, design):
         if not ok:
             issues.append("antenna_keepout requested in the netlist but no "
                           "no-fill rule area exists on the board")
+
+    issues += check_ep_via_farms(board, design)
+    return issues
+
+
+def check_ep_via_farms(board, design):
+    """Exposed-pad parts that thermal_check flags as real dissipators must
+    have a thermal via farm under the EP — either built into the footprint
+    (PTH pads, e.g. the Texas ...ThermalVias variants) or added as board
+    vias. IPC-7093 practice; bare EP copper alone cannot move the watts."""
+    import thermal_check
+    issues = []
+    refs = thermal_check.check(design).get("ep_via_parts", [])
+    if not refs:
+        return issues
+    need = int((design.get("thermal") or {}).get("ep_vias_min", 4)) \
+        if isinstance(design.get("thermal"), dict) else 4
+    to = pcbnew.ToMM
+    for ref in refs:
+        fp = board.FindFootprintByReference(ref)
+        if fp is None:
+            continue
+        pads = list(fp.Pads())
+        if not pads:
+            continue
+        ep = max(pads, key=lambda p: p.GetBoundingBox().GetWidth()
+                 * p.GetBoundingBox().GetHeight())
+        bb = ep.GetBoundingBox()
+        n = 0
+        for p in pads:                       # footprint's own via-holes
+            try:
+                drilled = to(p.GetDrillSize().x) > 0
+            except Exception:
+                drilled = False
+            if drilled and bb.Contains(p.GetPosition()):
+                n += 1
+        for t in board.GetTracks():          # board-level vias under the EP
+            if t.GetClass() == "PCB_VIA" and bb.Contains(t.GetPosition()):
+                n += 1
+        if n < need:
+            issues.append(
+                f"{ref}: dissipating exposed-pad part has only {n} thermal "
+                f"via(s) under the EP (needs >= {need}, IPC-7093) — use a "
+                f"...ThermalVias footprint variant or add stitching vias")
     return issues
 
 

@@ -48,8 +48,17 @@ def g1_requirements(lint_rep: dict, design: dict) -> dict:
                     blockers, warnings)
 
 
-def g2_schematic(sch_rep: dict, design_rep: dict) -> dict:
+def g2_schematic(sch_rep: dict, design_rep: dict,
+                 thermal_rep: dict | None = None) -> dict:
     blockers, warnings, tasks = [], [], []
+    for b in (thermal_rep or {}).get("blockers", []):
+        blockers.append(f"thermal: {b}")
+        # needs design intent: a hot part means re-spec, re-package, or
+        # declared relief — never an automatic netlist edit
+        tasks.append({"desc": f"resolve thermal violation: {b}",
+                      "auto": False, "fix": {}})
+    for w in (thermal_rep or {}).get("warnings", []):
+        warnings.append(f"thermal: {w}")
     if not sch_rep.get("ok"):
         blockers.append("schematic generation failed")
         tasks.append({"desc": "fix schematic generation error", "auto": False,

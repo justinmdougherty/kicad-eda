@@ -26,6 +26,7 @@ import lint_netlist as lint    # noqa: E402
 import design_report as drpt   # noqa: E402
 import gates                   # noqa: E402
 import remediate               # noqa: E402
+import thermal_check           # noqa: E402
 
 
 def _drc(pcb: str) -> dict:
@@ -129,7 +130,9 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
         report["design_report"] = {
             "decoupling_uncovered": dr["decoupling"]["uncovered"],
             "flags": dr["flags"]}
-        g2 = gates.g2_schematic(r, dr)
+        trep = thermal_check.check(design)
+        report["thermal"] = trep
+        g2 = gates.g2_schematic(r, dr, trep)
         if g2["passed"]:
             break
         fixed, log = remediate.apply(design, g2["tasks"])
