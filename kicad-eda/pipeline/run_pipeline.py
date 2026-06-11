@@ -89,6 +89,26 @@ def _board_fix(pcb: str, netlist: str, mode: str) -> list:
     return []
 
 
+def _render(pcb: str, tag: str, quality: str = "basic") -> list:
+    """Render top/bottom PNGs next to the board so every gate exit leaves a
+    visual record (placement view at G3, final board at G5)."""
+    out = []
+    base = str(Path(pcb).with_suffix(""))
+    for side in ("top", "bottom"):
+        png = f"{base}_{tag}_{side}.png"
+        try:
+            r = subprocess.run(
+                [k.KICAD_CLI, "pcb", "render", pcb, "-o", png,
+                 "--side", side, "--quality", quality,
+                 "--width", "1600", "--height", "1400"],
+                capture_output=True, text=True, timeout=300)
+            if r.returncode == 0 and Path(png).is_file():
+                out.append(png)
+        except Exception:
+            pass
+    return out
+
+
 def _emc_stitch(pcb: str, emc: dict) -> dict:
     """Run the EMC ground-stitching pass (perimeter via fence + interior
     grid) on the routed board under KiCad's Python."""
@@ -215,6 +235,7 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
                      "applied": [f"re-placed at pack_scale {scales[attempt]}"]})
                 continue
             break
+        report["renders_placement"] = _render(pcb, "place")
         ra = k.autoroute_board(pcb, 600, "", 1500)
         route_rep = {"attempt": attempt, "pack_scale": scale,
                      "tracks": ra.get("tracks"),
@@ -317,6 +338,7 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
            "files": len(r.get("files", [])),
            "bom": r.get("bom"), "cpl": r.get("cpl")}
     report["fab"] = fab
+    report["renders_final"] = _render(pcb, "final", quality="high")
     report["gates"].append(gates.g5_fab(fab, require_assembly=True))
     return _halt(report)
 
