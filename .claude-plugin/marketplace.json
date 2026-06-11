@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "dougherty-eda",
+  "owner": {
+    "name": "Justin Dougherty",
+    "url": "https://github.com/dougherty-labs"
+  },
+  "metadata": {
+    "description": "Electronic design automation plugins for Claude Code.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "kicad-eda",
+      "source": "./kicad-eda",
+      "description": "Concept-to-Gerbers PCB design for KiCad 9/10: a headless gated pipeline (netlist -> ERC -> placement -> Freerouting -> DRC -> fab zip) with self-remediating reviews, plus a GUI-assisted flow. Bundled MCP server, autorouter, subagents, hooks.",
+      "version": "0.2.0",
+      "keywords": ["kicad", "pcb", "eda", "hardware"]
+    }
+  ]
+}

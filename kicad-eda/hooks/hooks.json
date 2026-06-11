@@ -1,0 +1,36 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.js\" session-start"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__kicad-generator__(add_trace|add_via|add_copper_zone|add_footprint_to_pcb|add_footprints_batch|move_footprint|remove_footprint|validate_placement|register_net|get_pcb_summary|get_footprint_pads|create_pcb)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.js\" check-ipc"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__kicad-generator__(save_schematic|add_components_batch|wire_by_ref|label_pin|power_pin|add_power_port|build_schematic_from_netlist)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.js\" validate-schematic"
+          }
+        ]
+      }
+    ]
+  }
+}

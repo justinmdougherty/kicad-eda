@@ -1,0 +1,4 @@
+# kicad-generator server dependencies
+mcp>=1.2.0
+# Optional — enables the PCB / IPC tools. Requires a matching KiCad 9 install.
+# kicad-python

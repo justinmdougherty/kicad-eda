@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+logs/
+
+# bundled-tool exclusions: only freerouting-1.9.0.jar ships
+server/tools/*.jar.disabled
+server/tools/jre*/
+
+# generated board artifacts (examples/ keeps only netlist.json sources)
+*.erc.json
+*_gerbers/
+*.kicad_sch
+*.kicad_pcb
+*.kicad_pcb.attempt
+*.kicad_pro
+*.kicad_prl
+*.dsn
+*.ses
+*_drc.json
+*.rpt
+*.zip
+examples/**/*.png
+examples/**/*.csv
+~*.lck

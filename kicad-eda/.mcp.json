@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "kicad-generator": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/launch-server.js"],
+      "env": {
+        "KICAD_PATH": "${user_config.kicad_path}",
+        "FAB_PROFILE": "${user_config.fab_profile}",
+        "WORK_UNITS": "${user_config.units}"
+      }
+    }
+  }
+}
