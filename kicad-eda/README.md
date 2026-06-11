@@ -22,6 +22,10 @@ decision genuinely needs design intent.
 
 ## Install
 
+> **First time? Never used Claude Code or cloned a repo?** Follow
+> **[docs/SETUP.md](docs/SETUP.md)** — a step-by-step guide from a blank
+> machine to your first board, no prior knowledge assumed.
+
 ```
 /plugin marketplace add justinmdougherty/kicad-eda
 /plugin install kicad-eda@dougherty-eda

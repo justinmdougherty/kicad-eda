@@ -8,6 +8,10 @@ Plugins for electronic design automation.
 /kicad-eda:setup        # checks/installs KiCad, Java, Python
 ```
 
+**New to all of this?** Start with the step-by-step
+[setup guide](kicad-eda/docs/SETUP.md) — it assumes nothing and takes you
+from a blank machine to your first board.
+
 - **kicad-eda** — design circuit boards by chatting with Claude: describe the
   board, get back an ERC-clean schematic, a placed + autorouted PCB with
   clean DRC, and a fab-ready zip (Gerbers, drill, BOM, CPL). Five
