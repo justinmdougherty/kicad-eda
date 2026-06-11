@@ -1,0 +1,5 @@
+# Keep the image lean — the container uses the system JRE and its own venv.
+kicad-eda/server/tools/jre25/
+kicad-eda/.venv/
+**/__pycache__/
+.git/

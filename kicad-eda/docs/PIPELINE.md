@@ -82,7 +82,12 @@ The single source of truth. Pad-level, hand-authored or generated:
   // via size) and the G4 ampacity checks:
   "net_specs": {
     "5V_PI":  {"voltage":5.0, "current":4.0},
-    "RF_OUT": {"impedance":50}          // RF: controlled-impedance class
+    "RF_OUT": {"impedance":50},         // RF: controlled-impedance class
+    // diff pairs: G4 measures intra-pair length mismatch (dp_tol_mm,
+    // default 1.5) and the coupled fraction (within dp_gap_mm, default
+    // 1.0; <70% flags). WARNING-grade: Freerouting cannot pair-route —
+    // preroute real high-speed pairs as a pair and let the numbers verify.
+    "USB_DP": {"diff_pair":"USB_DM"}
   },
 
   // PREROUTES — designer-authored fat copper laid before the router runs.
@@ -99,7 +104,24 @@ The single source of truth. Pad-level, hand-authored or generated:
      "path":[["xy",6.4,24.9],["xy",6.4,2.28]]}
   ],
 
-  "antenna_keepout": {"edge":"top","depth":6}   // optional no-fill rule area
+  "antenna_keepout": {"edge":"top","depth":6},  // optional no-fill rule area
+
+  // EMC POST-PASS (opt-in, runs after G4 passes, then re-DRCs):
+  // perimeter GND via fence + interior stitching grid (Ott/Montrose).
+  // Pitch = guided lambda/20 from max_freq_hz, else a fixed 3 mm.
+  // NOTE: "teardrops" only emits a reminder — KiCad's teardrop generator
+  // has no headless API; generate in the GUI before fab if required.
+  "emc": {"stitch": true, "max_freq_hz": 0, "fence_only": false},
+
+  // MECHANICAL CEILINGS — courtyard DRC is 2D-blind. Board-relative mm;
+  // side "F"|"B"|"both". Part height: component "height" key, else a
+  // package table (XAL6060 6.36, CP_Elec 10.5+, PinSocket 8.7, TSSOP 1.2,
+  // 0603 0.7, ...). Taller-than-ceiling = G3 blocker; unknown height
+  // inside a zone = warning. "exempt" for the part that IS the standoff:
+  "height_zones": [
+    {"name":"clearance to Pi", "side":"B", "x":0, "y":0, "w":65, "h":56.5,
+     "max_height":4.0, "exempt":["J5"]}
+  ]
 }
 ```
 
@@ -144,8 +166,8 @@ What happens, gate by gate:
 | Gate | Stage | Auto-remediation on failure |
 |---|---|---|
 | **G1** Requirements | `lint_netlist` + intent check | — (designer fixes the netlist) |
-| **G2** Schematic | `sch_build` → `.kicad_sch`, `kicad-cli sch erc`, design-intent review (`design_report`: decoupling coverage, floating pins, pulls, test points) | missing bypass → 100 nF auto-added at the IC, netlist rewritten, stage re-runs |
-| **G3** Placement | `swig_build_board` (KiCad bundled python) → outline, mixed/two-sided placement, zones (In1=GND, In2=first power rail), preroutes, silk; courtyard DRC must be **0**; connector mouths must face off-board at the edge | courtyard overlap → re-place at next `pack_scale` (1.0→1.5→2.0→2.6→3.2); a retry that no longer fits restores the last good ROUTED snapshot (`.attempt` file) |
+| **G2** Schematic | `sch_build` → `.kicad_sch`, `kicad-cli sch erc`, design-intent review (`design_report`: decoupling coverage, floating pins, pulls, test points), **thermal review** (`thermal_check`: shunt I²R vs 50%-derated rating, FET conduction loss, linear-reg (Vin−Vout)·I, switcher loss estimate; Tj = Tamb + P·θJA ≤ 80% Tj_max) | missing bypass → 100 nF auto-added at the IC, netlist rewritten, stage re-runs. Thermal: declared numbers (`p_diss`, `rds_mohm`, value "3W") block; estimates warn. Overrides per part: `"thermal": {"p_diss", "theta_ja", "tj_max", "i_max"}` (`i_max` for topology-capped parts, e.g. a bypassed sleep shunt); board-level: `"thermal": {"t_ambient", "tj_margin", "ep_vias_min"}` |
+| **G3** Placement | `swig_build_board` (KiCad bundled python) → outline, mixed/two-sided placement, zones (In1=GND, In2=first power rail), preroutes, silk; courtyard DRC must be **0**; connector mouths must face off-board at the edge; dissipating exposed-pad parts must have ≥4 thermal vias under the EP (IPC-7093 — footprint `...ThermalVias` variants count); **plane integrity**: a power plane whose pad population is split across separate fill islands is a BLOCKER (the DSN export hides voids — the router will return the net broken); corridors under 1.8 mm between pad groups (one router via from sealing) are a warning. GND is exempt (post-route pours + stitching unify it) | courtyard overlap → re-place at next `pack_scale` (1.0→1.5→2.0→2.6→3.2); a retry that no longer fits restores the last good ROUTED snapshot (`.attempt` file); **EP via farm**: a dissipating EP part whose footprint has no `...ThermalVias` variant (e.g. TO-263) gets an IPC-7093 via farm auto-dropped under the tab (0.3 mm drill, ~1.2 mm pitch, pad's net) before the review runs |
 | **G4** Layout | DSN export → **Freerouting 1.9** → SES import → DRC + routed-width check + via-ampacity check (`swig_gate_checks`) | 1–4 unconnected → **heal in place** (`swig_board_fixes`): ≤2 mm same-net gaps bridged; plane-net orphans get island-link tracks (straight-or-L, plane layer preferred); under-ampacity transitions get parallel vias. 2-round fix→re-DRC→re-gate loop. Scale escalation only for real congestion. |
 | **G5** Fab package | `kicad-cli` Gerbers + drill + pos; BOM.csv + CPL.csv (JLCPCB format) zipped | — |
 
@@ -160,6 +182,19 @@ Useful environment variables:
 | `PACK_DEBUG=1` | print cluster/shelf packing decisions |
 | `FREEROUTING_JAR` | pin a specific router jar (keep 1.9.0) |
 | `KICAD_PATH` | KiCad install root when auto-detect fails |
+| `PIPELINE_NO_CACHE=1` | bypass the route cache (always rebuild + re-route) |
+
+**Route cache:** after a successful run, `<netlist>.cache.json` records a hash
+of everything that moves copper (geometry, nets, net_specs, preroutes, board,
+emc). A re-run with only value/sourcing/thermal edits reuses the routed board
+— the G3/G4 **gates still re-run** against it (the cache skips work, never
+judgement) — and goes straight to silk/checks/fab. The G3 re-validation uses
+the `placement_routed` check variant: plane integrity is skipped (it is a
+PRE-route prediction; on a routed board the plane is legitimately carved by
+via antipads and any stranded islands are already tied by healed tracks —
+G4's DRC re-run proves the connectivity it exists to predict). Any net,
+footprint, position, or preroute change invalidates automatically, as does a
+G2 netlist remediation.
 
 ## 5. Regression suite
 
@@ -196,8 +231,13 @@ safe on a finished board, then re-run DRC and re-export:
    (the harness does this automatically for preroute/plane nets).
 3. **DSN plane abstraction lies.** KiCad exports zones as full-rect polygons;
    Freerouting cannot see fill voids, so plane-connected nets can come back
-   with orphan islands. The G4 healer links them; for chronic cases add a
-   netlist preroute stub through the corridor.
+   with orphan islands. Division of labor: G3 statically catches planes that
+   are ALREADY fractured (blocker) or pinched below 1.8 mm (warning) — but
+   the worst case (HAT VBUS_PD) was created by the ROUTER's own via antipads
+   sealing a healthy ≥3 mm corridor, which no static pre-route check can
+   see. That class belongs to the G4 healer (bridge / island-link / BFS maze
+   route), which the `negative_g4_heal` fixture proves on every regression
+   run. For chronic nets, author a corridor preroute.
 4. **Freerouting 2.x is broken headless** (phones home, never routes; also
    re-splits CLI paths on spaces). The server routes from a temp dir and pins
    1.9.0.
@@ -215,7 +255,10 @@ safe on a finished board, then re-run DRC and re-export:
 9. **Two-sided placement:** PTH obstacles (THT pads, thermal-via farms) exist
    on BOTH faces — carve `auto_b` away from them or G3 reports
    "PTH inside courtyard".
-10. **HAT/fixed-board pattern:** fixed connector coordinates + `auto_x/y/w/h`
+10. **No headless teardrops.** KiCad 10's teardrop generator is not exposed
+    to SWIG at all — `"emc": {"teardrops": true}` can only remind you to
+    generate them in the GUI (Edit → Edit Teardrops) before fab.
+11. **HAT/fixed-board pattern:** fixed connector coordinates + `auto_x/y/w/h`
     free field + hand-placed power chain + preroutes is the proven recipe for
     a dense fixed-outline board.
 

@@ -29,8 +29,8 @@
     "AMP_IN": {"impedance": 50},
     "AMP_OUT": {"impedance": 50},
     "RF_OUT": {"impedance": 50},
-    "V5": {"voltage": 5.0, "current": 0.15},
-    "VBIAS": {"voltage": 5.0, "current": 0.15}
+    "V5": {"voltage": 5.0, "current": 0.035},
+    "VBIAS": {"voltage": 5.0, "current": 0.035}
   },
   "power_flags": ["AMP_IN"],
   "no_connect": []

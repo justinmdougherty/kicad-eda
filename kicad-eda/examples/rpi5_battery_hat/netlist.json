@@ -4,6 +4,9 @@
   "class": 2,
   "board": {"w": 65.0, "h": 56.5, "auto_y": 21.0, "auto_x": 8.5, "auto_w": 23.0, "auto_h": 25.0,
             "auto_b": {"x": 30.0, "y": 26.0, "w": 25.0, "h": 22.0}},
+  "height_zones": [
+    {"name": "clearance to Pi top side", "side": "B", "x": 0, "y": 0, "w": 65.0, "h": 56.5, "max_height": 4.0, "exempt": ["J5"]}
+  ],
   "mounting_holes": {
     "footprint": "MountingHole:MountingHole_2.7mm_M2.5",
     "positions": [[3.5, 3.5], [61.5, 3.5], [3.5, 52.5], [61.5, 52.5]]
@@ -72,7 +75,7 @@
     {"ref": "L2", "lib_id": "Device:L", "value": "6.8uH XAL6060-682", "footprint": "Inductor_SMD:L_Coilcraft_XAL6060-XXX", "x": 22, "y": 11},
 
     {"ref": "RS1", "lib_id": "Device:R", "value": "0.01R 1% 3W", "footprint": "Resistor_SMD:R_2512_6332Metric", "x": 40.5, "y": 27},
-    {"ref": "RS2", "lib_id": "Device:R", "value": "10R 1%", "footprint": "Resistor_SMD:R_2512_6332Metric", "x": 49, "y": 27},
+    {"ref": "RS2", "thermal": {"i_max": 0.001}, "lib_id": "Device:R", "value": "10R 1%", "footprint": "Resistor_SMD:R_2512_6332Metric", "x": 49, "y": 27},
 
     {"ref": "R1", "lib_id": "Device:R", "value": "8.2k 1%", "footprint": "Resistor_SMD:R_0603_1608Metric", "x": 40.5, "y": 18.5},
     {"ref": "R2", "lib_id": "Device:R", "value": "470R 1%", "footprint": "Resistor_SMD:R_0603_1608Metric", "side": "B"},

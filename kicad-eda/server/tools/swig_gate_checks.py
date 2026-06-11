@@ -48,7 +48,13 @@ def _world_mouth(fp):
     return ((0.0, 1.0 if dy > 0 else -1.0), bb)
 
 
-def check_placement(board, design):
+def check_placement(board, design, routed=False):
+    """routed=True re-validates a cached ROUTED board: plane integrity is
+    skipped — it is a PRE-route check (its premise is "the router will trust
+    the DSN plane rectangle and return the net broken"); on a routed board
+    the plane is legitimately carved by via antipads and any stranded
+    islands are already tied by healed tracks, proven by DRC unconnected=0
+    at G4. Every other placement check still applies to the artifact."""
     issues = []
     to = pcbnew.ToMM
     bb = board.GetBoardEdgesBoundingBox()
@@ -87,6 +93,305 @@ def check_placement(board, design):
         if not ok:
             issues.append("antenna_keepout requested in the netlist but no "
                           "no-fill rule area exists on the board")
+
+    issues += check_ep_via_farms(board, design)
+    pi_issues, pi_warnings = ([], []) if routed else check_plane_integrity(board)
+    h_issues, h_warnings = check_heights(board, design)
+    return issues + pi_issues + h_issues, pi_warnings + h_warnings
+
+
+# component height defaults by footprint hint (mm), specific before generic
+PKG_HEIGHTS = [
+    ("XAL6060", 6.36), ("CP_Elec_8x10", 10.5), ("CP_Elec", 11.0),
+    ("D_7343", 3.1), ("7343", 3.1), ("PinSocket", 8.7), ("PinHeader", 9.0),
+    ("TerminalBlock", 12.0), ("USB_C", 3.5), ("SOT-223", 1.8),
+    ("SOT-23", 1.2), ("SOT-89", 1.6), ("PowerPAK", 1.1), ("HSOP", 1.7),
+    ("TSSOP", 1.2), ("SOIC", 1.75), ("SO-8", 1.75), ("LQFP", 1.6),
+    ("QFN", 1.0), ("DFN", 0.8), ("SOD-123", 1.2), ("SOD-323", 1.0),
+    ("LED", 0.9), ("0402", 0.5), ("0603", 0.7), ("0805", 0.85),
+    ("1206", 0.95), ("1210", 1.1), ("2010", 0.7), ("2512", 0.7),
+]
+
+
+def check_heights(board, design):
+    """Mechanical ceiling check — courtyard DRC is 2D-blind. The netlist
+    declares "height_zones": [{x,y,w,h,max_height, side: "F"|"B"|"both",
+    exempt: [refs]}] in board-relative mm (a HAT's underside clearance to
+    the Pi, an enclosure lid, a heatsink shadow). Part height comes from
+    the component's "height" key, else the package table; a part inside a
+    zone with UNKNOWN height is a warning ("declare it"), a part TALLER
+    than the ceiling is a blocker. Returns (issues, warnings)."""
+    zones = design.get("height_zones") or []
+    if not zones:
+        return [], []
+    issues, warnings = [], []
+    to = pcbnew.ToMM
+    bb = board.GetBoardEdgesBoundingBox()
+    ox, oy = to(bb.GetLeft()), to(bb.GetTop())
+    comps = {c["ref"]: c for c in design.get("components", [])}
+
+    def part_height(c):
+        if c.get("height") is not None:
+            return float(c["height"])
+        fp_name = c.get("footprint", "")
+        for hint, h in PKG_HEIGHTS:
+            if hint.lower() in fp_name.lower():
+                return h
+        return None
+
+    for fp in board.GetFootprints():
+        ref = fp.GetReference()
+        c = comps.get(ref)
+        if c is None:
+            continue                       # mounting holes etc.
+        side = "B" if fp.GetLayer() == pcbnew.B_Cu else "F"
+        try:
+            cy = fp.GetCourtyard(pcbnew.F_CrtYd if side == "F"
+                                 else pcbnew.B_CrtYd)
+            fbb = (cy.BBox() if cy and cy.OutlineCount() > 0
+                   else fp.GetBoundingBox())
+        except Exception:
+            fbb = fp.GetBoundingBox()
+        fx0, fy0 = to(fbb.GetLeft()) - ox, to(fbb.GetTop()) - oy
+        fx1, fy1 = to(fbb.GetRight()) - ox, to(fbb.GetBottom()) - oy
+        for z in zones:
+            zside = z.get("side", "F")
+            if zside != "both" and zside != side:
+                continue
+            if ref in (z.get("exempt") or []):
+                continue
+            if (fx1 < z["x"] or fx0 > z["x"] + z["w"]
+                    or fy1 < z["y"] or fy0 > z["y"] + z["h"]):
+                continue
+            lim = float(z["max_height"])
+            h = part_height(c)
+            zname = z.get("name", f"height zone @({z['x']},{z['y']})")
+            if h is None:
+                warnings.append(
+                    f"{ref}: inside {zname} (ceiling {lim} mm) but its "
+                    f"height is unknown — declare \"height\" on the part")
+            elif h > lim + 1e-6:
+                issues.append(
+                    f"{ref}: {h} mm tall inside {zname} with a {lim} mm "
+                    f"ceiling ({side} side) — move it out, use a lower "
+                    f"package, or exempt it if it IS the standoff")
+    return issues, warnings
+
+
+def check_plane_integrity(board):
+    """Pre-route plane fracture detection — the failure DRC can only catch
+    after routing and Freerouting can never see at all (the DSN exports a
+    plane as a full-board rectangle, hiding fill voids).
+
+    For each plane net: take the FILLED zone's islands, then union-find over
+    [islands + the net's pads + existing same-net copper (preroutes)]. Pads
+    attach to the island under them (a router via will land there); preroute
+    tracks join the pads they enter; preroute vias join their island.
+
+    Severity calibration (from the HAT): a TRUE multi-island split of the
+    pad population is a BLOCKER — the router will return the net broken.
+    A PINCH split (corridors a single router via could seal, found by
+    deflating the fill) is a WARNING — the router only seals corridors it
+    actually routes through, and the shipped HAT works with several. GND is
+    exempt: the post-route outer pours + stitching own its unification.
+    Returns (issues, warnings)."""
+    import math
+    issues = []
+    warnings = []
+    to = pcbnew.ToMM
+    MIN_ISLAND_MM2 = 5.0
+    PAD_REACH = 3.0          # pad attaches to an island within this distance
+
+    for z in board.Zones():
+        if z.GetIsRuleArea():
+            continue
+        net = z.GetNetname()
+        nc = z.GetNetCode()
+        layer = z.GetLayer()
+        if net == "GND":
+            continue
+        if not board.GetLayerName(layer).startswith("In"):
+            # outer-layer pours are post-route artifacts, unified by
+            # stitching vias — only the INNER planes ride the DSN export
+            continue
+        try:
+            polys = pcbnew.SHAPE_POLY_SET(z.GetFilledPolysList(layer))
+            # KiCad stores fills FRACTURED (holes slit into the outline, so
+            # HoleCount()==0) — unfracture or the pinch deflate sees no voids
+            polys.Unfracture()
+        except Exception:
+            continue
+        n_out = polys.OutlineCount()
+        raw = []                           # per-island SHAPE_POLY_SET + holes
+        for i in range(n_out):
+            o = polys.Outline(i)
+            if abs(o.Area()) / 1e12 < MIN_ISLAND_MM2:
+                continue
+            sp = pcbnew.SHAPE_POLY_SET()
+            sp.AddOutline(o)
+            try:
+                for j in range(polys.HoleCount(i)):
+                    sp.AddHole(polys.Hole(i, j))
+            except Exception:
+                pass
+            raw.append(sp)
+        if not raw:
+            continue
+        fractured = len(raw) > 1
+
+        # PINCH detection: the fresh fill usually survives as ONE island —
+        # the fracture completes only when the ROUTER's via antipads seal a
+        # narrow corridor (the HAT's VBUS_PD died through a 1.18 mm gap).
+        # Deflating by PINCH erases any corridor narrower than 2*PINCH —
+        # i.e. anything a single 1.2 mm via + clearance would sever.
+        PINCH = 0.9
+        islands = []
+        for sp in raw:
+            d = pcbnew.SHAPE_POLY_SET(sp)
+            try:
+                d.Deflate(pcbnew.FromMM(PINCH),
+                          pcbnew.CORNER_STRATEGY_CHAMFER_ALL_CORNERS,
+                          pcbnew.FromMM(0.02))
+            except Exception:
+                islands.append(sp)
+                continue
+            kept = 0
+            for j in range(d.OutlineCount()):
+                o = d.Outline(j)
+                if abs(o.Area()) / 1e12 < MIN_ISLAND_MM2:
+                    continue
+                p2 = pcbnew.SHAPE_POLY_SET()
+                p2.AddOutline(o)
+                islands.append(p2)
+                kept += 1
+            if kept == 0:
+                islands.append(sp)         # deflate ate it — keep original
+        if len(islands) <= 1:
+            continue
+
+        # --- union-find nodes: islands then pads ---
+        pads = [p for fp in board.GetFootprints() for p in fp.Pads()
+                if p.GetNetCode() == nc]
+        parent = list(range(len(islands) + len(pads)))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        def union(a, b):
+            parent[find(a)] = find(b)
+
+        def island_at(pos, reach=0.0):
+            """Index of the island containing pos, else (with reach) the one
+            with the smallest TRUE polygon distance — bbox distance is
+            meaningless when one outline spans the whole board."""
+            best, bd = None, max(reach, 1e-9)
+            for k, sp in enumerate(islands):
+                if sp.Contains(pos):
+                    return k
+                if reach > 0:
+                    d = math.sqrt(sp.SquaredDistance(pos)) / 1e6
+                    if d < bd:
+                        best, bd = k, d
+            return best
+
+        for pi, pad in enumerate(pads):
+            isl = island_at(pad.GetPosition(), PAD_REACH)
+            if isl is not None:
+                union(len(islands) + pi, isl)
+
+        # existing same-net copper (preroutes laid at build time): a track
+        # joins the pads its endpoints enter; a via joins its island
+        for t in board.GetTracks():
+            if t.GetNetCode() != nc:
+                continue
+            if t.GetClass() == "PCB_VIA":
+                isl = island_at(t.GetPosition())
+                if isl is not None:
+                    for pi, pad in enumerate(pads):
+                        p, q = pad.GetPosition(), t.GetPosition()
+                        if math.hypot(to(p.x - q.x), to(p.y - q.y)) < 1.0:
+                            union(len(islands) + pi, isl)
+                continue
+            ends = []
+            for ep in (t.GetStart(), t.GetEnd()):
+                for pi, pad in enumerate(pads):
+                    p = pad.GetPosition()
+                    if math.hypot(to(p.x - ep.x), to(p.y - ep.y)) < 1.0:
+                        ends.append(len(islands) + pi)
+            for a, b in zip(ends, ends[1:]):
+                union(a, b)
+
+        groups = {}
+        for pi in range(len(pads)):
+            groups.setdefault(find(len(islands) + pi), []).append(
+                pads[pi].GetParentFootprint().GetReference())
+        groups = {g: refs for g, refs in groups.items() if refs}
+        if len(groups) >= 2:
+            parts = sorted(groups.values(), key=len, reverse=True)
+            if fractured:
+                issues.append(
+                    f"{net}: plane on {board.GetLayerName(layer)} is "
+                    f"fractured into separate islands, splitting the net's "
+                    f"pads into {len(groups)} groups (largest: "
+                    f"{sorted(set(parts[0]))[:6]}, stranded: "
+                    f"{sorted(set(parts[1]))[:6]}) — the router trusts the "
+                    f"DSN plane rectangle and will return this net broken. "
+                    f"Add a corridor preroute joining the groups, or "
+                    f"re-place the wall-forming THT part")
+            else:
+                warnings.append(
+                    f"{net}: plane on {board.GetLayerName(layer)} has "
+                    f"corridors under {2 * PINCH:.1f} mm between pad groups "
+                    f"(e.g. {sorted(set(parts[0]))[:4]} vs "
+                    f"{sorted(set(parts[1]))[:4]}) — a single router via can "
+                    f"seal one and orphan the group. If routing returns this "
+                    f"net unconnected, add a corridor preroute (the G4 "
+                    f"healer will also attempt an island link)")
+    return issues, warnings
+
+
+def check_ep_via_farms(board, design):
+    """Exposed-pad parts that thermal_check flags as real dissipators must
+    have a thermal via farm under the EP — either built into the footprint
+    (PTH pads, e.g. the Texas ...ThermalVias variants) or added as board
+    vias. IPC-7093 practice; bare EP copper alone cannot move the watts."""
+    import thermal_check
+    issues = []
+    refs = thermal_check.check(design).get("ep_via_parts", [])
+    if not refs:
+        return issues
+    need = int((design.get("thermal") or {}).get("ep_vias_min", 4)) \
+        if isinstance(design.get("thermal"), dict) else 4
+    to = pcbnew.ToMM
+    for ref in refs:
+        fp = board.FindFootprintByReference(ref)
+        if fp is None:
+            continue
+        pads = list(fp.Pads())
+        if not pads:
+            continue
+        ep = max(pads, key=lambda p: p.GetBoundingBox().GetWidth()
+                 * p.GetBoundingBox().GetHeight())
+        bb = ep.GetBoundingBox()
+        n = 0
+        for p in pads:                       # footprint's own via-holes
+            try:
+                drilled = to(p.GetDrillSize().x) > 0
+            except Exception:
+                drilled = False
+            if drilled and bb.Contains(p.GetPosition()):
+                n += 1
+        for t in board.GetTracks():          # board-level vias under the EP
+            if t.GetClass() == "PCB_VIA" and bb.Contains(t.GetPosition()):
+                n += 1
+        if n < need:
+            issues.append(
+                f"{ref}: dissipating exposed-pad part has only {n} thermal "
+                f"via(s) under the EP (needs >= {need}, IPC-7093) — use a "
+                f"...ThermalVias footprint variant or add stitching vias")
     return issues
 
 
@@ -117,8 +422,27 @@ def check_routed_widths(board, pro_path, design=None):
     # check to segments WIDER than half the target (the fat path), and
     # verify their total length is non-trivial.
     pre_w = {}
+    authored = {}
     for pr in (design or {}).get("preroutes", []):
-        pre_w[pr["net"]] = max(pre_w.get(pr["net"], 0), float(pr["width"]))
+        net = pr["net"]
+        pre_w[net] = max(pre_w.get(net, 0), float(pr["width"]))
+        # authored fat length: segments at >= the net's preroute width
+        # (the router may legitimately TRIM a fat run where it enters a
+        # wide pad — only substantial REMOVAL is a violation)
+        pts = []
+        for p in pr.get("path", []):
+            if p[0] == "xy":
+                pts.append((float(p[1]), float(p[2]),
+                            float(p[3]) if len(p) > 3 else None))
+            else:
+                pts.append((None, None,
+                            float(p[3]) if len(p) > 3 else None))
+        for (x0, y0, w0), (x1, y1, _w1) in zip(pts, pts[1:]):
+            w_seg = w0 if w0 is not None else float(pr["width"])
+            if (w_seg + 1e-3 >= pre_w[net] and None not in (x0, y0, x1, y1)):
+                import math as _m
+                authored[net] = authored.get(net, 0) + _m.hypot(x1 - x0,
+                                                                y1 - y0)
     to = pcbnew.ToMM
     for net, w_req in pre_w.items():
         fat_len = sum(
@@ -126,9 +450,13 @@ def check_routed_widths(board, pro_path, design=None):
             for t in board.GetTracks()
             if t.GetClass() == "PCB_TRACK" and t.GetNetname() == net
             and to(t.GetWidth()) + 1e-3 >= w_req)
-        if fat_len < 1.0:
+        need = min(1.0, 0.5 * authored.get(net, 2.0))
+        if fat_len + 1e-3 < need:
             issues.append(f"{net}: prerouted {w_req} mm power path missing "
-                          f"from the routed board (router removed it?)")
+                          f"from the routed board ({round(fat_len, 2)} mm of "
+                          f"fat copper survives, authored "
+                          f"{round(authored.get(net, 0), 2)} mm — router "
+                          f"removed it?)")
             bound[net] = "preroute"
 
     # Entry-neck exemption: a router MUST neck where the copper it enters (pad
@@ -177,6 +505,82 @@ def check_routed_widths(board, pro_path, design=None):
             issues.append(f"{net}: open-field segment routed at {w:.3f} mm but "
                           f"class {bound[net]} requires {target:.3f} mm")
     return issues
+
+
+def check_diff_pairs(board, design):
+    """Differential pairs must be ROUTED as pairs. Declared in net_specs:
+    "USB_DP": {"diff_pair": "USB_DM", "dp_tol_mm": 1.5, "dp_gap_mm": 1.0}.
+    Measures (a) intra-pair length mismatch and (b) the fraction of each
+    net's length that runs coupled (within dp_gap of its partner).
+
+    WARNING-grade by design: Freerouting cannot pair-route, so a blocker
+    would make every diff-pair board unbuildable headless — but a pair
+    routed as two independent meanders must never pass silently. For real
+    high-speed pairs, preroute them as a pair and let these numbers verify.
+    Returns warnings list."""
+    import math
+    warnings = []
+    to = pcbnew.ToMM
+    specs = design.get("net_specs", {})
+    seen = set()
+    for net_a, s in specs.items():
+        net_b = s.get("diff_pair")
+        if not net_b or tuple(sorted((net_a, net_b))) in seen:
+            continue
+        seen.add(tuple(sorted((net_a, net_b))))
+        tol = float(s.get("dp_tol_mm", 1.5))
+        gap = float(s.get("dp_gap_mm", 1.0))
+        segs = {}
+        for name in (net_a, net_b):
+            segs[name] = [t for t in board.GetTracks()
+                          if t.GetClass() == "PCB_TRACK"
+                          and t.GetNetname() == name]
+        if not segs[net_a] or not segs[net_b]:
+            continue                      # unrouted / plane-carried
+
+        def length(name):
+            return sum(to(t.GetLength()) for t in segs[name])
+
+        la, lb = length(net_a), length(net_b)
+        if abs(la - lb) > tol:
+            warnings.append(
+                f"diff pair {net_a}/{net_b}: length mismatch "
+                f"{abs(la - lb):.2f} mm ({la:.2f} vs {lb:.2f}) exceeds "
+                f"{tol} mm — add serpentine or preroute the pair")
+
+        def seg_pts(t):
+            s_, e_ = t.GetStart(), t.GetEnd()
+            return ((to(s_.x), to(s_.y)), (to(e_.x), to(e_.y)))
+
+        def dist_pt_seg(p, a, b):
+            ax, ay = a
+            vx, vy = b[0] - ax, b[1] - ay
+            L2 = vx * vx + vy * vy
+            if L2 < 1e-12:
+                return math.hypot(p[0] - ax, p[1] - ay)
+            t_ = max(0.0, min(1.0, ((p[0] - ax) * vx + (p[1] - ay) * vy) / L2))
+            return math.hypot(p[0] - (ax + t_ * vx), p[1] - (ay + t_ * vy))
+
+        other = [seg_pts(t) for t in segs[net_b]]
+        coupled = total = 0.0
+        for t in segs[net_a]:
+            (x0, y0), (x1, y1) = seg_pts(t)
+            ln = math.hypot(x1 - x0, y1 - y0)
+            if ln < 1e-6:
+                continue
+            total += ln
+            mid = ((x0 + x1) / 2, (y0 + y1) / 2)
+            d = min((dist_pt_seg(mid, a, b) for a, b in other), default=1e9)
+            if d <= gap + 0.2:            # gap is edge-ish; small slack
+                coupled += ln
+        frac = coupled / total if total else 0.0
+        if frac < 0.7:
+            warnings.append(
+                f"diff pair {net_a}/{net_b}: only {frac:.0%} of the routed "
+                f"length runs coupled (within {gap} mm of its partner) — "
+                f"the pair is routed as two independent traces; preroute it "
+                f"as a pair for impedance/EMI integrity")
+    return warnings
 
 
 def check_via_ampacity(board, design):
@@ -257,15 +661,19 @@ def main():
         except Exception:
             pass
     board = pcbnew.LoadBoard(pcb)
+    warnings = []
     if mode == "placement":
-        issues = check_placement(board, design)
+        issues, warnings = check_placement(board, design)
+    elif mode == "placement_routed":
+        issues, warnings = check_placement(board, design, routed=True)
     elif mode == "routed":
         pro = pcb.rsplit(".", 1)[0] + ".kicad_pro"
         issues = check_routed_widths(board, pro, design)
         issues += check_via_ampacity(board, design)
+        warnings += check_diff_pairs(board, design)
     else:
         issues = [f"unknown mode {mode}"]
-    print(json.dumps({"issues": issues}))
+    print(json.dumps({"issues": issues, "warnings": warnings}))
 
 
 if __name__ == "__main__":

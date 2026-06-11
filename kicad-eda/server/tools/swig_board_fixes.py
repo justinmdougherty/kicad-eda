@@ -44,6 +44,16 @@ def _dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def _min_clearance(board):
+    """The board's real minimum copper clearance (mm) — margins derived from
+    an assumed 0.15 mm fail DRC on a 0.2 mm-rule project."""
+    try:
+        return max(_to(board.GetDesignSettings().GetSmallestClearanceValue()),
+                   0.15)
+    except Exception:
+        return 0.2
+
+
 def _via_w(v):
     """PCB_VIA pad width. KiCad 10's padstack API asserts (and, headless on
     Windows, WEDGES the process in a wx dialog) when GetWidth() is called
@@ -158,7 +168,8 @@ def heal_micro_gaps(board, drc):
                              pcbnew.F_Cu)
                 width = min((w for w in (a[3], b[3]) if w), default=0.25)
                 if _clear_path(board, nc, a[:2], b[:2],
-                               width / 2 + 0.2, layer):
+                               width / 2 + _min_clearance(board) + 0.05,
+                               layer):
                     t = pcbnew.PCB_TRACK(board)
                     t.SetStart(pcbnew.VECTOR2I(_mm(a[0]), _mm(a[1])))
                     t.SetEnd(pcbnew.VECTOR2I(_mm(b[0]), _mm(b[1])))
@@ -422,7 +433,7 @@ def _try_link(board, net, a, b, layer, width=0.3, bfs=False):
     """Lay a same-net link from a to b on layer — straight, L-shaped, or
     (when bfs=True) maze-routed. Returns True when tracks were added."""
     nc = net.GetNetCode()
-    keep = width / 2 + 0.17                 # 0.15 clearance + a hair
+    keep = width / 2 + _min_clearance(board) + 0.05
     path = None
     for cand in ((a, b),
                  (a, (a[0], b[1]), b),
@@ -551,6 +562,75 @@ def add_parallel_vias(board, design, open_tasks):
     return applied
 
 
+def add_ep_via_farms(board, design):
+    """Thermal via farm under the EP of every dissipating exposed-pad part
+    (thermal_check ep_via_parts) that lacks one — the auto-remedy for the
+    G3 check_ep_via_farms blocker when the library has no ...ThermalVias
+    footprint variant (e.g. TO-263). IPC-7093: a grid of 0.3 mm-drill vias
+    fully inside the EP copper, same net, sunk into the planes. Caller
+    re-fills zones so plane antipads regenerate around the new barrels."""
+    import thermal_check
+    applied = []
+    refs = thermal_check.check(design).get("ep_via_parts", [])
+    if not refs:
+        return applied
+    need = int((design.get("thermal") or {}).get("ep_vias_min", 4)) \
+        if isinstance(design.get("thermal"), dict) else 4
+    W, DRILL = _mm(0.6), _mm(0.3)
+    for ref in refs:
+        fp = board.FindFootprintByReference(ref)
+        if fp is None:
+            continue
+        pads = list(fp.Pads())
+        if not pads:
+            continue
+        ep = max(pads, key=lambda p: p.GetBoundingBox().GetWidth()
+                 * p.GetBoundingBox().GetHeight())
+        bb = ep.GetBoundingBox()
+        have = sum(1 for t in board.GetTracks()
+                   if t.GetClass() == "PCB_VIA" and bb.Contains(t.GetPosition()))
+        for p in pads:
+            try:
+                drilled = p.GetDrillSize().x > 0
+            except Exception:
+                drilled = False
+            if drilled and bb.Contains(p.GetPosition()):
+                have += 1
+        if have >= need:
+            continue
+        # grid fully inside the pad: margin = via radius + annular slack
+        m = _to(W) / 2 + 0.15
+        x0, y0 = _to(bb.GetLeft()) + m, _to(bb.GetTop()) + m
+        pw, ph = _to(bb.GetRight()) - m - x0, _to(bb.GetBottom()) - m - y0
+        if pw <= 0 or ph <= 0:
+            continue
+        cols = max(1, min(int(pw / 1.2) + 1, 6))   # ~1.2 mm IPC-7093 pitch
+        rows = max(1, min(int(ph / 1.2) + 1, 6))
+        while cols * rows < need and (cols < 6 or rows < 6):
+            if pw / cols >= ph / rows and cols < 6:
+                cols += 1
+            elif rows < 6:
+                rows += 1
+            else:
+                break
+        taken = [(_to(t.GetPosition().x), _to(t.GetPosition().y))
+                 for t in board.GetTracks() if t.GetClass() == "PCB_VIA"]
+        net, added = ep.GetNet(), 0
+        for i in range(cols):
+            for j in range(rows):
+                xy = (x0 + pw * (i + 0.5) / cols, y0 + ph * (j + 0.5) / rows)
+                if any(_dist(xy, t) < 0.55 for t in taken):  # hole-to-hole
+                    continue
+                _add_via(board, net, xy, W, DRILL)
+                taken.append(xy)
+                added += 1
+        if added:
+            applied.append(
+                f"{ref}: {added} thermal via(s) 0.3 mm drill under the EP "
+                f"on net {net.GetNetname()} (IPC-7093 via farm)")
+    return applied
+
+
 def main():
     pcb, netlist, drc_path, mode = sys.argv[1:5]
     board = pcbnew.LoadBoard(pcb)
@@ -567,6 +647,8 @@ def main():
         applied += heal_micro_gaps(board, drc)
     if mode in ("vias", "all"):
         applied += add_parallel_vias(board, design, open_tasks)
+    if mode in ("ep_vias", "all"):
+        applied += add_ep_via_farms(board, design)
     if applied:
         board.BuildConnectivity()
         try:

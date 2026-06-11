@@ -48,8 +48,17 @@ def g1_requirements(lint_rep: dict, design: dict) -> dict:
                     blockers, warnings)
 
 
-def g2_schematic(sch_rep: dict, design_rep: dict) -> dict:
+def g2_schematic(sch_rep: dict, design_rep: dict,
+                 thermal_rep: dict | None = None) -> dict:
     blockers, warnings, tasks = [], [], []
+    for b in (thermal_rep or {}).get("blockers", []):
+        blockers.append(f"thermal: {b}")
+        # needs design intent: a hot part means re-spec, re-package, or
+        # declared relief — never an automatic netlist edit
+        tasks.append({"desc": f"resolve thermal violation: {b}",
+                      "auto": False, "fix": {}})
+    for w in (thermal_rep or {}).get("warnings", []):
+        warnings.append(f"thermal: {w}")
     if not sch_rep.get("ok"):
         blockers.append("schematic generation failed")
         tasks.append({"desc": "fix schematic generation error", "auto": False,
@@ -90,8 +99,8 @@ def g2_schematic(sch_rep: dict, design_rep: dict) -> dict:
 
 
 def g3_placement(board_rep: dict, courtyard_drc: dict,
-                 place_issues: list) -> dict:
-    blockers, warnings, tasks = [], [], []
+                 place_issues: list, place_warnings: list | None = None) -> dict:
+    blockers, warnings, tasks = [], list(place_warnings or []), []
     if not board_rep.get("ok"):
         why = (board_rep.get("error") or board_rep.get("reason")
                or board_rep.get("stderr") or "(no detail)")
@@ -115,8 +124,9 @@ def g3_placement(board_rep: dict, courtyard_drc: dict,
                     "pre-route hard gate", blockers, warnings, tasks)
 
 
-def g4_layout(route_rep: dict, drc: dict, width_issues: list) -> dict:
-    blockers, warnings, tasks = [], [], []
+def g4_layout(route_rep: dict, drc: dict, width_issues: list,
+              check_warnings: list | None = None) -> dict:
+    blockers, warnings, tasks = [], list(check_warnings or []), []
     unc = route_rep.get("unconnected")
     if unc is None:
         why = route_rep.get("error", "router produced no result")
@@ -145,7 +155,8 @@ def g4_layout(route_rep: dict, drc: dict, width_issues: list) -> dict:
 
 
 def g5_fab(fab_rep: dict, min_files: int = 10,
-           require_assembly: bool = False) -> dict:
+           require_assembly: bool = False,
+           sourcing: dict | None = None) -> dict:
     blockers, warnings = [], []
     if not fab_rep.get("ok"):
         blockers.append("Gerber/drill export failed")
@@ -157,6 +168,18 @@ def g5_fab(fab_rep: dict, min_files: int = 10,
             blockers.append("assembly BOM.csv missing from the fab package")
         if not fab_rep.get("cpl"):
             blockers.append("assembly CPL.csv missing from the fab package")
+    if sourcing:
+        # a BOM without orderable part numbers is decorative, not a handoff.
+        # Warning by default; netlist "require_sourcing": true makes it a
+        # release blocker (contract-assembly posture).
+        hard = sourcing.get("required")
+        miss = sourcing.get("missing", [])
+        if miss:
+            msg = (f"{len(miss)} BOM part(s) have neither an LCSC number nor "
+                   f"an MPN: {miss[:8]}{'...' if len(miss) > 8 else ''}")
+            (blockers if hard else warnings).append(msg)
+        for b in sourcing.get("bad", []):
+            (blockers if hard else warnings).append(b)
     return _verdict("G5", "Fabrication package (handoff)", "release to fab",
                     blockers, warnings)
 

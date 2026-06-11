@@ -13,7 +13,9 @@ Usage:
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +28,7 @@ import lint_netlist as lint    # noqa: E402
 import design_report as drpt   # noqa: E402
 import gates                   # noqa: E402
 import remediate               # noqa: E402
+import thermal_check           # noqa: E402
 
 
 def _drc(pcb: str) -> dict:
@@ -45,22 +48,26 @@ def _counts(viols: list) -> dict:
     return out
 
 
-def _gate_check(mode: str, pcb: str, netlist: str) -> list:
+def _gate_check(mode: str, pcb: str, netlist: str) -> dict:
     """Run the pcbnew-side gate checks (connector orientation / keepout /
-    routed-width-vs-class) under KiCad's bundled Python."""
+    plane integrity / routed-width-vs-class) under KiCad's bundled Python.
+    Returns {"issues": [...], "warnings": [...]}."""
     kpy = k._kicad_python()
     script = SERVER / "tools" / "swig_gate_checks.py"
     if not kpy or not script.is_file():
-        return [f"gate check unavailable ({mode})"]
+        return {"issues": [f"gate check unavailable ({mode})"], "warnings": []}
     r = subprocess.run([kpy, str(script), mode, pcb, netlist],
-                       capture_output=True, text=True, timeout=120)
+                       capture_output=True, text=True, timeout=300)
     for line in reversed(r.stdout.strip().splitlines()):
         if line.startswith("{"):
             try:
-                return json.loads(line).get("issues", [])
+                d = json.loads(line)
+                return {"issues": d.get("issues", []),
+                        "warnings": d.get("warnings", [])}
             except Exception:
                 break
-    return [f"gate check produced no result ({mode}): {r.stderr[-300:]}"]
+    return {"issues": [f"gate check produced no result ({mode}): "
+                       f"{r.stderr[-300:]}"], "warnings": []}
 
 
 def _board_fix(pcb: str, netlist: str, mode: str) -> list:
@@ -82,6 +89,90 @@ def _board_fix(pcb: str, netlist: str, mode: str) -> list:
             except Exception:
                 break
     return []
+
+
+def _route_hash(design: dict) -> str:
+    """Hash of everything that determines PLACEMENT + ROUTING. A change to a
+    value, sourcing field, or thermal annotation does not move copper — only
+    these keys force the expensive build+route stages to re-run."""
+    geo_keys = ("ref", "footprint", "x", "y", "rot", "side", "interior")
+    comps = sorted(({k: c.get(k) for k in geo_keys if k in c}
+                    for c in design.get("components", [])),
+                   key=lambda c: c["ref"])
+    payload = {
+        "components": comps,
+        "nets": design.get("nets"),
+        "net_specs": design.get("net_specs"),
+        "preroutes": design.get("preroutes"),
+        "board": design.get("board"),
+        "mounting_holes": design.get("mounting_holes"),
+        "antenna_keepout": design.get("antenna_keepout"),
+        "class": design.get("class"),
+        "emc": design.get("emc"),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _sourcing(design: dict) -> dict:
+    """Offline BOM sourcing audit for G5: every assembly-relevant part
+    should carry an LCSC number or an MPN; LCSC numbers must look like
+    Cxxxxx. Test points / mounting holes / fiducials are exempt. The
+    netlist 'require_sourcing': true upgrades findings to blockers."""
+    import re
+    missing, bad = [], []
+    for c in design.get("components", []):
+        ref = c["ref"]
+        if ref.startswith(("TP", "H", "FID")):
+            continue
+        lcsc = str(c.get("lcsc", "") or "")
+        mpn = str(c.get("mpn", "") or "")
+        if not lcsc and not mpn:
+            missing.append(ref)
+        if lcsc and not re.match(r"^C\d{3,}$", lcsc):
+            bad.append(f"{ref}: lcsc '{lcsc}' is not Cxxxxx format")
+    return {"missing": missing, "bad": bad,
+            "required": bool(design.get("require_sourcing"))}
+
+
+def _render(pcb: str, tag: str, quality: str = "basic") -> list:
+    """Render top/bottom PNGs next to the board so every gate exit leaves a
+    visual record (placement view at G3, final board at G5)."""
+    out = []
+    base = str(Path(pcb).with_suffix(""))
+    for side in ("top", "bottom"):
+        png = f"{base}_{tag}_{side}.png"
+        try:
+            r = subprocess.run(
+                [k.KICAD_CLI, "pcb", "render", pcb, "-o", png,
+                 "--side", side, "--quality", quality,
+                 "--width", "1600", "--height", "1400"],
+                capture_output=True, text=True, timeout=300)
+            if r.returncode == 0 and Path(png).is_file():
+                out.append(png)
+        except Exception:
+            pass
+    return out
+
+
+def _emc_stitch(pcb: str, emc: dict) -> dict:
+    """Run the EMC ground-stitching pass (perimeter via fence + interior
+    grid) on the routed board under KiCad's Python."""
+    kpy = k._kicad_python()
+    script = SERVER / "tools" / "emc_stitch.py"
+    if not kpy or not script.is_file():
+        return {"ok": False, "reason": "emc_stitch unavailable"}
+    r = subprocess.run(
+        [kpy, str(script), pcb, str(emc.get("max_freq_hz", 0)),
+         "fence" if emc.get("fence_only") else "grid"],
+        capture_output=True, text=True, timeout=600)
+    for line in reversed(r.stdout.strip().splitlines()):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except Exception:
+                break
+    return {"ok": False, "reason": r.stderr[-300:]}
 
 
 def _courtyard_drc(pcb: str) -> dict:
@@ -129,7 +220,9 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
         report["design_report"] = {
             "decoupling_uncovered": dr["decoupling"]["uncovered"],
             "flags": dr["flags"]}
-        g2 = gates.g2_schematic(r, dr)
+        trep = thermal_check.check(design)
+        report["thermal"] = trep
+        g2 = gates.g2_schematic(r, dr, trep)
         if g2["passed"]:
             break
         fixed, log = remediate.apply(design, g2["tasks"])
@@ -143,6 +236,24 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     if not g2["passed"]:
         return _halt(report)
 
+    # ---- ROUTE CACHE: when nothing that moves copper changed since the last
+    # successful run, reuse the routed board and skip build+route entirely —
+    # the G3/G4 GATES still re-run against the cached artifact (the cache
+    # skips work, never judgement). Hash computed AFTER G2 so a G2 netlist
+    # remediation correctly invalidates. PIPELINE_NO_CACHE=1 bypasses.
+    rhash = _route_hash(design)
+    cache_p = Path(base + ".cache.json")
+    cached = {}
+    try:
+        cached = json.loads(cache_p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    use_cache = (not placement
+                 and not os.environ.get("PIPELINE_NO_CACHE")
+                 and cached.get("route_hash") == rhash
+                 and cached.get("routed_ok")
+                 and Path(pcb).is_file())
+
     # ---- G3 + G4: place (gate) then route (gate), self-feeding. A G3 failure
     # whose tasks are all auto ("loosen placement") re-places at the next
     # pack_scale and re-tests; a G4 routing shortfall does the same (the
@@ -152,6 +263,22 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     g3 = g4 = None
     board_rep, route_rep, drc_rep = {}, {}, {}
     last_good = None              # (scale, g3, board_rep) of last buildable attempt
+    if use_cache:
+        report["route_cache"] = "hit"
+        board_rep = cached.get("board_rep") or {"ok": True}
+        cy = _courtyard_drc(pcb)
+        # the cached artifact is ROUTED — re-validate with the routed variant
+        # (plane integrity is a pre-route check; G4's DRC re-run below proves
+        # the net connectivity the plane check exists to predict)
+        pl = _gate_check("placement_routed", pcb, netlist)
+        g3 = gates.g3_placement(board_rep, cy, pl["issues"], pl["warnings"])
+        route_rep = {"cached": True,
+                     "pack_scale": cached.get("pack_scale"),
+                     "tracks": cached.get("tracks"),
+                     "unconnected": cached.get("unconnected", 0)}
+        scales = []                # skip the build+route loop below
+    else:
+        report["route_cache"] = "miss"
     for attempt, scale in enumerate(scales, 1):
         rb = k.build_board_from_netlist(netlist, w, h, pcb, "", placement, scale)
         board_rep = {kk: rb.get(kk) for kk in
@@ -173,11 +300,21 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
                              f"the fixed board -> restored routed board at "
                              f"pack_scale {scale}"]})
             break
+        if rb.get("ok") and trep.get("ep_via_parts"):
+            # self-remediate the G3 EP check: footprints without a
+            # ...ThermalVias variant get an IPC-7093 via farm dropped
+            # under the EP before the placement review runs
+            farm = _board_fix(pcb, netlist, "ep_vias")
+            if farm:
+                report.setdefault("remediation", []).append(
+                    {"gate": "G3", "round": attempt, "applied": farm})
         cy = _courtyard_drc(pcb) if rb.get("ok") else {"courtyard_violations": 0}
-        pl = _gate_check("placement", pcb, netlist) if rb.get("ok") else []
+        pl = (_gate_check("placement", pcb, netlist) if rb.get("ok")
+              else {"issues": [], "warnings": []})
         if design.get("mounting_holes") and not rb.get("mounting_holes"):
-            pl = pl + ["mounting holes requested but none placed on the board"]
-        g3 = gates.g3_placement(rb, cy, pl)
+            pl["issues"] = pl["issues"] + ["mounting holes requested but "
+                                           "none placed on the board"]
+        g3 = gates.g3_placement(rb, cy, pl["issues"], pl["warnings"])
         if not g3["passed"]:
             if (g3["tasks"] and all(t["auto"] for t in g3["tasks"])
                     and attempt < len(scales)):
@@ -186,6 +323,7 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
                      "applied": [f"re-placed at pack_scale {scales[attempt]}"]})
                 continue
             break
+        report["renders_placement"] = _render(pcb, "place")
         ra = k.autoroute_board(pcb, 600, "", 1500)
         route_rep = {"attempt": attempt, "pack_scale": scale,
                      "tracks": ra.get("tracks"),
@@ -238,8 +376,8 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     # gate re-tested — re-routing is never required for them.
     drc_rep = _drc(pcb)
     report["drc"] = drc_rep
-    widths = _gate_check("routed", pcb, netlist)
-    g4 = gates.g4_layout(route_rep, drc_rep, widths)
+    wc = _gate_check("routed", pcb, netlist)
+    g4 = gates.g4_layout(route_rep, drc_rep, wc["issues"], wc["warnings"])
     for rnd in (1, 2):
         if g4["passed"]:
             break
@@ -252,11 +390,46 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
         report["drc"] = drc_rep
         route_rep = {**route_rep, "unconnected": drc_rep["unconnected"]}
         report["autoroute"] = route_rep
-        widths = _gate_check("routed", pcb, netlist)
-        g4 = gates.g4_layout(route_rep, drc_rep, widths)
+        wc = _gate_check("routed", pcb, netlist)
+        g4 = gates.g4_layout(route_rep, drc_rep, wc["issues"], wc["warnings"])
+
+    # ---- EMC post-pass (opt-in via netlist "emc": {"stitch": true, ...}):
+    # perimeter GND via fence + interior stitching grid (Ott/Montrose,
+    # lambda/20 pitch from max_freq_hz), then re-DRC — the pass is
+    # clearance-aware but the gate trusts measurements, not intentions.
+    emc = design.get("emc") or {}
+    if g4["passed"] and emc.get("stitch") and not use_cache:
+        er = _emc_stitch(pcb, emc)
+        report["emc"] = er
+        notes = []
+        if er.get("ok"):
+            notes.append(f"EMC stitching: {er.get('vias_added')} GND vias "
+                         f"(fence {er.get('fence')}, interior "
+                         f"{er.get('interior')}, pitch {er.get('pitch_mm')} mm)")
+            drc_rep = _drc(pcb)
+            report["drc"] = drc_rep
+        else:
+            notes.append(f"EMC stitching FAILED: {er.get('reason')}")
+        if emc.get("teardrops"):
+            notes.append("teardrops requested but KiCad's teardrop generator "
+                         "has no headless API — generate in the GUI "
+                         "(Edit > Edit Teardrops) before fab if required")
+        g4 = gates.g4_layout(route_rep, drc_rep, wc["issues"],
+                             wc["warnings"] + notes)
     report["gates"].append(g4)
     if not g4["passed"]:
         return _halt(report)
+
+    # board is final (routed + healed + stitched): record the cache manifest
+    try:
+        cache_p.write_text(json.dumps({
+            "route_hash": rhash, "routed_ok": True,
+            "unconnected": drc_rep.get("unconnected", 0),
+            "pack_scale": route_rep.get("pack_scale"),
+            "tracks": route_rep.get("tracks"),
+            "board_rep": board_rep}, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
     # ---- G5: fabrication package (release) ----
     r = k.export_fab_package(pcb, netlist=netlist)
@@ -264,7 +437,11 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
            "files": len(r.get("files", [])),
            "bom": r.get("bom"), "cpl": r.get("cpl")}
     report["fab"] = fab
-    report["gates"].append(gates.g5_fab(fab, require_assembly=True))
+    report["renders_final"] = _render(pcb, "final", quality="high")
+    src = _sourcing(design)
+    report["sourcing"] = src
+    report["gates"].append(gates.g5_fab(fab, require_assembly=True,
+                                        sourcing=src))
     return _halt(report)
 
 
