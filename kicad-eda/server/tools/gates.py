@@ -155,7 +155,8 @@ def g4_layout(route_rep: dict, drc: dict, width_issues: list,
 
 
 def g5_fab(fab_rep: dict, min_files: int = 10,
-           require_assembly: bool = False) -> dict:
+           require_assembly: bool = False,
+           sourcing: dict | None = None) -> dict:
     blockers, warnings = [], []
     if not fab_rep.get("ok"):
         blockers.append("Gerber/drill export failed")
@@ -167,6 +168,18 @@ def g5_fab(fab_rep: dict, min_files: int = 10,
             blockers.append("assembly BOM.csv missing from the fab package")
         if not fab_rep.get("cpl"):
             blockers.append("assembly CPL.csv missing from the fab package")
+    if sourcing:
+        # a BOM without orderable part numbers is decorative, not a handoff.
+        # Warning by default; netlist "require_sourcing": true makes it a
+        # release blocker (contract-assembly posture).
+        hard = sourcing.get("required")
+        miss = sourcing.get("missing", [])
+        if miss:
+            msg = (f"{len(miss)} BOM part(s) have neither an LCSC number nor "
+                   f"an MPN: {miss[:8]}{'...' if len(miss) > 8 else ''}")
+            (blockers if hard else warnings).append(msg)
+        for b in sourcing.get("bad", []):
+            (blockers if hard else warnings).append(b)
     return _verdict("G5", "Fabrication package (handoff)", "release to fab",
                     blockers, warnings)
 

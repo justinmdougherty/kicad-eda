@@ -89,6 +89,27 @@ def _board_fix(pcb: str, netlist: str, mode: str) -> list:
     return []
 
 
+def _sourcing(design: dict) -> dict:
+    """Offline BOM sourcing audit for G5: every assembly-relevant part
+    should carry an LCSC number or an MPN; LCSC numbers must look like
+    Cxxxxx. Test points / mounting holes / fiducials are exempt. The
+    netlist 'require_sourcing': true upgrades findings to blockers."""
+    import re
+    missing, bad = [], []
+    for c in design.get("components", []):
+        ref = c["ref"]
+        if ref.startswith(("TP", "H", "FID")):
+            continue
+        lcsc = str(c.get("lcsc", "") or "")
+        mpn = str(c.get("mpn", "") or "")
+        if not lcsc and not mpn:
+            missing.append(ref)
+        if lcsc and not re.match(r"^C\d{3,}$", lcsc):
+            bad.append(f"{ref}: lcsc '{lcsc}' is not Cxxxxx format")
+    return {"missing": missing, "bad": bad,
+            "required": bool(design.get("require_sourcing"))}
+
+
 def _render(pcb: str, tag: str, quality: str = "basic") -> list:
     """Render top/bottom PNGs next to the board so every gate exit leaves a
     visual record (placement view at G3, final board at G5)."""
@@ -339,7 +360,10 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
            "bom": r.get("bom"), "cpl": r.get("cpl")}
     report["fab"] = fab
     report["renders_final"] = _render(pcb, "final", quality="high")
-    report["gates"].append(gates.g5_fab(fab, require_assembly=True))
+    src = _sourcing(design)
+    report["sourcing"] = src
+    report["gates"].append(gates.g5_fab(fab, require_assembly=True,
+                                        sourcing=src))
     return _halt(report)
 
 
