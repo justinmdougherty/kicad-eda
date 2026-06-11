@@ -1,0 +1,53 @@
+name: regression
+
+# The 10-board gated regression matrix + negative fixtures. Proves every
+# tool change keeps the concept->Gerbers pipeline green: ERC 0, courtyard 0,
+# routed, DRC 0/0, fab package complete — and that the gates still CATCH
+# what the negative fixtures break.
+#
+# Runs in the official KiCad container (kicad-cli + system python3 with the
+# pcbnew SWIG module — exactly what the headless pipeline shells into).
+# Freerouting 1.9.0 ships in the repo; only a JRE is installed here.
+
+on:
+  push:
+    branches: [main, improvements]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150            # dense boards can route for a long time
+    container:
+      image: kicad/kicad:10.0
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JRE + venv support
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            default-jre-headless python3-venv python3-pip
+          java -version
+          kicad-cli version
+
+      - name: Server venv
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet -r kicad-eda/server/requirements.txt
+
+      - name: Run the gated regression suite
+        run: /tmp/venv/bin/python kicad-eda/pipeline/run_all.py
+
+      - name: Upload board artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-boards
+          path: |
+            kicad-eda/examples/**/netlist.kicad_pcb
+            kicad-eda/examples/**/netlist_drc.json
+            kicad-eda/examples/**/*.png
+          retention-days: 7
