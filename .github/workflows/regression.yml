@@ -29,7 +29,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            default-jre-headless python3-venv python3-pip
+            default-jre python3-venv python3-pip xvfb
           java -version
           kicad-cli version
 

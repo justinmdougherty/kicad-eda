@@ -1,5 +1,6 @@
-# kicad-generator server dependencies — pinned to the version the regression
+# kicad-generator server dependencies — pinned to the versions the regression
 # suite was validated against (CI and the Dockerfile install from this file).
 mcp==1.27.2
+sexpdata==1.0.2
 # Optional — enables the PCB / IPC tools. Requires a matching KiCad 9 install.
 # kicad-python

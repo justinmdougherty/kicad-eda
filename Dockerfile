@@ -4,6 +4,10 @@
 # Freerouting 1.9.0 jar, and the server's Python deps. This is also the
 # zero-step answer to "how do I install the dependencies" when sharing.
 #
+# default-jre (NOT -headless) + xvfb: Freerouting 1.x initializes Swing
+# even in CLI mode, and the headless JRE build has no X11 toolkit at all —
+# the server wraps the router in xvfb-run when no display is present.
+#
 #   docker build -t kicad-eda .
 #   docker run --rm kicad-eda                                  # regression suite
 #   docker run --rm -v %cd%\myboard:/work kicad-eda \
@@ -15,7 +19,7 @@ USER root
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        default-jre-headless python3-venv python3-pip \
+        default-jre python3-venv python3-pip xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 COPY kicad-eda/ /plugin/

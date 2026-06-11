@@ -903,6 +903,17 @@ def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
     shutil.copyfile(dsn, w_dsn)
     args = [java, "-Xmx4g", "-jar", fj, "-de", w_dsn, "-do", w_ses,
             "-mp", str(max_passes)]
+    # Freerouting 1.x initializes AWT/Swing even in CLI mode — on a
+    # display-less Linux box (Docker, CI) it dies with HeadlessException
+    # before routing anything. Wrap it in a virtual framebuffer.
+    if os.name != "nt" and not os.environ.get("DISPLAY") \
+            and "freerouting-2" not in Path(fj).name:
+        if shutil.which("xvfb-run"):
+            args = ["xvfb-run", "-a"] + args
+        else:
+            return {"ok": False, "reason":
+                    "no display and xvfb-run not found — Freerouting 1.x "
+                    "needs one (install xvfb, e.g. apt-get install xvfb)"}
     if "freerouting-2" in Path(fj).name:
         budget = max(60, route_timeout - 60)
         hh, rem = divmod(budget, 3600)
