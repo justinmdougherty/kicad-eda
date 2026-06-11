@@ -3,7 +3,7 @@
   "name": "kicad-eda",
   "displayName": "KiCad EDA — Napkin to Gerbers",
   "description": "Concept-to-Gerbers PCB design for KiCad 9/10. Two workflows: a fully HEADLESS gated pipeline (netlist.json -> schematic+ERC -> SWIG board build -> Freerouting -> DRC -> fab zip, with IEEE 15288.2-style self-remediating gates), and a GUI-assisted 10-stage flow. Bundles the kicad-generator MCP server, gate-reviewer subagents, IPC-2221/2141A rules math, the Freerouting 1.9 autorouter jar, and cross-platform guardrail hooks.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "Justin Dougherty",
     "url": "https://github.com/dougherty-labs"
