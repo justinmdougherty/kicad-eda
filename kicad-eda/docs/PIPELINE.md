@@ -182,6 +182,15 @@ Useful environment variables:
 | `PACK_DEBUG=1` | print cluster/shelf packing decisions |
 | `FREEROUTING_JAR` | pin a specific router jar (keep 1.9.0) |
 | `KICAD_PATH` | KiCad install root when auto-detect fails |
+| `PIPELINE_NO_CACHE=1` | bypass the route cache (always rebuild + re-route) |
+
+**Route cache:** after a successful run, `<netlist>.cache.json` records a hash
+of everything that moves copper (geometry, nets, net_specs, preroutes, board,
+emc). A re-run with only value/sourcing/thermal edits reuses the routed board
+— the G3/G4 **gates still re-run** against it (the cache skips work, never
+judgement) — and goes straight to silk/checks/fab. Any net, footprint,
+position, or preroute change invalidates automatically, as does a G2 netlist
+remediation.
 
 ## 5. Regression suite
 

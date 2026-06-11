@@ -13,7 +13,9 @@ Usage:
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -87,6 +89,29 @@ def _board_fix(pcb: str, netlist: str, mode: str) -> list:
             except Exception:
                 break
     return []
+
+
+def _route_hash(design: dict) -> str:
+    """Hash of everything that determines PLACEMENT + ROUTING. A change to a
+    value, sourcing field, or thermal annotation does not move copper — only
+    these keys force the expensive build+route stages to re-run."""
+    geo_keys = ("ref", "footprint", "x", "y", "rot", "side", "interior")
+    comps = sorted(({k: c.get(k) for k in geo_keys if k in c}
+                    for c in design.get("components", [])),
+                   key=lambda c: c["ref"])
+    payload = {
+        "components": comps,
+        "nets": design.get("nets"),
+        "net_specs": design.get("net_specs"),
+        "preroutes": design.get("preroutes"),
+        "board": design.get("board"),
+        "mounting_holes": design.get("mounting_holes"),
+        "antenna_keepout": design.get("antenna_keepout"),
+        "class": design.get("class"),
+        "emc": design.get("emc"),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def _sourcing(design: dict) -> dict:
@@ -211,6 +236,24 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     if not g2["passed"]:
         return _halt(report)
 
+    # ---- ROUTE CACHE: when nothing that moves copper changed since the last
+    # successful run, reuse the routed board and skip build+route entirely —
+    # the G3/G4 GATES still re-run against the cached artifact (the cache
+    # skips work, never judgement). Hash computed AFTER G2 so a G2 netlist
+    # remediation correctly invalidates. PIPELINE_NO_CACHE=1 bypasses.
+    rhash = _route_hash(design)
+    cache_p = Path(base + ".cache.json")
+    cached = {}
+    try:
+        cached = json.loads(cache_p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    use_cache = (not placement
+                 and not os.environ.get("PIPELINE_NO_CACHE")
+                 and cached.get("route_hash") == rhash
+                 and cached.get("routed_ok")
+                 and Path(pcb).is_file())
+
     # ---- G3 + G4: place (gate) then route (gate), self-feeding. A G3 failure
     # whose tasks are all auto ("loosen placement") re-places at the next
     # pack_scale and re-tests; a G4 routing shortfall does the same (the
@@ -220,6 +263,19 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     g3 = g4 = None
     board_rep, route_rep, drc_rep = {}, {}, {}
     last_good = None              # (scale, g3, board_rep) of last buildable attempt
+    if use_cache:
+        report["route_cache"] = "hit"
+        board_rep = cached.get("board_rep") or {"ok": True}
+        cy = _courtyard_drc(pcb)
+        pl = _gate_check("placement", pcb, netlist)
+        g3 = gates.g3_placement(board_rep, cy, pl["issues"], pl["warnings"])
+        route_rep = {"cached": True,
+                     "pack_scale": cached.get("pack_scale"),
+                     "tracks": cached.get("tracks"),
+                     "unconnected": cached.get("unconnected", 0)}
+        scales = []                # skip the build+route loop below
+    else:
+        report["route_cache"] = "miss"
     for attempt, scale in enumerate(scales, 1):
         rb = k.build_board_from_netlist(netlist, w, h, pcb, "", placement, scale)
         board_rep = {kk: rb.get(kk) for kk in
@@ -331,7 +387,7 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     # lambda/20 pitch from max_freq_hz), then re-DRC — the pass is
     # clearance-aware but the gate trusts measurements, not intentions.
     emc = design.get("emc") or {}
-    if g4["passed"] and emc.get("stitch"):
+    if g4["passed"] and emc.get("stitch") and not use_cache:
         er = _emc_stitch(pcb, emc)
         report["emc"] = er
         notes = []
@@ -352,6 +408,17 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     report["gates"].append(g4)
     if not g4["passed"]:
         return _halt(report)
+
+    # board is final (routed + healed + stitched): record the cache manifest
+    try:
+        cache_p.write_text(json.dumps({
+            "route_hash": rhash, "routed_ok": True,
+            "unconnected": drc_rep.get("unconnected", 0),
+            "pack_scale": route_rep.get("pack_scale"),
+            "tracks": route_rep.get("tracks"),
+            "board_rep": board_rep}, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
     # ---- G5: fabrication package (release) ----
     r = k.export_fab_package(pcb, netlist=netlist)
