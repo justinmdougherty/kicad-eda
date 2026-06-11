@@ -1,0 +1,4 @@
+# run artifacts dropped at the repo root when the suite runs from here
+logs/
+__pycache__/
+*.pyc
