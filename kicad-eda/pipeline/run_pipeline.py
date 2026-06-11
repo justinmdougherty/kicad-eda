@@ -46,22 +46,26 @@ def _counts(viols: list) -> dict:
     return out
 
 
-def _gate_check(mode: str, pcb: str, netlist: str) -> list:
+def _gate_check(mode: str, pcb: str, netlist: str) -> dict:
     """Run the pcbnew-side gate checks (connector orientation / keepout /
-    routed-width-vs-class) under KiCad's bundled Python."""
+    plane integrity / routed-width-vs-class) under KiCad's bundled Python.
+    Returns {"issues": [...], "warnings": [...]}."""
     kpy = k._kicad_python()
     script = SERVER / "tools" / "swig_gate_checks.py"
     if not kpy or not script.is_file():
-        return [f"gate check unavailable ({mode})"]
+        return {"issues": [f"gate check unavailable ({mode})"], "warnings": []}
     r = subprocess.run([kpy, str(script), mode, pcb, netlist],
-                       capture_output=True, text=True, timeout=120)
+                       capture_output=True, text=True, timeout=300)
     for line in reversed(r.stdout.strip().splitlines()):
         if line.startswith("{"):
             try:
-                return json.loads(line).get("issues", [])
+                d = json.loads(line)
+                return {"issues": d.get("issues", []),
+                        "warnings": d.get("warnings", [])}
             except Exception:
                 break
-    return [f"gate check produced no result ({mode}): {r.stderr[-300:]}"]
+    return {"issues": [f"gate check produced no result ({mode}): "
+                       f"{r.stderr[-300:]}"], "warnings": []}
 
 
 def _board_fix(pcb: str, netlist: str, mode: str) -> list:
@@ -177,10 +181,12 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
                              f"pack_scale {scale}"]})
             break
         cy = _courtyard_drc(pcb) if rb.get("ok") else {"courtyard_violations": 0}
-        pl = _gate_check("placement", pcb, netlist) if rb.get("ok") else []
+        pl = (_gate_check("placement", pcb, netlist) if rb.get("ok")
+              else {"issues": [], "warnings": []})
         if design.get("mounting_holes") and not rb.get("mounting_holes"):
-            pl = pl + ["mounting holes requested but none placed on the board"]
-        g3 = gates.g3_placement(rb, cy, pl)
+            pl["issues"] = pl["issues"] + ["mounting holes requested but "
+                                           "none placed on the board"]
+        g3 = gates.g3_placement(rb, cy, pl["issues"], pl["warnings"])
         if not g3["passed"]:
             if (g3["tasks"] and all(t["auto"] for t in g3["tasks"])
                     and attempt < len(scales)):
@@ -241,7 +247,7 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     # gate re-tested — re-routing is never required for them.
     drc_rep = _drc(pcb)
     report["drc"] = drc_rep
-    widths = _gate_check("routed", pcb, netlist)
+    widths = _gate_check("routed", pcb, netlist)["issues"]
     g4 = gates.g4_layout(route_rep, drc_rep, widths)
     for rnd in (1, 2):
         if g4["passed"]:
@@ -255,7 +261,7 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
         report["drc"] = drc_rep
         route_rep = {**route_rep, "unconnected": drc_rep["unconnected"]}
         report["autoroute"] = route_rep
-        widths = _gate_check("routed", pcb, netlist)
+        widths = _gate_check("routed", pcb, netlist)["issues"]
         g4 = gates.g4_layout(route_rep, drc_rep, widths)
     report["gates"].append(g4)
     if not g4["passed"]:

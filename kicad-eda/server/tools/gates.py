@@ -99,8 +99,8 @@ def g2_schematic(sch_rep: dict, design_rep: dict,
 
 
 def g3_placement(board_rep: dict, courtyard_drc: dict,
-                 place_issues: list) -> dict:
-    blockers, warnings, tasks = [], [], []
+                 place_issues: list, place_warnings: list | None = None) -> dict:
+    blockers, warnings, tasks = [], list(place_warnings or []), []
     if not board_rep.get("ok"):
         why = (board_rep.get("error") or board_rep.get("reason")
                or board_rep.get("stderr") or "(no detail)")
