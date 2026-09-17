@@ -1,12 +1,15 @@
-"""run_pipeline pure helpers: _route_hash (stage-cache key) and _sourcing (G5)."""
+"""run_pipeline helpers: _route_hash (stage-cache key), _sourcing (G5) and the
+board-cli plumbing behind _drc / _render."""
 from __future__ import annotations
 
 import copy
+import json
 import re
 
 import pytest
 
 import run_pipeline as rp
+import toolchain as tc
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -143,3 +146,47 @@ def test_sourcing_required_flag_from_design():
     assert rp._sourcing({"components": [], "require_sourcing": True})["required"] is True
     assert rp._sourcing({"components": [], "require_sourcing": 0})["required"] is False
     assert rp._sourcing({})["required"] is False
+
+
+# --- _drc / _render use the BOARD kicad-cli ------------------------------------
+
+def test_drc_runs_the_board_cli_and_records_it(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(list(args))
+        rpt = args[args.index("-o") + 1]
+        (tmp_path / rpt).write_text(json.dumps(
+            {"violations": [{"type": "clearance"}], "unconnected_items": [{}]}), encoding="utf-8")
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(tc, "board_cli", lambda: "S:/9.0/kicad-cli.exe")
+    monkeypatch.setattr(tc, "kicad_cli", lambda: "N:/10.99/kicad-cli.exe")
+    monkeypatch.setattr(rp.subprocess, "run", fake_run)
+    monkeypatch.chdir(tmp_path)
+    res = rp._drc("b.kicad_pcb")
+    assert calls[0][:3] == ["S:/9.0/kicad-cli.exe", "pcb", "drc"]
+    assert res == {"errors": 1, "unconnected": 1, "types": {"clearance": 1},
+                   "kicad_cli": "S:/9.0/kicad-cli.exe"}
+
+
+def test_render_runs_the_board_cli(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(list(args))
+        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "no"})()
+
+    monkeypatch.setattr(tc, "board_cli", lambda: "S:/9.0/kicad-cli.exe")
+    monkeypatch.setattr(rp.subprocess, "run", fake_run)
+    assert rp._render(str(tmp_path / "b.kicad_pcb"), "final") == []
+    assert [c[0] for c in calls] == ["S:/9.0/kicad-cli.exe"] * 2
+    assert [c[c.index("--side") + 1] for c in calls] == ["top", "bottom"]
+
+
+def test_drc_and_render_are_loud_without_a_kicad_cli(monkeypatch):
+    monkeypatch.setattr(tc, "board_cli", lambda: None)
+    with pytest.raises(RuntimeError, match="kicad-cli not found"):
+        rp._drc("b.kicad_pcb")
+    with pytest.raises(RuntimeError, match="kicad-cli not found"):
+        rp._render("b.kicad_pcb", "place")

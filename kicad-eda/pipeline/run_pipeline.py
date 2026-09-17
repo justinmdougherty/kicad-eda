@@ -24,6 +24,7 @@ SERVER = Path(__file__).resolve().parents[1] / "server"
 sys.path.insert(0, str(SERVER))
 sys.path.insert(0, str(SERVER / "tools"))
 import kicad_server as k       # noqa: E402
+import toolchain as tc         # noqa: E402
 import lint_netlist as lint    # noqa: E402
 import design_report as drpt   # noqa: E402
 import gates                   # noqa: E402
@@ -31,14 +32,25 @@ import remediate               # noqa: E402
 import thermal_check           # noqa: E402
 
 
+def _board_cli() -> str:
+    """The kicad-cli for BOARD jobs: the install whose pcbnew built the board
+    (toolchain.board_cli), never a newer nightly's. Loud when absent."""
+    cli = tc.board_cli()
+    if not cli:
+        raise RuntimeError("kicad-cli not found; install KiCad or set KICAD_PATH")
+    return cli
+
+
 def _drc(pcb: str) -> dict:
     rpt = str(Path(pcb).with_suffix("")) + "_drc.json"
-    subprocess.run([k.KICAD_CLI, "pcb", "drc", pcb, "--severity-error",
+    cli = _board_cli()
+    subprocess.run([cli, "pcb", "drc", pcb, "--severity-error",
                     "-o", rpt, "--format", "json"], capture_output=True, text=True)
     d = json.loads(Path(rpt).read_text())
     return {"errors": len(d.get("violations", [])),
             "unconnected": len(d.get("unconnected_items", [])),
-            "types": _counts(d.get("violations", []))}
+            "types": _counts(d.get("violations", [])),
+            "kicad_cli": cli}
 
 
 def _counts(viols: list) -> dict:
@@ -140,11 +152,12 @@ def _render(pcb: str, tag: str, quality: str = "basic") -> list:
     visual record (placement view at G3, final board at G5)."""
     out = []
     base = str(Path(pcb).with_suffix(""))
+    cli = _board_cli()
     for side in ("top", "bottom"):
         png = f"{base}_{tag}_{side}.png"
         try:
             r = subprocess.run(
-                [k.KICAD_CLI, "pcb", "render", pcb, "-o", png,
+                [cli, "pcb", "render", pcb, "-o", png,
                  "--side", side, "--quality", quality,
                  "--width", "1600", "--height", "1400"],
                 capture_output=True, text=True, timeout=300)
@@ -214,12 +227,13 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     for rnd in range(1, 4):
         r = k.build_schematic_from_netlist(netlist, sch)
         report["schematic"] = {kk: r.get(kk) for kk in
-                               ("ok", "components", "nets", "erc_ok",
+                               ("ok", "backend", "components", "nets", "erc_ok",
                                 "erc_violations")}
         dr = drpt.analyze(design, syms)
         report["design_report"] = {
             "decoupling_uncovered": dr["decoupling"]["uncovered"],
-            "flags": dr["flags"]}
+            "flags": dr["flags"],
+            "errors": dr.get("errors", [])}
         trep = thermal_check.check(design)
         report["thermal"] = trep
         g2 = gates.g2_schematic(r, dr, trep)

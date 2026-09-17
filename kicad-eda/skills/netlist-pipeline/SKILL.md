@@ -34,7 +34,7 @@ Never hand-edit the generated board to silence a gate.
 `run_pipeline.py` is primary (it owns the remediation loop). The same steps
 exist as `kicad-generator` MCP tools for driving a board one stage at a time:
 
-- `build_schematic_from_netlist(netlist, out_sch, symbols_dir, sidecars_dir, run_erc)` — G2: ERC-clean `.kicad_sch` (embedded symbols, no_connects, PWR_FLAGs); fails with `missing_pins` when a (ref, pad) resolves to no coordinate.
+- `build_schematic_from_netlist(netlist, out_sch, symbols_dir, sidecars_dir, run_erc, backend="auto")` — G2: ERC-clean `.kicad_sch` (a label per net pin, no_connects, PWR_FLAGs). `backend` "api" = KiCad 11 places every symbol through its schematic API and writes a **KiCad 11 file** (ERC with the newest kicad-cli; `symbols_dir` / `sidecars_dir` are ignored), "file" = `sch_build.py` with embedded symbols (KiCad 9/10 format); "auto" takes the API when a KiCad 11 nightly is installed. Fails with `missing_pins` when a (ref, pad) resolves to no pin. The response's `backend` says which ran; same topology either way, so G2 is identical.
 - `design_report(netlist)` — G2 design-intent review (decoupling, power tree, floating pins, pulls); writes `<netlist>_report.md`.
 - `build_board_from_netlist(netlist, board_w, board_h, out_pcb, footprints_dir, placement, pack_scale)` — G3: placed board, planes, Edge.Cuts, IPC net classes written to the `.kicad_pro`.
 - `check_design_gates(pcb, netlist, stage="placement"|"routed")` — the G3 / G4 review; `passed` must be true before the next step.
@@ -42,10 +42,19 @@ exist as `kicad-generator` MCP tools for driving a board one stage at a time:
 - `add_ground_stitching(pcb, gnd_net, max_freq_hz, er, interior, via_diameter_mm, via_drill_mm)` — transactional GND via fence/grid on a DRC-clean routed board.
 - `export_fab_package(pcb, out_dir, zip_name, netlist)` — G5: Gerbers, drill, CPL, BOM, zipped.
 - `build_pin_sidecars("Lib:Symbol,...")` — optional: both flows derive pin coordinates from the symbol; a sidecar in `server/pins/` overrides for both. Still a valid symbol-id check (exits 1 on an unknown symbol).
-- `server_status()` — kicad-cli, bundled Python, Java/Freerouting, IPC, open documents, capabilities.
+- `server_status()` — every installed KiCad (`installs`), the kicad-cli / bundled Python / libraries in use, `schematic_backend` ("api" | "file") with the reason when it is "file", Java/Freerouting, IPC, open documents, capabilities.
 
 Every writer above refuses a file that is open in a KiCad editor — close it
 first (`test_kicad_connection().open_documents` shows what is open).
+
+**Backends and installs** (`docs/PIPELINE.md` section 8): the newest kicad-cli
+runs schematic ERC/render, the newest KiCad with a pcbnew Python (9/10)
+builds the board and its own kicad-cli runs the board's DRC/Gerbers/render
+(never a newer nightly's), and a KiCad 11 nightly (10.99+, optional) serves the
+schematic API. A schematic written by the API backend needs KiCad 11 to open;
+pass `backend="file"` for a KiCad 9/10 file. A nightly that has never been
+opened has no library tables (`symbol Device:R not found`) — open it once or
+copy `sym-lib-table` / `fp-lib-table` from its `share/kicad/template`.
 
 ## Authoring rules that decide success
 

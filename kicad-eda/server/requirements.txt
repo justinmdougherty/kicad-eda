@@ -2,5 +2,11 @@
 # suite was validated against (CI and the Dockerfile install from this file).
 mcp==1.27.2
 sexpdata==1.0.2
-# Optional — enables the PCB / IPC tools. Requires a matching KiCad 9 install.
-# kicad-python
+# Runtime deps of the vendored kicad-python (server/vendor/kipy — built against
+# the KiCad 11 protos; the PyPI kicad-python must NOT be installed alongside it,
+# kicad_server puts server/vendor first on sys.path so the vendored copy wins).
+protobuf>=5.29.6,<6
+pynng>=0.9,<0.10
+jsonschema>=4.23,<5
+zstandard>=0.25,<0.26
+typing_extensions>=4.13.2

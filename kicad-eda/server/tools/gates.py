@@ -71,6 +71,14 @@ def g2_schematic(sch_rep: dict, design_rep: dict,
         tasks.append({"desc": f"resolve {erc} ERC violation(s)", "auto": False,
                       "fix": {}})
 
+    # a symbol the design review could not read means its pin-type checks
+    # (decoupling, power tree, floating pins) passed VACUOUSLY for that part —
+    # the review did not run, so the gate cannot pass on its verdict
+    for e in design_rep.get("errors", []):
+        blockers.append(f"design review could not run: {e}")
+        tasks.append({"desc": f"make the symbol readable so the design review "
+                              f"covers it: {e}", "auto": False, "fix": {}})
+
     dec = design_rep.get("decoupling", {})
     for u in dec.get("uncovered", []):
         for rail in u["rails_without_cap"]:

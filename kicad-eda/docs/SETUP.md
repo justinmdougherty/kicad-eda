@@ -17,6 +17,7 @@ zip file you can upload to a board fab.
 | **Claude Code** | The AI chat app this plugin runs inside. Lives in your terminal. |
 | **Git** | Lets your computer download ("clone") the private repo you've been invited to. |
 | **KiCad 10** | The PCB design suite. The plugin drives it headlessly — you only open it at the end to look at your board. |
+| **KiCad 11 nightly** *(optional)* | Lets KiCad itself draw the schematic through its new API instead of the plugin writing the file by hand. Everything works without it. |
 | **Java** | Runs the autorouter (the program that draws the copper traces). |
 | **Python 3** | Runs the plugin's design tools. |
 | **The kicad-eda plugin** | The thing that ties it all together. |
@@ -103,6 +104,29 @@ This is a multi-gigabyte download — let it run. Default options are fine.
 
 When it finishes, open KiCad once (Start menu → KiCad 10) and let it do its
 first-run setup. Accept the defaults. You can close it afterward.
+
+### Optional: KiCad 11 nightly (schematic API)
+
+With a KiCad 11 nightly installed **alongside** KiCad 10, the plugin builds
+schematics through KiCad's own API (KiCad places the symbols and writes the
+file) and can even edit a schematic you have open in the KiCad 11 editor.
+Skip this if you just want boards — the plugin falls back to writing the
+schematic file itself.
+
+1. Download the Windows nightly from
+   <https://downloads.kicad.org/kicad/windows/explore/nightlies> (macOS and
+   Linux nightlies are one level up on the same site) and install it. It
+   lands in `C:\Program Files\KiCad\10.99` (a KiCad 11 nightly calls itself
+   version 10.99) and does not touch your KiCad 10.
+2. **Open KiCad 11 once** and let it do its first-run setup. Until then it has
+   no library tables and the plugin reports `symbol Device:R not found`.
+   (Alternative without opening it: copy `sym-lib-table` and `fp-lib-table`
+   from `C:\Program Files\KiCad\10.99\share\kicad\template` into
+   `%APPDATA%\kicad\10.99`.)
+3. Keep KiCad 10: the board build still needs its bundled Python, which the
+   nightly no longer ships.
+
+Schematics made this way are KiCad 11 files — open them in KiCad 11, not 10.
 
 ---
 
@@ -219,10 +243,15 @@ yes, or use the matching step above. The happy ending looks like:
 
 ```
 [ok] KiCad: 10.0.x
+[--] KiCad 11 nightly not found (optional: schematic API backend) ...
 [ok] Java: openjdk 21...
 [ok] Python: 3.12.x
 [ok] freerouting-1.9.0.jar present
 ```
+
+The `[--]` line is informational — the nightly is optional (Step 4) and the
+checker never installs it. With one installed it reads
+`[ok] KiCad 11 nightly (optional, schematic API): 10.99.0-...`.
 
 The first time the plugin's tools run, it also builds its private Python
 environment — that one-time step takes a minute or two.
@@ -291,6 +320,8 @@ and re-runs only what changed.
 | `java not found (Freerouting needs a JRE/JDK)` during routing | Step 5, then restart Claude Code. `java -version` must work in a fresh terminal. |
 | Routing seems frozen for minutes | Normal for dense boards. The pipeline has its own timeout and will tell you if the router actually failed. |
 | You have KiCad 9 | Upgrade to 10. The headless tools call KiCad APIs that changed between 9 and 10. |
+| `symbol Device:R not found` (or "no libraries") right after installing the KiCad 11 nightly | The nightly has never been opened, so it has no library tables. Open KiCad 11 once, or copy `sym-lib-table` and `fp-lib-table` from `C:\Program Files\KiCad\10.99\share\kicad\template` into `%APPDATA%\kicad\10.99` (Step 4). |
+| KiCad 10 refuses to open the `.kicad_sch` | It was written by KiCad 11 (the schematic API backend). Open it in KiCad 11, or ask Claude to rebuild it with `backend="file"` for a KiCad 10 file. |
 | Something else | Copy the error into the chat — Claude can usually diagnose its own pipeline. The internals run-book is `docs/PIPELINE.md` in the repo. |
 
 ---
@@ -306,4 +337,6 @@ and re-runs only what changed.
   it for you.
 - **The KiCad GUI being closed.** The pipeline never needs KiCad running —
   it uses KiCad's command-line tools. You only open KiCad to admire the
-  result.
+  result. (The one bonus of KiCad 11: if you have the schematic open in its
+  editor with the API server enabled, Claude's schematic edits land right in
+  that window.)

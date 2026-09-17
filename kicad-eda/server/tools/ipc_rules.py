@@ -56,10 +56,10 @@ def clearance_mm(voltage_peak: float, column: str = "B2") -> float:
     v = abs(voltage_peak)
     idx = _COL[column]
     if v <= 500:
+        # the last row's bound IS 500, so the loop always returns here
         for vmax, *cols in _CLEARANCE_TABLE:
             if v <= vmax:
                 return cols[idx - 1]
-        return _CLEARANCE_TABLE[-1][idx]
     base, slope = _CLEARANCE_OVER_500[column]
     return round(base + (v - 500) * slope, 4)
 

@@ -19,7 +19,12 @@ const { ROOT, VENV_PY, WIN } = require('./venv');
 
 const mode = process.argv[2] || '';
 const IPC_PROBE_TIMEOUT_MS = 8000;
-const IPC_PROBE = 'from kipy import KiCad; k=KiCad(); print(k.get_version())';
+// The probe imports the VENDORED kipy (server/vendor, built against the KiCad
+// 11 protos) — the same copy the MCP server puts first on sys.path — never a
+// pip-installed kicad-python that may be missing the schematic API.
+const VENDOR_DIR = path.join(ROOT, 'server', 'vendor');
+const IPC_PROBE = `import sys; sys.path.insert(0, ${JSON.stringify(VENDOR_DIR)}); `
+  + 'from kipy import KiCad; k=KiCad(); print(k.get_version())';
 const ENABLE_API_HINT = 'Preferences > Plugins and Content Manager > Enable KiCad API '
   + '(KiCad 9: Preferences > API)';
 
@@ -148,9 +153,12 @@ if (mode === 'session-start') {
 }
 
 if (mode === 'check-ipc') {
-  // The IPC-API tool family needs a running KiCad GUI with the API server
-  // enabled. The headless pipeline (create_pcb / build_board_from_netlist /
-  // autoroute_board / drc_pcb / export_fab_package) does NOT go through here.
+  // The IPC-API tool family (live board edits) needs a running KiCad GUI with
+  // the API server enabled. The headless pipeline (create_pcb /
+  // build_board_from_netlist / autoroute_board / drc_pcb / export_fab_package)
+  // and EVERY schematic tool (they run their own headless KiCad 11 api-server
+  // or the file model; no GUI needed) do NOT go through here — keep the
+  // hooks.json matcher limited to the live board tools.
   // Probe the API socket through the venv first; fall back to a process scan
   // when kipy is absent. Unknown = allow.
   const ipc = probeIpc();

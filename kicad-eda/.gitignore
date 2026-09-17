@@ -24,3 +24,6 @@ examples/**/*.png
 examples/**/*.csv
 ~*.lck
 .venv*/
+
+# vendored kipy (server/vendor/kipy) ships source + generated *_pb2 only
+server/vendor/**/__pycache__/

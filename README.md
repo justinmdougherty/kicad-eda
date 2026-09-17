@@ -17,6 +17,7 @@ from a blank machine to your first board.
   clean DRC, and a fab-ready zip (Gerbers, drill, BOM, CPL). Five
   self-remediating review gates in the IEEE 15288.2 style do the engineering
   discipline; KiCad 10 + the bundled Freerouting autorouter do the file
-  work. See [`kicad-eda/README.md`](kicad-eda/README.md) to get started and
+  work, and an optional KiCad 11 nightly lets KiCad draw the schematic
+  itself through its IPC API. See [`kicad-eda/README.md`](kicad-eda/README.md) to get started and
   [`kicad-eda/docs/PIPELINE.md`](kicad-eda/docs/PIPELINE.md) for the
   internals run-book.

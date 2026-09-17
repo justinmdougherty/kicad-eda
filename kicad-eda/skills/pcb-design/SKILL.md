@@ -19,16 +19,16 @@ You are the lead. At each gate, hand the review to the matching subagent and act
 - **Stage 9 (DRC):** delegate to the `drc-reviewer` subagent.
 - **Stage 10 (Fab):** delegate to the `fab-checker` subagent.
 
-The live PCB stages (6–10) require KiCad (9/10 today; 11 nightly for the API path) running with the IPC API enabled; the IPC tools return `ipc_connected: false` when it is not, and a plugin hook blocks them when the KiCad API is unreachable (it probes the API through the server venv; a kicad/pcbnew process scan is only the fallback when kipy is missing). A second hook validates schematic files after each write. The fab profile and KiCad path come from the plugin's userConfig.
+The live PCB stages (6–10) require KiCad (9/10 today; 11 nightly for the API path) running with the IPC API enabled; the IPC tools return `ipc_connected: false` when it is not, and a plugin hook blocks them when the KiCad API is unreachable (it probes the API through the server venv; a kicad/pcbnew process scan is only the fallback when kipy is missing). The schematic stages (3–4) need no running KiCad: with a KiCad 11 nightly installed the schematic tools drive KiCad's own schematic API (a private headless `kicad-cli api-server`, or the running KiCad 11 editor when the file is open there); otherwise they write the file themselves. A second hook validates schematic files after each write. The fab profile and KiCad path come from the plugin's userConfig.
 
 ## The kicad-generator tool surface (call these by name — nothing else exists)
 
 | Stage | Tool | Notes |
 |---|---|---|
-| 3 | `create_schematic(path, paper="A4")` → `add_components_batch(sch, components=[{ref, lib_id, value, x, y, rot?, footprint?}])` | new in-memory schematic for that `.kicad_sch` path, then ONE batch call: a real list of dicts, key is `ref`; prefer over `add_component` |
-| 3 | `wire_by_ref(sch, ref_a, pin_a, ref_b, pin_b)` / `label_pin(sch, ref, pin, net_name)` / `power_pin(sch, ref, pin, net_name)` | pin coordinates are resolved from the KiCad symbol (by pin number or name) and rotated by the symbol's `rot`; a sidecar in `server/pins/<Lib_Symbol>.pins.json` overrides. On a ValueError fix the pin id or `lib_id` named in the message — `build_pin_sidecars` is optional (an id check / override), not a prerequisite |
-| 3 | `add_wire(sch, x1, y1, x2, y2)` / `add_label(sch, net, x, y, rot=0)` / `add_power_port(sch, net, x, y)` | explicit-coordinate fallbacks |
-| 3–4 | `save_schematic(sch)` → `run_erc(sch)` → `render_sch(sch)` | write (embeds symbols), check, look. `list_symbols(sch)` / `list_nets(sch)` inspect the model |
+| 3 | `create_schematic(path, paper="A4", backend="auto")` → `add_components_batch(sch, components=[{ref, lib_id, value, x, y, rot?, footprint?, unit?}])` | new schematic for that `.kicad_sch` path (`backend` "auto": KiCad 11's schematic API when a nightly is installed, else the file model — the response's `backend` says which), then ONE batch call: a real list of dicts, key is `ref`; prefer over `add_component`. `load_schematic(path)` opens an existing file (API: a real round-trip, `symbols` counted; file model: an EMPTY model that `save_schematic` writes over) |
+| 3 | `wire_by_ref(sch, ref_a, pin_a, ref_b, pin_b)` = `wire_pins(...)` / `label_pin(sch, ref, pin, net_name)` / `power_pin(sch, ref, pin, net_name)` / `no_connect_pin(sch, ref, pin)` | pin coordinates come from KiCad itself (API backend, any rotation/mirror) or from the KiCad symbol + an optional `server/pins/<Lib_Symbol>.pins.json` sidecar (file backend). A failure is `{ok: false, backend, reason}` — fix the pin id, ref or `lib_id` named in `reason`; `build_pin_sidecars` is optional (an id check / override), not a prerequisite. `no_connect_pin` flags an intentionally unused pin so ERC accepts it |
+| 3 | `add_wire(sch, x1, y1, x2, y2)` / `add_label(sch, net, x, y, rot=0)` / `add_power_port(sch, net, x, y)` / `add_junction(sch, x, y)` | explicit-coordinate fallbacks (`rot` applies to the file backend only) |
+| 3–4 | `save_schematic(sch)` → `run_erc(sch)` → `render_sch(sch)`; `close_schematic(sch, save=False)` | write, check, look. API backend: KiCad writes a **KiCad 11 file** (KiCad 9/10 and their kicad-cli cannot open it; ERC/render always use the newest kicad-cli). File backend: KiCad 9/10 format with embedded symbols. `list_symbols(sch)` / `list_nets(sch)` / `schematic_netlist(sch)` (`{net: [[ref, pin], ...]}` — on the API backend KiCad's own connectivity, the authority for "is it wired") inspect the live document. `close_schematic` releases the session (stops the headless KiCad; unsaved edits are discarded unless `save=true`) |
 | 6 | `create_pcb(pcb, sch="", overwrite=False)` | creates an empty `.kicad_pcb` headlessly (KiCad's bundled Python); if THIS file is already open in Pcbnew it reports the live board instead of creating anything |
 | 6–9 | `test_kicad_connection()` | MANDATORY gate: `ipc_connected`, `kicad_version`, `open_documents[{type, path}]`, `capabilities{schematic_api, place_footprint_from_library, import_netlist}` |
 | 7 | `add_footprints_batch(footprints=[{ref, x, y, rot?}])` / `move_footprint(ref, x, y, rot)` / `add_footprint_to_pcb(ref, lib_id, x, y, rot)`; `validate_placement()` / `get_pcb_summary()` / `get_footprint_pads(ref)` / `remove_footprint(ref)` | position footprints ALREADY on the board (F8 puts them there); `add_footprint_to_pcb` only moves an existing one on KiCad 9/10; `validate_placement` takes no arguments |
@@ -37,7 +37,9 @@ The live PCB stages (6–10) require KiCad (9/10 today; 11 nightly for the API p
 | 9 | `drc_pcb(pcb, fab_profile="")` | real kicad-cli DRC: `{ok, errors, unconnected, types, report, profile, note?}` |
 | 10 | `export_gerbers(pcb, out_dir)` / `export_fab_package(pcb, out_dir, zip_name, netlist)` / `render_pcb(pcb, side)`; `server_status()` | kicad-cli on the SAVED file; `server_status` reports kicad-cli, bundled Python, Java/Freerouting, IPC, open documents, capabilities |
 
-**Hard rule — files open in a KiCad editor.** The server refuses to write a schematic or board that is currently open in Eeschema/Pcbnew: `save_schematic`, `build_schematic_from_netlist`, `build_board_from_netlist`, `autoroute_board` and `add_ground_stitching` return `ok: false` with the reason. Before any of them, check `test_kicad_connection().open_documents`; if the file is listed, ask the user to close it (saving first if they changed anything) and reopen it after the write. Never open a file in KiCad — or let the user keep it open — while you still intend to write it. Read-only tools (`drc_pcb`, `render_*`, `export_*`) work on the saved file at any time, but unsaved GUI edits are not reflected in them.
+**Every schematic tool response carries `backend`: `"api"` or `"file"`**, and a failure is `{ok: false, backend, reason}` (a missing session — no `create_schematic` / `load_schematic` for that path — is the one thing that raises). The API backend keeps ONE headless document at a time: `create_schematic` / `load_schematic` / `build_schematic_from_netlist` on another path drops an idle (saved) session — the response lists it in `released_sessions`; `load_schematic` it again to continue — and refuses while the earlier one has unsaved changes (`save_schematic` or `close_schematic` it first). Reads (`list_symbols`, `list_nets`, `schematic_netlist`) never write to disk; `run_erc` runs on the SAVED file and warns when the session has unsaved edits.
+
+**Hard rule — files open in a KiCad editor.** The server refuses to write a schematic or board that is currently open in Eeschema/Pcbnew: `save_schematic`, `create_schematic`, `build_schematic_from_netlist`, `build_board_from_netlist`, `autoroute_board` and `add_ground_stitching` return `ok: false` with the reason. Before any of them, check `test_kicad_connection().open_documents`; if the file is listed, ask the user to close it (saving first if they changed anything) and reopen it after the write. Never open a file in KiCad — or let the user keep it open — while you still intend to write it. Read-only tools (`drc_pcb`, `render_*`, `export_*`) work on the saved file at any time, but unsaved GUI edits are not reflected in them. **Exception:** a schematic open in a running **KiCad 11** GUI with its API server enabled is edited IN that GUI — `load_schematic(path)` reports `mode: "gui"`, every schematic tool then works on the live document and `save_schematic` saves it there. KiCad 9/10 editors and every board write keep the refusal.
 
 ---
 
@@ -461,7 +463,7 @@ Block: SENSOR (x: 270–350)
 
 - Log component ref, part, center position, rotation, block name, and pin NAMES — not pin coordinates
 - Use the **ref-based tools** — `wire_by_ref`, `label_pin`, `power_pin` — which accept component ref + pin name (or number) and resolve the absolute coordinate for you. Never compute rotation transforms by hand.
-- Pin coordinates are derived from the KiCad symbol itself (keyed by pin number AND pin name) and rotated by the symbol's placed `rot`, so any rotation is fine. A sidecar in `server/pins/<Lib_Symbol>.pins.json`, when one exists, overrides the symbol-derived offsets. If `wire_by_ref` / `label_pin` / `power_pin` raise a ValueError, read it: "has no pin 'X'" means use the pin number or name as printed in the KiCad symbol; "symbol ... not found" means the `lib_id` is wrong; "coordinates ... unknown" means the KiCad symbol libraries were not found (install KiCad or set `KICAD_PATH`, or use the explicit-coordinate tools). `build_pin_sidecars("Lib:Symbol")` is optional — a symbol-id check that also writes an override sidecar — and it fails in the same no-libraries case, so it is not a fix for that.
+- Pin coordinates come from KiCad itself on the API backend (the placed instance, any rotation or mirror) and, on the file backend, from the KiCad symbol (keyed by pin number AND pin name) rotated by the symbol's placed `rot` — a sidecar in `server/pins/<Lib_Symbol>.pins.json`, when one exists, overrides those offsets. If `wire_by_ref` / `label_pin` / `power_pin` / `no_connect_pin` return `ok: false`, read `reason`: "has no pin 'X'" means use the pin number or name as printed in the KiCad symbol; "no symbol 'R9'" / "symbol ... not found" means the ref or `lib_id` is wrong; "unit N is not placed" means place that unit of the multi-unit part first; "coordinates ... unknown" (file backend) means the KiCad symbol libraries were not found (install KiCad or set `KICAD_PATH`, or use the explicit-coordinate tools). `build_pin_sidecars("Lib:Symbol")` is optional — a symbol-id check that also writes an override sidecar for the file backend — and it fails in the same no-libraries case, so it is not a fix for that.
 
 ### Step A: Build the Net Map (MANDATORY — Do Before Any Wiring)
 
@@ -613,7 +615,7 @@ Wire section by section, completing ALL connections in each section before movin
 
 6. **Unused pins — EVERY one**: For every pin not in the signal assignment table:
    - Unused MCU GPIOs → wire to an expansion header where the design allows it
-   - Everything else → list it explicitly as **unused (needs NC flag)** in the Component Placement Log. The MCP wiring tools place no no-connect flags: the user adds them in Eeschema (Q key) after your LAST `save_schematic`, then you re-run `run_erc`; or use the netlist path (`build_schematic_from_netlist` adds them itself)
+   - Everything else → list it explicitly as **unused (NC)** in the Component Placement Log and flag it with `no_connect_pin(sch, ref, pin)` so ERC accepts it (the netlist path, `build_schematic_from_netlist`, adds the flags itself)
    - **Zero unaccounted pins allowed** — every unused pin is either wired to a header or on the NC list
 
 ### Step C: Wiring Verification (MANDATORY — Do After All Wiring)
@@ -624,7 +626,7 @@ After completing all wiring, perform this verification:
    - A wire connecting it to something
    - A net label attached via a wire stub
    - A power symbol (GND, +3V3, etc.)
-   - A no-connect flag (X symbol) — or it is on your NC list for the user to flag after the last save
+   - A no-connect flag (X symbol, placed with `no_connect_pin`)
    - If ANY pin has none of these → it's unwired. Fix it now.
 
 2. **Net label matching**: For every net label in the schematic, there must be at LEAST two instances of that label (one source, one destination). A net label that appears only once is a dead-end — the signal goes nowhere.
@@ -632,6 +634,8 @@ After completing all wiring, perform this verification:
 3. **Count check**: The number of unique net names in your signal assignment table should match the number of unique net labels in the schematic. If they don't match, something is missing.
 
 4. **`list_nets(sch)`** must return exactly the nets in your table — a net that is absent was never labelled; an extra one is a misspelling.
+
+5. **`schematic_netlist(sch)`** — compare `{net: [[ref, pin], ...]}` against your Net Connection List endpoint by endpoint. On the API backend this is KiCad's own connectivity, so a pin missing from its net there IS unwired, whatever the render looks like.
 
 ### Wiring Rules — Complete Reference
 
@@ -713,24 +717,27 @@ After completing all wiring, perform this verification:
 
 ### Creating and Persisting the Schematic (MCP Tools)
 
-The schematic lives in the server's memory until you save it. The sequence is always:
+Until you save, the schematic lives in KiCad (API backend: a headless KiCad 11, or the user's open KiCad 11 editor) or in the server's memory (file backend). The sequence is always:
 
 ```
-create_schematic(path)                 # registers an empty model for that .kicad_sch path
+create_schematic(path)                 # new document for that .kicad_sch path; response.backend = "api" | "file"
 add_components_batch(sch, components=[ # ONE call, a real list of dicts — the key is "ref"
     {"ref": "R1", "lib_id": "Device:R", "value": "5.1k", "x": 48, "y": 165, "footprint": "Resistor_SMD:R_0402_1005Metric"},
     {"ref": "R2", "lib_id": "Device:R", "value": "5.1k", "x": 55, "y": 165, "rot": 0, "footprint": "Resistor_SMD:R_0402_1005Metric"},
 ])
-wire_by_ref / label_pin / power_pin    # or add_wire / add_label / add_power_port with explicit coordinates
-save_schematic(sch)                    # writes the .kicad_sch (embeds the symbols); the PostToolUse hook validates it
-run_erc(sch)                           # kicad-cli ERC on the saved file
+wire_by_ref / label_pin / power_pin    # or add_wire / add_label / add_power_port / add_junction with explicit coordinates
+no_connect_pin(sch, ref, pin)          # every intentionally unused pin
+schematic_netlist(sch)                 # connectivity check against the Net Connection List
+save_schematic(sch)                    # KiCad writes the file (api) / the server does (file); the PostToolUse hook validates it
+run_erc(sch)                           # newest kicad-cli ERC on the saved file
 render_sch(sch)                        # SVG for inspection
+close_schematic(sch)                   # when done: releases the session (stops the headless KiCad)
 ```
 
 ### Verification After Schematic Creation
 
 1. `render_sch(sch)` and inspect the image: placement, label readability, no overlaps. Fix problems with the tools and `save_schematic` again — never hand-edit the file.
-2. If the user wants to touch it up in Eeschema, that happens AFTER your last `save_schematic`. Once it is open there you must not write it again (`save_schematic` refuses while the path is in `test_kicad_connection().open_documents`); ask the user to close it before any further MCP write, and let their Eeschema save win.
+2. If the user wants to touch it up in Eeschema, that happens AFTER your last `save_schematic`. In KiCad 9/10, once it is open there you must not write it again (`save_schematic` refuses while the path is in `test_kicad_connection().open_documents`); ask the user to close it before any further MCP write, and let their Eeschema save win. In **KiCad 11** (API server enabled) the opposite holds: `load_schematic(path)` joins the open editor (`mode: "gui"`) and your edits appear there live — no need to close it. Remember a file saved by the API backend opens only in KiCad 11.
 
 ### Standard Library References
 
@@ -782,8 +789,8 @@ ALL of the following must be true before advancing:
 6. Every IC ground pin wired to GND
 7. Every signal in the Net Connection List has matching net labels at BOTH endpoints (or a direct wire)
 8. Every endpoint in the Net Connection List is marked DONE
-9. Every unused pin is either wired to a header or on the NC list handed to the user (they add the flags in Eeschema after your last `save_schematic`; the netlist path adds them itself) — a listed-and-acknowledged unused pin passes
-10. Zero floating pins on any IC
+9. Every unused pin is either wired to a header or flagged with `no_connect_pin` and listed as NC in the Component Placement Log
+10. Zero floating pins on any IC — `schematic_netlist(sch)` shows every endpoint of the Net Connection List in its net
 11. `save_schematic(sch)` returned ok (the PostToolUse hook validated the file)
 
 ---
@@ -807,7 +814,7 @@ ERC will flag every unconnected pin. If you see dozens of "Pin not connected" er
 
 ### Running ERC
 
-1. `save_schematic(sch)` — ERC runs on the file on disk, never on the in-memory model
+1. `save_schematic(sch)` — ERC runs on the file on disk, never on the unsaved session (the `run_erc` response carries a `warning` when the session has unsaved edits)
 2. `run_erc(sch)` — kicad-cli ERC; the JSON report comes back in `report`
 3. Delegate to the `erc-reviewer` subagent (it re-runs `run_erc` itself and audits beyond it)
 
@@ -817,7 +824,7 @@ ERC will flag every unconnected pin. If you see dozens of "Pin not connected" er
 
 | Error | Meaning | Fix |
 |-------|---------|-----|
-| Pin unconnected | A pin has no wire, label, or no-connect flag | Wire it — or, if genuinely unused, the user adds a no-connect in Eeschema (Q key) after the last save; the MCP tools cannot |
+| Pin unconnected | A pin has no wire, label, or no-connect flag | Wire it — or, if genuinely unused, `no_connect_pin(sch, ref, pin)`, then `save_schematic` and re-run |
 | Power pin not driven | A VCC/GND pin has no power source | Add appropriate power symbol |
 | Conflicting pin types | Output driving another output | Check your connections — two outputs on the same net |
 | Missing power flag | A power net exists but has no power symbol | Add the missing power symbol |
@@ -832,7 +839,7 @@ ERC will flag every unconnected pin. If you see dozens of "Pin not connected" er
 
 ### Common ERC Pitfalls
 
-- **No-connect on pins that should be connected**: the headless `build_schematic_from_netlist` auto-adds a no_connect flag to every pin absent from the netlist. If the netlist missed a pin, it gets a no-connect instead of an ERC error. Always review the no-connect list against design intent. (The MCP wiring tools place no no-connect flags; unused pins surface in ERC as "pin not connected" — either the user adds NC flags in Eeschema after your last save, or use the netlist path.)
+- **No-connect on pins that should be connected**: the headless `build_schematic_from_netlist` auto-adds a no_connect flag to every pin absent from the netlist. If the netlist missed a pin, it gets a no-connect instead of an ERC error. Always review the no-connect list against design intent. (In the interactive flow `no_connect_pin` places them one pin at a time — flag only pins you consciously listed as unused in the Component Placement Log, never to silence an ERC error you have not understood.)
 - **Power flags**: Some KiCad symbols need a `PWR_FLAG` to tell the ERC that a net is intentionally powered. USB VBUS and battery nets often need this.
 - **Multi-unit symbols**: Some symbols (like op-amps) have multiple units — each unit's power pins must be connected even if only one unit is placed.
 

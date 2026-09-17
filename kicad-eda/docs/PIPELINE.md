@@ -7,8 +7,9 @@ process that produced the RPi 5 battery-emulator HAT fab package (65×56.5 mm,
 
 ```
 netlist.json ──> G1 lint ──> G2 schematic+ERC ──> G3 place (SWIG) ──> G4 route
- (source of      structure    sch_build.py         swig_build_board    Freerouting
-  truth)         + intent     ERC must be 0        courtyard DRC = 0   + DRC + checks
+ (source of      structure    KiCad 11 API or      swig_build_board    Freerouting
+  truth)         + intent     sch_build.py (§8)    courtyard DRC = 0   + DRC + checks
+                              ERC must be 0
                                                                           │
                                                           G5 fab package <─┘
                                                           Gerbers/drill/BOM/CPL zip
@@ -27,15 +28,17 @@ tasks stop the run, with the open task list attached.
 | Dependency | Why | Install |
 |---|---|---|
 | **KiCad 10** (9 works) | bundled `pcbnew` Python (SWIG board build), `kicad-cli` (ERC/DRC/Gerbers), stock symbol+footprint libs | `winget install KiCad.KiCad` / `brew install --cask kicad` / distro package |
+| **KiCad 11 nightly** (optional) | `kicad-cli api-server`: the schematic is built through KiCad's own IPC API instead of hand-written S-expressions (§8) | <https://downloads.kicad.org/kicad/windows/explore/nightlies> — installs beside 10 as `Program Files\KiCad\10.99` |
 | **Python 3.10+** | MCP server + harness venv | python.org / OS package |
 | **Java 17–21 JRE** | Freerouting 1.9.0 (bundled at `server/tools/freerouting-1.9.0.jar`) | `winget install EclipseAdoptium.Temurin.21.JRE` / `brew install temurin@21` |
 
 Run `scripts/install-deps.ps1` (Windows) or `scripts/install-deps.sh`
-(macOS/Linux) to check and install all three. The server auto-discovers
-KiCad (`KICAD_PATH` env overrides), Java (`JAVA_HOME`, then a bundled
-`server/tools/jre*`), and the Freerouting jar (`FREEROUTING_JAR` overrides —
-**do not use Freerouting 2.x: it phones home and hangs headless; 1.9.0 is the
-pinned router**).
+(macOS/Linux) to check and install the three required tools (the nightly is
+reported, never installed). The server discovers **every** KiCad on the
+machine (`server/kicad_env.py`; `KICAD_PATH` adds a root or bin dir), Java
+(`JAVA_HOME`, then a bundled `server/tools/jre*`), and the Freerouting jar
+(`FREEROUTING_JAR` overrides — **do not use Freerouting 2.x: it phones home
+and hangs headless; 1.9.0 is the pinned router**).
 
 ## 2. Author the netlist (`netlist.json`)
 
@@ -133,12 +136,14 @@ Hard-won authoring rules:
 - Check real pin maps against the datasheet, not the symbol name
   (MCP45HV51-ST TSSOP-14 ≠ its QFN pinout; INA228 lib symbol carries SPI
   names — INA226 was the usable I²C part).
-- Pin coordinates: both `sch_build` and the GUI-flow wiring tools derive them
-  from the flattened symbol itself (keyed by pin number and name); a **pin
-  sidecar** in the central `server/pins/<Lib_Symbol>.pins.json`
-  (`python server/tools/build_pin_sidecars.py` or the `build_pin_sidecars`
-  MCP tool, optional) overrides it for both. A (ref, pad) that resolves to no
-  coordinate fails G2 with `missing_pins` instead of silently dropping the label.
+- Pin coordinates: on the API backend (§8) KiCad itself reports them for the
+  placed instance, any rotation. On the file backend both `sch_build` and the
+  GUI-flow wiring tools derive them from the flattened symbol (keyed by pin
+  number and name); a **pin sidecar** in the central
+  `server/pins/<Lib_Symbol>.pins.json` (`python server/tools/build_pin_sidecars.py`
+  or the `build_pin_sidecars` MCP tool, optional) overrides it for both. On
+  either backend a (ref, pad) that resolves to no pin fails G2 with
+  `missing_pins` instead of silently dropping the label.
 - Size continuous vs burst current honestly: a 5 A ms-scale burst fed by bulk
   capacitance is IPC-2152 transient — spec the *continuous* number or the
   class width physically cannot thread the board and the router thrashes.
@@ -168,7 +173,7 @@ What happens, gate by gate:
 | Gate | Stage | Auto-remediation on failure |
 |---|---|---|
 | **G1** Requirements | `lint_netlist` + intent check | — (designer fixes the netlist) |
-| **G2** Schematic | `sch_build` → `.kicad_sch`, `kicad-cli sch erc`, design-intent review (`design_report`: decoupling coverage, floating pins, pulls, test points), **thermal review** (`thermal_check`: shunt I²R vs 50%-derated rating, FET conduction loss, linear-reg (Vin−Vout)·I, switcher loss estimate; Tj = Tamb + P·θJA ≤ 80% Tj_max) | missing bypass → 100 nF auto-added at the IC, netlist rewritten, stage re-runs. Thermal: declared numbers (`p_diss`, `rds_mohm`, value "3W") block; estimates warn. Overrides per part: `"thermal": {"p_diss", "theta_ja", "tj_max", "i_max"}` (`i_max` for topology-capped parts, e.g. a bypassed sleep shunt); board-level: `"thermal": {"t_ambient", "tj_margin", "ep_vias_min"}` |
+| **G2** Schematic | `build_schematic_from_netlist` → `.kicad_sch` (KiCad 11 API backend when a nightly is installed, else `sch_build` — §8; the report's `schematic.backend` says which), `kicad-cli sch erc` (newest kicad-cli), design-intent review (`design_report`: decoupling coverage, floating pins, pulls, test points), **thermal review** (`thermal_check`: shunt I²R vs 50%-derated rating, FET conduction loss, linear-reg (Vin−Vout)·I, switcher loss estimate; Tj = Tamb + P·θJA ≤ 80% Tj_max) | missing bypass → 100 nF auto-added at the IC, netlist rewritten, stage re-runs. Thermal: declared numbers (`p_diss`, `rds_mohm`, value "3W") block; estimates warn. Overrides per part: `"thermal": {"p_diss", "theta_ja", "tj_max", "i_max"}` (`i_max` for topology-capped parts, e.g. a bypassed sleep shunt); board-level: `"thermal": {"t_ambient", "tj_margin", "ep_vias_min"}` |
 | **G3** Placement | `swig_build_board` (KiCad bundled python) → outline, mixed/two-sided placement, zones (In1=GND, In2=first power rail), preroutes, silk; courtyard DRC must be **0**; connector mouths must face off-board at the edge; dissipating exposed-pad parts must have ≥4 thermal vias under the EP (IPC-7093 — footprint `...ThermalVias` variants count); **plane integrity**: a power plane whose pad population is split across separate fill islands is a BLOCKER (the DSN export hides voids — the router will return the net broken); corridors under 1.8 mm between pad groups (one router via from sealing) are a warning. GND is exempt (post-route pours + stitching unify it) | courtyard overlap → re-place at next `pack_scale` (1.0→1.5→2.0→2.6→3.2); a retry that no longer fits restores the last good ROUTED snapshot (`.attempt` file); **EP via farm**: a dissipating EP part whose footprint has no `...ThermalVias` variant (e.g. TO-263) gets an IPC-7093 via farm auto-dropped under the tab (0.3 mm drill, ~1.2 mm pitch, pad's net) before the review runs |
 | **G4** Layout | DSN export → **Freerouting 1.9** → SES import → DRC + routed-width check + via-ampacity check (`swig_gate_checks`) | 1–4 unconnected → **heal in place** (`swig_board_fixes`): ≤2 mm same-net gaps bridged; plane-net orphans get island-link tracks (straight-or-L, plane layer preferred); under-ampacity transitions get parallel vias. 2-round fix→re-DRC→re-gate loop. Scale escalation only for real congestion. |
 | **G5** Fab package | `kicad-cli` Gerbers + drill + pos; BOM.csv + CPL.csv (JLCPCB format) zipped | — |
@@ -183,7 +188,7 @@ Useful environment variables:
 | `PACK_SCALE` | placement looseness multiplier (harness drives this itself) |
 | `PACK_DEBUG=1` | print cluster/shelf packing decisions |
 | `FREEROUTING_JAR` | pin a specific router jar (keep 1.9.0) |
-| `KICAD_PATH` | KiCad install root when auto-detect fails |
+| `KICAD_PATH` | an extra KiCad root (or bin dir) to probe when auto-detect misses it; every install found is still used per job (§8) |
 | `PIPELINE_NO_CACHE=1` | bypass the route cache (always rebuild + re-route) |
 
 **Route cache:** after a successful run, `<netlist>.cache.json` records a hash
@@ -263,18 +268,94 @@ safe on a finished board, then re-run DRC and re-export:
 11. **HAT/fixed-board pattern:** fixed connector coordinates + `auto_x/y/w/h`
     free field + hand-placed power chain + preroutes is the proven recipe for
     a dense fixed-outline board.
+12. **A schematic written by KiCad 11 is a KiCad 11 file.** KiCad 9/10 and
+    their `kicad-cli` cannot open it (§8). And a KiCad 11 that has never been
+    opened has no library tables: the headless server then reports
+    `symbol Device:R not found` (§8, first-run gotcha).
 
-## 8. Where things live
+## 8. Schematic backends
+
+G2 (and every schematic MCP tool) runs on one of two backends. Every response
+and the pipeline report carry `backend`:
+
+| Backend | What does the work | When |
+|---|---|---|
+| **`api`** | KiCad 11's IPC schematic API through the vendored `kipy` (`server/backends/`): KiCad places the library symbols, wires, labels, no-connects and PWR_FLAGs and writes the file. Headless — the server launches its own private `kicad-cli api-server` — or **live in a running KiCad 11 editor** that has the schematic open (`load_schematic` reports `mode: "gui"`; edits land in the open document) | a KiCad ≥ 10.99 whose `kicad-cli api-server --help` works is installed (`server_status().schematic_backend == "api"`) |
+| **`file`** | `server/tools/sch_build.py` (pipeline) / `server/sch_file_model.py` (interactive tools): S-expressions written by us, symbols flattened and embedded from the newest install's libraries, KiCad 9/10 file format | no KiCad 11, or `backend="file"` requested |
+
+**Selection.** `backend="auto"` (the default everywhere, including
+`run_pipeline.py`) picks `api` when `server/kicad_env.py` finds an install with
+`has_api_server` and the vendored kipy imports, else `file`; `"api"` insists
+(error when unavailable), `"file"` forces the fallback. Both backends produce
+the same topology (grid cell per unit, a label at every net pin, no-connect
+markers, PWR_FLAG on every undriven power net) so G2's ERC-0 contract and
+everything downstream are identical.
+
+**Which kicad-cli.** `kicad_env` discovers every KiCad (`KICAD_PATH`,
+`Program Files\KiCad\*`, `LOCALAPPDATA\Programs\KiCad\*`, PATH, `/usr/bin`,
+`/usr/local/bin`, the macOS bundle), probes each once (`kicad-cli version`,
+bundled Python `import pcbnew`, `kicad-cli api-server --help`) and picks per
+job: the **newest** kicad-cli runs the **schematic** jobs — ERC and SVG render
+(`pick_cli` / `toolchain.kicad_cli`: a file written by KiCad N needs kicad-cli
+≥ N, and the API backend writes KiCad 11 files); the **newest install with a
+pcbnew-capable Python** builds the board and supplies its footprint libraries
+(`pick_swig` — KiCad 9/10; KiCad 11 dropped the SWIG bindings) **and its own
+kicad-cli runs every board job** — DRC, Gerbers, drill, pos, PNG render
+(`toolchain.board_cli`), so a nightly can never change the DRC semantics or
+the Gerber output of a stable-built board; `board_cli` falls back to the newest
+kicad-cli only when no install has a pcbnew Python. The **newest with
+`api-server`** serves the schematic API (`pick_api`). A mixed machine (9.0.4
+stable + 10.99 nightly) therefore builds and ERCs the schematic with 11 and
+builds, checks and exports the board entirely with 9. `server_status()` reports
+`kicad_cli_schematic`, `kicad_cli_board`, `kicad_cli_policy` and `installs`;
+the pipeline report's `drc.kicad_cli` records which binary ran DRC.
+
+**Files written by 11 need 11.** The API backend saves KiCad 11 format
+(`version 20260830`); KiCad 9/10 and their `kicad-cli` cannot load it — which
+is why schematic ERC/render always use the newest kicad-cli. Open such a schematic in
+KiCad 11 only. If a board flow must stay on 9/10 files, pass `backend="file"`.
+
+**First-run gotcha (sym-lib-table).** A freshly installed nightly has no
+library tables in its config dir (`%APPDATA%\kicad\10.99`, `~/.config/kicad/10.99`),
+so the headless server finds no libraries: `symbol Device:R not found`. Open
+KiCad 11 once (it writes the tables) **or** copy `sym-lib-table` and
+`fp-lib-table` from `<install>/share/kicad/template` into that config dir.
+
+**Headless limits.** One headless document at a time: opening another path
+drops an idle (saved) session — reported in `released_sessions` — and refuses
+while the earlier one has unsaved edits. Paper size and label rotation are not
+settable through the API (the response carries a `note`).
+
+**Vendored kipy.** `server/vendor/kipy/` is kicad-python `main` (0.9.0.dev0)
+with protobuf classes generated from KiCad master's `api/proto` — the PyPI
+0.8.0 release predates the schematic API. `kicad_server.py` puts `server/vendor`
+first on `sys.path`, so never `pip install kicad-python` into the server venv;
+its runtime deps (`protobuf`, `pynng`, `jsonschema`, `zstandard`,
+`typing_extensions`) are in `server/requirements.txt`. Refresh with
+`server/tools/update_kipy.py` (clone, fetch protos, generate, rewrite imports,
+vendor — `server/vendor/README.md` records the origin and the recipe).
+
+## 9. Where things live
 
 ```
-server/kicad_server.py        MCP server (also importable: run_pipeline uses it as a library)
+server/kicad_server.py        MCP server + schematic session registry (also importable:
+                              run_pipeline uses it as a library)
+server/kicad_env.py           discovers every KiCad install; pick_cli / pick_swig / pick_api
+server/toolchain.py           per-job picks (kicad-cli, pcbnew Python, libraries, Java, jar)
+server/kicad_ipc.py           GUI connection + open-document guard
+server/backends/              KiCad 11 API schematic backend (sch_api, sch_session,
+                              sch_netlist_build, sch_geometry, sch_items, sch_erc)
+server/sch_file_model.py      file-model fallback for the interactive schematic tools
+server/vendor/kipy/           vendored kicad-python (see server/vendor/README.md)
+server/pcb_ipc_tools.py       live PCB tools over IPC;  server/board_pipeline_tools.py: G3-G5 shell-outs
 server/tools/                 sch_build, swig_build_board, gates, remediate,
                               swig_gate_checks, swig_board_fixes, silk_place,
                               netclass_writer, ipc_rules (IPC-2221/2141A math),
-                              lint_netlist, design_report, emc_stitch,
+                              lint_netlist, design_report, emc_stitch, update_kipy,
                               freerouting-1.9.0.jar
-server/pins/                  pin sidecars (schematic wiring coordinates)
+server/pins/                  pin sidecars (file-backend wiring coordinates)
 pipeline/run_pipeline.py      the gated harness (single board)
 pipeline/run_all.py           regression suite + negative fixture
+tests/                        pytest tier (pure + live API tests, skipped without KiCad 11)
 docs/PIPELINE.md              this file
 ```

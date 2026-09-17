@@ -18,7 +18,7 @@
     "kicad_path": {
       "type": "directory",
       "title": "KiCad install path",
-      "description": "Root of your KiCad 9/10 installation (kicad-cli, bundled Python, symbol/footprint libraries). Leave blank to auto-detect.",
+      "description": "Optional: one more KiCad install root to add to auto-discovery. The plugin discovers every installed KiCad by itself and picks per job — the newest for schematics/ERC, the one with a bundled Python (pcbnew) for board builds and their DRC/Gerbers, the KiCad 11 nightly for the schematic API — so leave this blank unless KiCad lives somewhere unusual.",
       "required": false
     },
     "fab_profile": {

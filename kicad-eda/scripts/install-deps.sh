@@ -2,7 +2,8 @@
 # kicad-eda external dependency installer (macOS / Linux).
 # Idempotent: checks each dependency first, installs only what's missing.
 # Python packages are handled automatically by scripts/launch-server.js;
-# this script covers the three EXTERNAL tools the pipeline needs.
+# this script covers the three EXTERNAL tools the pipeline needs and REPORTS
+# the optional KiCad 11 nightly (schematic API backend) without installing it.
 #
 #   ./install-deps.sh             check + install (brew / apt / dnf)
 #   ./install-deps.sh --check     report status, change nothing
@@ -11,6 +12,7 @@ set -uo pipefail
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
 OK=1
+NIGHTLY_URL="https://downloads.kicad.org/kicad/"   # windows/ macos/ linux/ ... explore/nightlies
 
 pkg_install() {
   if command -v brew >/dev/null 2>&1; then brew install "$1"
@@ -30,6 +32,37 @@ else
   echo "[..] Installing KiCad..."
   if command -v brew >/dev/null 2>&1; then brew install --cask kicad
   else pkg_install kicad kicad kicad; fi
+fi
+
+# --- KiCad 11 nightly (OPTIONAL: schematic API backend; reported, never installed)
+# A nightly calls itself 10.99.x and adds `kicad-cli api-server`, which is what
+# the plugin's schematic backend launches. Distro nightlies ship kicad-cli-nightly.
+NIGHTLY_CLI=""; NIGHTLY_VER=""; NIGHTLY_MM=""
+for cand in "$(command -v kicad-cli-nightly 2>/dev/null || true)" \
+            /usr/lib/kicad-nightly/bin/kicad-cli \
+            /Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli \
+            "$(command -v kicad-cli 2>/dev/null || true)"; do
+  [ -n "$cand" ] && [ -x "$cand" ] || continue
+  ver="$("$cand" version 2>/dev/null | head -n1)"
+  major="${ver%%.*}"; rest="${ver#*.}"; minor="${rest%%.*}"; minor="${minor%%-*}"
+  case "$major" in ''|*[!0-9]*) continue;; esac
+  case "$minor" in ''|*[!0-9]*) continue;; esac
+  if { [ "$major" -ge 11 ] || { [ "$major" -eq 10 ] && [ "$minor" -ge 99 ]; }; } \
+     && "$cand" api-server --help >/dev/null 2>&1; then
+    NIGHTLY_CLI="$cand"; NIGHTLY_VER="$ver"; NIGHTLY_MM="$major.$minor"; break
+  fi
+done
+if [ -n "$NIGHTLY_CLI" ]; then
+  echo "[ok] KiCad 11 nightly (optional, schematic API): $NIGHTLY_VER ($NIGHTLY_CLI)"
+  case "$(uname -s)" in
+    Darwin) NIGHTLY_CFG="$HOME/Library/Preferences/kicad/$NIGHTLY_MM";;
+    *)      NIGHTLY_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/kicad/$NIGHTLY_MM";;
+  esac
+  if [ ! -f "$NIGHTLY_CFG/sym-lib-table" ]; then
+    echo "[warn] $NIGHTLY_CFG/sym-lib-table missing — open KiCad 11 once, or copy sym-lib-table and fp-lib-table from the install's share/kicad/template into that folder; until then the headless schematic API finds no symbol libraries"
+  fi
+else
+  echo "[--] KiCad 11 nightly not found (optional: schematic API backend; the plugin writes schematic files itself without it). Not auto-installed — nightlies live under $NIGHTLY_URL"
 fi
 
 # --- Java 17-21 JRE (Freerouting 1.9.0 is bundled) -----------------------------

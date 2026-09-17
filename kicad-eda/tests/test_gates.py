@@ -118,6 +118,25 @@ def test_g2_floating_pin_is_a_designer_task_never_auto():
                                    "the netlist", "auto": False, "fix": {}}]
 
 
+def test_g2_design_report_errors_block_as_designer_tasks():
+    # a symbol design_report could not read means its decoupling / power-tree /
+    # floating-pin checks passed vacuously: the review did not run -> BLOCKER
+    rep = {"errors": ["pin types unavailable for Nope:Chip (U2): SymbolLibError: "
+                      "symbol library not found: Nope"],
+           "decoupling": {"uncovered": []}, "flags": {"floating_pins": []}}
+    g = gates.g2_schematic(CLEAN_SCH, rep)
+    assert not g["passed"]
+    assert g["blockers"] == ["design review could not run: pin types unavailable for "
+                             "Nope:Chip (U2): SymbolLibError: symbol library not found: Nope"]
+    assert len(g["tasks"]) == 1 and g["tasks"][0]["auto"] is False
+    assert "Nope:Chip" in g["tasks"][0]["desc"]
+
+
+def test_g2_empty_design_report_errors_do_not_block():
+    g = gates.g2_schematic(CLEAN_SCH, {"errors": []})
+    assert g["passed"] and g["blockers"] == []
+
+
 def test_g2_advisory_flags_are_warnings_only():
     rep = {"flags": {"nets_missing_pull": ["NRST"],
                      "rails_missing_testpoint": ["3V3"]},
