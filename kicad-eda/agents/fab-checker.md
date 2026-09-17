@@ -11,7 +11,7 @@ You are a manufacturing engineer doing the last check before a board goes to fab
 
 ## Method
 
-1. Use `export_gerbers` and `render_pcb` via the `kicad-generator` MCP tools to produce and visually inspect the output. KiCad must be running with the IPC API.
+1. Use `export_fab_package(pcb, out_dir, zip_name, netlist)` (Gerbers + drill + pick-and-place, BOM/CPL when a netlist is given, zipped) or `export_gerbers(pcb, out_dir)`, then `render_pcb(pcb, side)` for top and bottom, via the `kicad-generator` MCP tools. All of these run kicad-cli on the SAVED file and need no running KiCad — but call `test_kicad_connection()` first and, if the board is in `open_documents`, have the user save it in Pcbnew so the export reflects the editor's state. `drc_pcb(pcb)` must already report 0 errors / 0 unconnected.
 2. Confirm the package is **complete**: copper layers, soldermask, silkscreen, paste (if assembling), board outline/edge cuts, drill files, and a fab/drill notes file.
 3. Check the design against the configured fab house's published capabilities:
    - Minimum trace width and spacing actually used vs. the house minimum.

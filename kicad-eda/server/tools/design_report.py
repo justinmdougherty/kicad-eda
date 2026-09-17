@@ -12,7 +12,10 @@ and part count is the dominant lever, so the report surfaces consolidation
 opportunities (repeated passives -> arrays) and counts placements. Decoupling
 and power-tree checks encode IPC/standard review practice.
 
-Pure standard library; symbol pin types via sch_build.flatten (best-effort).
+Symbol pin types come from symlib (sexpdata). A symbol that cannot be resolved
+is NOT silently treated as pin-less: it is listed in report["errors"] (and under
+"## Errors" in the Markdown), because a pin-type-dependent check that runs
+against an empty map passes vacuously.
 """
 from __future__ import annotations
 
@@ -21,31 +24,76 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import symlib  # noqa: E402
+
 # how many identical passives before an array part is worth suggesting
 _ARRAY_THRESHOLD = 4
 # nets that should usually carry a pull-up/pull-down resistor
 _PULL_HINTS = ("SDA", "SCL", "I2C", "NRST", "RESET", "BOOT")
+# a pin the symbol itself marks no-connect/unconnected is intentionally open
+_NC_TYPES = {"no_connect", "unconnected", "free", "not_connected"}
 
 
-def _pin_types(design: dict, symbols_dir: str) -> dict:
-    """{ref: {pad_num: electrical_type}} from the KiCad symbols, best-effort."""
+class DesignReportError(Exception):
+    """The netlist is malformed in a way the report cannot work around."""
+
+
+def _pin_types(design: dict, symbols_dir: str) -> tuple[dict, dict, list]:
+    """({ref: {pad_num: electrical_type}}, {ref: {pin_name: pad_num}}, errors)
+    from the KiCad symbols. The alias map lets a netlist that keys pads by pin
+    NAME ("V+") resolve to the NUMBER the type map is keyed by.
+
+    An empty symbols_dir yields an empty map and no errors (the caller chose
+    not to supply symbols; the report marks symbols_available False). A symbol
+    that cannot be loaded/parsed is reported once per lib_id in ``errors`` and
+    its refs are left OUT of the map, so the caller can see exactly which
+    parts the pin-type checks did not cover. A component with no usable
+    ``lib_id`` is likewise reported and skipped (lint does not reject it, and
+    the pipeline calls analyze() unconditionally, so it must not raise).
+
+    Raises DesignReportError only when ``components`` is not a list of dicts."""
     out: dict = {}
+    aliases: dict = {}
+    errors: list = []
     if not symbols_dir:
-        return out
-    try:
-        sys.path.insert(0, str(Path(__file__).parent))
-        import sch_build as sb
-        cache: dict = {}
-        for c in design.get("components", []):
-            lib, _, name = c["lib_id"].partition(":")
-            try:
-                flat = sb.flatten(cache, symbols_dir, lib, name)
-                out[c["ref"]] = sb.pin_etypes(flat)
-            except Exception:
-                out[c["ref"]] = {}
-    except Exception:
-        pass
-    return out
+        return out, aliases, errors
+    comps = design.get("components", [])
+    if not isinstance(comps, list) or not all(isinstance(c, dict) for c in comps):
+        raise DesignReportError("netlist 'components' must be a list of objects")
+    cache: dict = {}
+    failed: dict = {}                              # lib_id -> (reason, [refs])
+    for c in comps:
+        ref, lib_id = c.get("ref"), c.get("lib_id")
+        if not ref or not lib_id:
+            errors.append(f"pin types unavailable for {ref or '(no ref)'}: "
+                          f"component has no lib_id ({c!r})")
+            continue
+        if lib_id in failed:
+            failed[lib_id][1].append(ref)
+            continue
+        lib, _, name = lib_id.partition(":")
+        try:
+            flat = symlib.flatten(cache, symbols_dir, lib, name)
+            out[ref] = symlib.pin_etypes(flat)
+            aliases[ref] = {k: v["number"] for k, v in symlib.pin_offsets(flat).items()
+                            if v.get("number") and k != v["number"]}
+        except (symlib.SymbolLibError, ValueError, IndexError, TypeError) as e:
+            out.pop(ref, None)
+            failed[lib_id] = (f"{type(e).__name__}: {e}", [ref])
+    for lib_id, (reason, refs) in failed.items():
+        errors.append(f"pin types unavailable for {lib_id} "
+                      f"({', '.join(refs)}): {reason}")
+    return out, aliases, errors
+
+
+def _canon(aliases: dict, ref: str, pad) -> str:
+    """The pin NUMBER for a netlist pad key that may be a pin name."""
+    key = str(pad)
+    return aliases.get(ref, {}).get(key, key)
 
 
 def _prefix(ref: str) -> str:
@@ -55,12 +103,11 @@ def _prefix(ref: str) -> str:
 def analyze(design: dict, symbols_dir: str = "") -> dict:
     comps = design.get("components", [])
     nets = design.get("nets", {})
-    by_ref = {c["ref"]: c for c in comps}
-    ptypes = _pin_types(design, symbols_dir)
-    net_of = {}                                   # (ref,pad) -> net
+    ptypes, aliases, errors = _pin_types(design, symbols_dir)
+    net_of = {}                                   # (ref,pad_number) -> net
     for net, conns in nets.items():
         for r, p in conns:
-            net_of[(r, str(p))] = net
+            net_of[(r, _canon(aliases, r, p))] = net
     ref_nets = defaultdict(set)
     for (r, _p), net in net_of.items():
         ref_nets[r].add(net)
@@ -109,30 +156,28 @@ def analyze(design: dict, symbols_dir: str = "") -> dict:
     for net, conns in nets.items():
         drivers, loads = [], 0
         for r, p in conns:
-            t = ptypes.get(r, {}).get(str(p), "")
+            t = ptypes.get(r, {}).get(_canon(aliases, r, p), "")
             if t in ("power_out", "output"):
                 drivers.append(f"{r}.{p}")
             else:
                 loads += 1
-        is_rail = net in specs or any(ptypes.get(r, {}).get(str(p)) == "power_in"
-                                      for r, p in conns)
+        is_rail = net in specs or any(
+            ptypes.get(r, {}).get(_canon(aliases, r, p)) == "power_in"
+            for r, p in conns)
         if is_rail:
             rails[net] = {"drivers": drivers or ["(passive/flagged source)"],
                           "loads": loads,
                           "spec": specs.get(net, {})}
 
     # --- intent flags: floating pins + missing pulls ---
-    no_connect = {(r, str(p)) for r, p in design.get("no_connect", [])}
-    # a pin the symbol itself marks no-connect/unconnected is intentionally open
-    _nc_types = {"no_connect", "unconnected", "free", "not_connected"}
+    no_connect = {(r, _canon(aliases, r, p)) for r, p in design.get("no_connect", [])}
     floating = []
     for c in comps:
         for p, t in ptypes.get(c["ref"], {}).items():
             key = (c["ref"], str(p))
-            if key not in net_of and key not in no_connect and t not in _nc_types:
+            if key not in net_of and key not in no_connect and t not in _NC_TYPES:
                 floating.append(f"{c['ref']}.{p}")
     pulls = []
-    has_res = any(_prefix(c["ref"]) == "R" for c in comps)
     for net in nets:
         if any(h in net.upper() for h in _PULL_HINTS):
             on_net_res = any(_prefix(r) == "R" for r, _ in nets[net])
@@ -156,11 +201,18 @@ def analyze(design: dict, symbols_dir: str = "") -> dict:
                   "nets_missing_pull": sorted(pulls),
                   "rails_missing_testpoint": sorted(tp_missing)},
         "symbols_available": bool(ptypes and any(ptypes.values())),
+        "errors": errors,
     }
 
 
 def to_markdown(rep: dict) -> str:
     L = [f"# Design Report — {rep['title']}", ""]
+    if rep.get("errors"):
+        L += ["## Errors",
+              "The following symbols could not be read; decoupling, power-tree "
+              "and floating-pin checks did NOT cover their parts:"]
+        L += [f"- {e}" for e in rep["errors"]]
+        L.append("")
     d = rep["dfa"]
     L += ["## DFA / BOM",
           f"- Placements: **{d['placements']}**  |  unique line items: "
@@ -203,14 +255,17 @@ def to_markdown(rep: dict) -> str:
 
 
 def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: design_report.py <netlist.json> [symbols_dir] [--json]")
+        return 2
     design = json.load(open(sys.argv[1], encoding="utf-8"))
-    symbols_dir = sys.argv[2] if len(sys.argv) > 2 else ""
+    symbols_dir = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "--json" else ""
     rep = analyze(design, symbols_dir)
     if "--json" in sys.argv:
         print(json.dumps(rep, indent=2))
     else:
         print(to_markdown(rep))
-    return 0
+    return 1 if rep["errors"] else 0
 
 
 if __name__ == "__main__":

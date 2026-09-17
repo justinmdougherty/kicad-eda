@@ -14,4 +14,6 @@ Verify the kicad-eda environment and install anything missing.
    builds its own venv on first start. If the `kicad-generator` MCP server
    shows as failed, restart Claude Code after Python is installed.
 5. Finish by confirming the full chain: `kicad-cli version`, `java -version`,
-   and that `${CLAUDE_PLUGIN_ROOT}/server/tools/freerouting-1.9.0.jar` exists.
+   and that `${CLAUDE_PLUGIN_ROOT}/server/tools/freerouting-1.9.0.jar` exists —
+   or call the `server_status` MCP tool, which reports all three plus the
+   bundled Python, IPC status, open documents and capabilities in one shot.

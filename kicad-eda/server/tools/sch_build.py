@@ -6,10 +6,18 @@ Approach: embed each used symbol into lib_symbols (flattening `extends` symbols 
 inherited pins/graphics are present), place components on a grid, and drop a local
 net label at every pin (same-named local labels are electrically connected on a
 sheet). Power-source nets get a PWR_FLAG so ERC sees them driven. Unused pins get
-no_connect flags. Coordinates come from the same sidecars the wiring tools use.
+no_connect flags.
+
+Pin coordinates are derived from the flattened symbol itself (symlib.pin_offsets),
+so no sidecar is needed. A ``<sidecars_dir>/<Lib_Symbol>.pins.json`` file, when
+present, overrides the derived offset per key. A pin that resolves to NO
+coordinate is an error: the script prints ``{"ok": false, "missing_pins": ...}``
+and exits 1 instead of silently dropping the label. A sidecar key the symbol
+itself does not have (a pad id from another KiCad version) is honoured but
+listed in the success result's ``warnings``.
 
 Usage:
-  <venv-python> sch_build.py <netlist.json> <out.kicad_sch> <symbols_dir> <sidecars_dir>
+  <venv-python> sch_build.py <netlist.json> <out.kicad_sch> <symbols_dir> [sidecars_dir]
 """
 from __future__ import annotations
 
@@ -18,140 +26,48 @@ import sys
 import uuid as uuidlib
 from pathlib import Path
 
-import sexpdata
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
-S = sexpdata.Symbol
+import symlib  # noqa: E402
+from symlib import (SYM_ONLY_TAGS, S, SymbolLibError, dumps, embed, first,  # noqa: E402,F401
+                    flatten, is_, kids, load_lib, pin_etypes, pin_numbers,
+                    pin_offsets, unit_pins)
 
+# public re-exports (lint_netlist / design_report / older callers import these)
+__all__ = ["S", "SYM_ONLY_TAGS", "SymbolLibError", "dumps", "embed", "first",
+           "flatten", "is_", "kids", "load_lib", "pin_etypes", "pin_numbers",
+           "pin_offsets", "unit_pins", "uid", "load_sidecars", "main"]
 
-def is_(n, t):
-    return isinstance(n, list) and n and isinstance(n[0], S) and n[0].value() == t
-
-
-def kids(n, t):
-    return [c for c in n if is_(c, t)]
-
-
-def first(n, t):
-    for c in n:
-        if is_(c, t):
-            return c
-    return None
+PWR_FLAG_LIB_ID = "power:PWR_FLAG"
+USAGE_EXIT = 2
 
 
-def uid():
+def uid() -> str:
     return str(uuidlib.uuid4())
 
 
-
-def load_lib(symbols_dir, lib):
-    data = sexpdata.loads(Path(f"{symbols_dir}/{lib}.kicad_sym").read_text(encoding="utf-8"))
-    return {c[1]: c for c in kids(data, "symbol")}
-
-
-def flatten(cache, symbols_dir, lib, name):
-    """Return a fully-resolved symbol sexp, merging an `extends` base."""
-    if lib not in cache:
-        cache[lib] = load_lib(symbols_dir, lib)
-    s = cache[lib][name]
-    ext = first(s, "extends")
-    if ext is None:
-        return s
-    base = flatten(cache, symbols_dir, lib, ext[1])
-    out = [S("symbol"), name]
-    for tag in ("pin_numbers", "pin_names", "exclude_from_sim", "in_bom", "on_board"):
-        node = first(s, tag) or first(base, tag)
-        if node is not None:
-            out.append(node)
-    props, order = {}, []
-    for src in (base, s):
-        for p in kids(src, "property"):
-            if p[1] not in props:
-                order.append(p[1])
-            props[p[1]] = p
-    out += [props[n] for n in order]
-    bn = ext[1]
-    for sub in kids(base, "symbol"):
-        s2 = list(sub)
-        s2[1] = name + sub[1][len(bn):]
-        out.append(s2)
-    return out
-
-
-# tags valid in a .kicad_sym symbol-editor library but NOT accepted inside a
-# .kicad_sch <lib_symbols> block — they must be stripped or KiCad refuses to load.
-SYM_ONLY_TAGS = {"in_pos_files"}
-
-
-def embed(flat, lib_id):
-    """Rename the top symbol to the full lib_id, dropping library-only tags the
-    schematic parser rejects. Unit sub-symbols KEEP their bare name (e.g.
-    ``R_0_1``) — KiCad rejects sub-symbols prefixed with the library nickname."""
-    out = [flat[0], lib_id]
-    for c in flat[2:]:
-        if is_(c, "symbol"):
-            out.append(c)  # unit sub-symbol: leave name untouched
-        elif isinstance(c, list) and c and isinstance(c[0], S) and c[0].value() in SYM_ONLY_TAGS:
+def load_sidecars(sidecars_dir: str, lib_ids: list) -> dict:
+    """{lib_id: {key: {x, y}}} from ``<dir>/<Lib_Symbol>.pins.json`` files.
+    A missing file means "no override" (empty map); a malformed one is an error."""
+    out: dict = {}
+    for lib_id in lib_ids:
+        out[lib_id] = {}
+        if not sidecars_dir:
             continue
-        else:
-            out.append(c)
-    return out
-
-
-def pin_numbers(flat):
-    """All pin numbers declared in a flattened symbol's unit sub-symbols."""
-    nums = []
-    for sub in kids(flat, "symbol"):
-        for pin in kids(sub, "pin"):
-            num = first(pin, "number")
-            if num is not None and num[1] not in nums:
-                nums.append(num[1])
-    return nums
-
-
-def pin_etypes(flat):
-    """Map pin number -> electrical type (e.g. 'power_in', 'power_out', 'passive').
-    The type is the first atom after the `pin` tag: (pin power_in line ...)."""
-    out = {}
-    for sub in kids(flat, "symbol"):
-        for pin in kids(sub, "pin"):
-            num = first(pin, "number")
-            if num is None:
-                continue
-            etype = pin[1].value() if len(pin) > 1 and isinstance(pin[1], S) else "unspecified"
-            out[str(num[1])] = etype
-    return out
-
-
-def unit_pins(flat):
-    """Map unit number -> [pin numbers], parsed from sub-symbol names of the form
-    ``<bare>_<unit>_<bodystyle>``. Unit 0 (common-to-all-units graphics) is folded
-    into unit 1. A single-unit part returns {1: [...]}; a dual op-amp returns
-    {1: [...], 2: [...], 3: [...]} (the 3rd being the power unit)."""
-    bare = flat[1]
-    units: dict[int, list] = {}
-    for sub in kids(flat, "symbol"):
-        rest = str(sub[1])[len(bare):].strip("_").split("_")
+        p = Path(sidecars_dir) / f"{lib_id.replace(':', '_')}.pins.json"
+        if not p.is_file():
+            continue
         try:
-            u = int(rest[0])
-        except (ValueError, IndexError):
-            u = 1
-        if u == 0:
-            u = 1
-        for pin in kids(sub, "pin"):
-            num = first(pin, "number")
-            if num is not None:
-                units.setdefault(u, [])
-                if num[1] not in units[u]:
-                    units[u].append(num[1])
-    return units or {1: []}
+            out[lib_id] = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise ValueError(f"malformed pin sidecar {p}: {e}") from e
+    return out
 
 
-def dumps(node):
-    return sexpdata.dumps(node)
-
-
-def main():
-    netlist_path, out_path, symbols_dir, sidecars_dir = sys.argv[1:5]
+def build(netlist_path: str, out_path: str, symbols_dir: str,
+          sidecars_dir: str = "") -> dict:
     design = json.load(open(netlist_path, encoding="utf-8"))
     root = uid()
     project = design.get("name", "design")
@@ -163,24 +79,35 @@ def main():
         if c["lib_id"] not in lib_ids:
             lib_ids.append(c["lib_id"])
     lib_blocks = []
-    pins_of, etypes_of, units_of, pin_unit_of = {}, {}, {}, {}
-    for lib_id in lib_ids + ["power:PWR_FLAG"]:
+    pins_of, etypes_of, units_of, pin_unit_of, offsets_of = {}, {}, {}, {}, {}
+    for lib_id in lib_ids + [PWR_FLAG_LIB_ID]:
         lib, _, name = lib_id.partition(":")
         flat = flatten(cache, symbols_dir, lib, name)
         pins_of[lib_id] = pin_numbers(flat)
         etypes_of[lib_id] = pin_etypes(flat)
         units_of[lib_id] = unit_pins(flat)
         pin_unit_of[lib_id] = {p: u for u, ps in units_of[lib_id].items() for p in ps}
+        offsets_of[lib_id] = pin_offsets(flat)
         lib_blocks.append("\t\t" + dumps(embed(flat, lib_id)))
 
     # --- which nets need a PWR_FLAG: any net with a power-input pin but no
     #     power-output pin driving it (exactly KiCad's power_pin_not_driven rule) ---
     by_ref_lib = {c["ref"]: c["lib_id"] for c in design["components"]}
+
+    def pin_type(ref, pad) -> str:
+        """Electrical type of a pad key that may be a pin NUMBER or a pin NAME
+        (the type map is number-keyed; a name resolves through its offset)."""
+        lib_id = by_ref_lib.get(ref, "")
+        key = str(pad)
+        types = etypes_of.get(lib_id, {})
+        if key not in types:
+            key = str((offsets_of.get(lib_id, {}).get(key) or {}).get("number") or key)
+        return types.get(key, "")
+
     drive_flag_nets = set()
     has_driver_net = set()      # nets with any output/power_out source pin
     for net, conns in design.get("nets", {}).items():
-        types = [etypes_of.get(by_ref_lib.get(ref, ""), {}).get(str(pad), "")
-                 for ref, pad in conns]
+        types = [pin_type(ref, pad) for ref, pad in conns]
         has_pwr_in = any(t == "power_in" for t in types)
         has_pwr_out = any(t == "power_out" for t in types)
         if any(t in ("power_out", "output") for t in types):
@@ -201,11 +128,8 @@ def main():
     drive_flag_nets |= {n for n in declared
                         if n in design.get("nets", {}) and n not in has_driver_net}
 
-    sidecar = {}
-    for lib_id in lib_ids:
-        safe = lib_id.replace(":", "_")
-        p = Path(sidecars_dir) / f"{safe}.pins.json"
-        sidecar[lib_id] = json.loads(p.read_text()) if p.is_file() else {}
+    # a sidecar, when present, overrides the symbol-derived offset per key
+    sidecar = load_sidecars(sidecars_dir, lib_ids)
 
     # --- grid layout: one cell per (component, unit). Multi-unit parts (op-amps,
     #     logic) place each unit separately, all sharing one reference. Origins/
@@ -254,13 +178,34 @@ def main():
         ]
 
     # --- labels at every pin (resolved to the pin's own unit placement) ---
+    missing_pins: list[list[str]] = []
+    warnings: list[str] = []
+    overridden: set = set()          # (lib_id, key) sidecar overrides reported
+
     def pin_xy(ref, pad):
-        lib_id = by_ref[ref]["lib_id"]
-        u = pin_unit_of[lib_id].get(str(pad), 1)
-        cell = pos.get((ref, u))
-        off = sidecar[lib_id].get(str(pad))
-        if cell is None or off is None:
+        key = str(pad)
+        comp = by_ref.get(ref)
+        if comp is None:
+            missing_pins.append([str(ref), key])
             return None
+        lib_id = comp["lib_id"]
+        derived = offsets_of[lib_id].get(key)
+        override = sidecar[lib_id].get(key)
+        off = override or derived
+        # The unit comes from the pin NUMBER map when the key is a number; a pin
+        # NAME (e.g. "V+" on a dual op-amp) carries its unit in the derived
+        # offset. Defaulting to unit 1 would drop the label in the wrong cell.
+        u = pin_unit_of[lib_id].get(key) or (derived or {}).get("unit", 1)
+        cell = pos.get((ref, u))
+        if cell is None or off is None:
+            missing_pins.append([str(ref), key])
+            return None
+        if override and derived is None and (lib_id, key) not in overridden:
+            overridden.add((lib_id, key))
+            warnings.append(f"{ref}.{key}: not a pin of {lib_id} in this symbol "
+                            f"library; sidecar override used (the board stage "
+                            f"will report the pad missing if the footprint "
+                            f"lacks it too)")
         return round(cell[0] + off["x"], 2), round(cell[1] + off["y"], 2)
 
     for net, conns in design.get("nets", {}).items():
@@ -279,6 +224,13 @@ def main():
             continue
         L.append(f'\t(no_connect (at {xy[0]} {xy[1]}) (uuid "{uid()}"))')
 
+    # a label that silently vanished would leave a pin electrically open in an
+    # ERC-"clean" schematic — refuse to write the file instead.
+    if missing_pins:
+        return {"ok": False,
+                "error": f"{len(missing_pins)} pins have no coordinates",
+                "missing_pins": missing_pins}
+
     # --- PWR_FLAG per undriven power net (placed in a column on the right;
     #     grid-aligned to keep pins on the 1.27 mm connection grid) ---
     fx, fy = 363.22, 38.1
@@ -290,7 +242,7 @@ def main():
         ref = f"#FLG{flagn:02d}"
         L += [
             '\t(symbol',
-            '\t\t(lib_id "power:PWR_FLAG")',
+            f'\t\t(lib_id "{PWR_FLAG_LIB_ID}")',
             f'\t\t(at {fx} {fy} 0)', '\t\t(unit 1)',
             '\t\t(exclude_from_sim no)', '\t\t(in_bom yes)', '\t\t(on_board yes)', '\t\t(dnp no)',
             f'\t\t(uuid "{uid()}")',
@@ -312,10 +264,25 @@ def main():
         ')',
     ]
     Path(out_path).write_text("\n".join(L) + "\n", encoding="utf-8")
-    print(json.dumps({"ok": True, "sch": out_path,
-                      "components": len(design["components"]),
-                      "nets": len(design.get("nets", {}))}))
+    return {"ok": True, "sch": out_path,
+            "components": len(design["components"]),
+            "nets": len(design.get("nets", {})),
+            "warnings": warnings}
+
+
+def main() -> int:
+    if len(sys.argv) < 4:
+        print(__doc__)
+        return USAGE_EXIT
+    netlist_path, out_path, symbols_dir = sys.argv[1:4]
+    sidecars_dir = sys.argv[4] if len(sys.argv) > 4 else ""
+    try:
+        res = build(netlist_path, out_path, symbols_dir, sidecars_dir)
+    except (SymbolLibError, ValueError, KeyError, OSError) as e:
+        res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    print(json.dumps(res))
+    return 0 if res["ok"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -133,10 +133,12 @@ Hard-won authoring rules:
 - Check real pin maps against the datasheet, not the symbol name
   (MCP45HV51-ST TSSOP-14 ≠ its QFN pinout; INA228 lib symbol carries SPI
   names — INA226 was the usable I²C part).
-- New parts need a **pin sidecar** for the schematic:
-  `python server/tools/build_pin_sidecars.py` writes
-  `server/pins/<Lib_Symbol>.pins.json`. The server reads the central
-  `server/pins/` dir.
+- Pin coordinates: both `sch_build` and the GUI-flow wiring tools derive them
+  from the flattened symbol itself (keyed by pin number and name); a **pin
+  sidecar** in the central `server/pins/<Lib_Symbol>.pins.json`
+  (`python server/tools/build_pin_sidecars.py` or the `build_pin_sidecars`
+  MCP tool, optional) overrides it for both. A (ref, pad) that resolves to no
+  coordinate fails G2 with `missing_pins` instead of silently dropping the label.
 - Size continuous vs burst current honestly: a 5 A ms-scale burst fed by bulk
   capacitance is IPC-2152 transient — spec the *continuous* number or the
   class width physically cannot thread the board and the router thrashes.

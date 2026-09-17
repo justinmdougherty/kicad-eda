@@ -16,6 +16,26 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Fast tier: pure-Python unit tests for the design-rule / gate / netlist
+  # modules (no KiCad, no Java). Runs in under a minute and gives a verdict
+  # long before the 150-minute board matrix below finishes.
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install server requirements + pytest
+        run: pip install -r kicad-eda/server/requirements.txt pytest pytest-cov
+
+      - name: Unit tests
+        working-directory: kicad-eda
+        run: python -m pytest -q --cov=server/tools --cov-report=term-missing
+
   suite:
     runs-on: ubuntu-latest
     timeout-minutes: 150            # dense boards can route for a long time

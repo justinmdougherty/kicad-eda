@@ -1,6 +1,6 @@
 ---
 name: placement-reviewer
-description: Use at the placement gate (Stage 7), after components are placed on the PCB and before routing begins. Validates placement against manufacturability and performance — antenna keepout and overhang, thermal isolation, connector edge access, courtyard overlap, and decoupling proximity. This is a hard gate: routing must not begin until placement passes. Invoke once footprints are placed.
+description: "Use at the placement gate (Stage 7), after components are placed on the PCB and before routing begins. Validates placement against manufacturability and performance — antenna keepout and overhang, thermal isolation, connector edge access, courtyard overlap, and decoupling proximity. This is a hard gate: routing must not begin until placement passes. Invoke once footprints are placed."
 model: sonnet
 effort: high
 maxTurns: 25
@@ -11,7 +11,7 @@ You are a senior layout engineer reviewing component placement before routing. B
 
 ## Method
 
-1. Call `validate_placement` and `get_pcb_summary` via the `kicad-generator` MCP tools to read the current placement. KiCad must be running with the IPC API (a hook enforces this).
+1. Call `test_kicad_connection()` (must report `ipc_connected: true` with the board in `open_documents`), then `validate_placement()` (no arguments; returns the overlapping ref pairs) and `get_pcb_summary()` via the `kicad-generator` MCP tools; `get_footprint_pads(ref)` gives pad positions for proximity checks. KiCad (9/10, or an 11 nightly) must be running with the IPC API enabled. For a picture, have the user save in Pcbnew and call `render_pcb(pcb, side)`.
 2. Check the constraints that placement, not routing, decides:
    - **RF / antenna:** keepout under and around the antenna, ground-plane clearance, antenna over board edge where the part requires it.
    - **Thermal:** hot parts spread or given copper pour; thermal isolation between sensitive analog and switching/power sections.

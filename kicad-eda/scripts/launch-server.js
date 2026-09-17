@@ -17,25 +17,10 @@
 const { spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { ROOT, VENV, VENV_PY, findPython } = require('./venv');
 
-const ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(__dirname, '..');
-const DATA = process.env.CLAUDE_PLUGIN_DATA || ROOT;
-const VENV = path.join(DATA, '.venv');
-const WIN = process.platform === 'win32';
-const VENV_PY = path.join(VENV, WIN ? 'Scripts' : 'bin', WIN ? 'python.exe' : 'python');
 const REQ = path.join(ROOT, 'server', 'requirements.txt');
 const REQ_STAMP = path.join(VENV, 'requirements.installed.txt');
-
-function findPython() {
-  const candidates = WIN
-    ? [['py', ['-3']], ['python', []], ['python3', []]]
-    : [['python3', []], ['python', []]];
-  for (const [cmd, args] of candidates) {
-    const r = spawnSync(cmd, [...args, '--version'], { stdio: 'ignore' });
-    if (r.status === 0) return [cmd, args];
-  }
-  return null;
-}
 
 function ensureVenv() {
   if (fs.existsSync(VENV_PY)) return true;

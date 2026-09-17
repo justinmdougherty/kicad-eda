@@ -12,7 +12,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__kicad-generator__(add_trace|add_via|add_copper_zone|add_footprint_to_pcb|add_footprints_batch|move_footprint|remove_footprint|validate_placement|register_net|get_pcb_summary|get_footprint_pads|create_pcb)",
+        "matcher": "mcp__kicad-generator__(add_trace|add_via|add_copper_zone|add_footprint_to_pcb|add_footprints_batch|move_footprint|remove_footprint|validate_placement|register_net|get_pcb_summary|get_footprint_pads)",
         "hooks": [
           {
             "type": "command",

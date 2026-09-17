@@ -1,20 +1,45 @@
 #!/usr/bin/env python3
 """kicad-generator — MCP server for the kicad-eda plugin.
 
-Exposes the tool surface the `pcb-design` skill calls by name. Two layers:
+Exposes the tool surface the `pcb-design` skill calls by name. Four layers:
 
-  SCHEMATIC  — direct .kicad_sch S-expression generation. Pure Python, no
-               KiCad required. Produces files that open in KiCad 9.
-  PCB        — KiCad 9 IPC API (kicad-python / `kipy`). These require KiCad
-               running with the API server enabled; when it is unreachable
-               every PCB tool returns {"ipc_connected": false, ...} so the
-               caller stops cleanly (a plugin PreToolUse hook also blocks them).
+  SCHEMATIC (file-based, no KiCad GUI needed)
+      create_schematic / add_component(s) / add_wire / add_label / add_power_port /
+      wire_by_ref / label_pin / power_pin / save_schematic build an in-memory model
+      and write a .kicad_sch through the SAME emitter format as the headless
+      pipeline (server/tools/sch_build.py): file version 20250114, every used
+      library symbol flattened and embedded in lib_symbols, per-instance pin
+      lists, instances / sheet_instances / embedded_fonts. Pin coordinates for
+      the *_pin tools come from a pins/ sidecar when one exists, otherwise they
+      are derived from the library symbol itself. run_erc / render_sch shell out
+      to kicad-cli.
 
-This is a clean, runnable baseline that matches the skill's tool names. The
-elaborate pieces from a mature generator — full lib_symbols embedding and the
-pin-coordinate sidecar that powers wire_by_ref / label_pin / power_pin — drop
-in behind the same function signatures. Where a pin map is required and absent,
-the tool says so explicitly rather than guessing coordinates.
+  PCB (KiCad IPC API via kicad-python / `kipy`)
+      Live edits of the board OPEN in Pcbnew: move/remove footprints, traces,
+      vias, zones, placement checks. KiCad 9/10 cannot instantiate a footprint
+      from a library over IPC (only Update PCB from Schematic / F8 does), so
+      add_footprint_to_pcb only positions footprints that already exist. When
+      the API is unreachable every PCB tool returns {"ipc_connected": false}
+      and a PreToolUse hook blocks the call before it reaches the server.
+      test_kicad_connection reports version, open documents and the
+      version-derived capabilities; server_status reports the whole toolchain.
+
+  HEADLESS PIPELINE (netlist.json -> ERC-clean schematic -> placed board ->
+      Freerouting -> DRC -> fab zip). build_schematic_from_netlist,
+      build_board_from_netlist, autoroute_board, add_ground_stitching,
+      check_design_gates, export_fab_package, drc_pcb, create_pcb shell out to
+      server/tools/*.py — sch_build under this venv (sexpdata), the SWIG board
+      steps under KiCad's bundled Python (pcbnew), Freerouting under Java.
+
+  OPEN-DOCUMENT GUARD
+      Every tool that WRITES a .kicad_sch/.kicad_pcb first asks a running KiCad
+      (over IPC) whether that file is open in an editor and refuses to clobber
+      it. When IPC is unavailable the guard cannot know and never blocks.
+
+Forward path: KiCad 11 adds a schematic API, footprint placement from a
+library and netlist import over IPC. `capabilities` in test_kicad_connection
+turns those on by version so the prompt layer can pick the IPC route when it
+exists and the file/pipeline route otherwise.
 """
 
 from __future__ import annotations
@@ -28,6 +53,7 @@ import shutil
 import tempfile
 import zipfile
 import subprocess
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +67,17 @@ mcp = FastMCP("kicad-generator")
 SCH: dict[str, dict[str, Any]] = {}          # path -> schematic model
 FAB_PROFILE = os.environ.get("FAB_PROFILE", "JLCPCB")
 WORK_UNITS = os.environ.get("WORK_UNITS", "mm")
+SERVER_DIR = Path(__file__).parent
+TOOLS_DIR = SERVER_DIR / "tools"
+PINS_DIR = SERVER_DIR / "pins"
+
+# schematic file format written by the emitter (KiCad 9/10 stable format)
+SCH_FORMAT_VERSION = 20250114
+SCH_GENERATOR = "kicad-eda"
+SCH_GENERATOR_VERSION = "10.0"
+KICAD11_NIGHTLY = (10, 99)      # a KiCad 11 nightly reports itself as 10.99.x
+PCBNEW_PROBE_TIMEOUT_S = 30
+KICAD_CLI_TIMEOUT_S = 600
 
 
 def _find_kicad_cli() -> str | None:
@@ -77,8 +114,97 @@ def _find_kicad_cli() -> str | None:
 KICAD_CLI = _find_kicad_cli()
 
 
-def _new_sch() -> dict[str, Any]:
-    return {"uuid": str(uuid.uuid4()), "paper": "A4",
+def _kicad_share() -> Path | None:
+    """KiCad's shared data dir (.../share/kicad) holding symbols/ and footprints/."""
+    if KICAD_CLI:
+        share = Path(KICAD_CLI).parent.parent / "share" / "kicad"
+        if share.is_dir():
+            return share
+    return None
+
+
+def _symbols_dir(explicit: str = "") -> str | None:
+    """The .kicad_sym library dir: an explicit path (must exist) or KiCad's stock one."""
+    if explicit:
+        if not Path(explicit).is_dir():
+            raise ValueError(f"symbols_dir does not exist: {explicit}")
+        return explicit
+    share = _kicad_share()
+    if share and (share / "symbols").is_dir():
+        return str(share / "symbols")
+    return None
+
+
+def _version_tuple(ver: str) -> tuple[int, ...]:
+    """'9.0.4' -> (9, 0, 4); '10.99.0-rc1-3-gabc' -> (10, 99, 0); junk -> ()."""
+    head = ver.strip().split()[0] if ver.strip() else ""
+    nums: list[int] = []
+    for part in head.split("-")[0].split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        if not digits or digits != part:
+            if digits:
+                nums.append(int(digits))
+            break
+        nums.append(int(digits))
+    return tuple(nums)
+
+
+def _capabilities(ver: tuple[int, ...]) -> dict[str, bool]:
+    """Version-derived IPC capabilities: KiCad 11+ (or a 10.99 nightly) gains the
+    schematic API, footprint placement from a library and netlist import."""
+    is11 = bool(ver) and (ver[0] >= 11 or ver[:2] == KICAD11_NIGHTLY)
+    return {"schematic_api": is11,
+            "place_footprint_from_library": is11,
+            "import_netlist": is11}
+
+
+# ----------------------------------------------------------------------------
+# Symbol libraries (shared with the pipeline: server/tools/sch_build.py)
+# ----------------------------------------------------------------------------
+_SYM_CACHE: dict[str, dict] = {}            # symbols_dir -> sch_build lib cache
+
+
+def _sch_build():
+    """Import server/tools/sch_build.py — the pipeline's symbol flattener / emitter
+    helpers (flatten, embed, unit_pins, dumps, ...). Needs sexpdata in this venv."""
+    if str(TOOLS_DIR) not in sys.path:
+        sys.path.insert(0, str(TOOLS_DIR))
+    try:
+        import sch_build  # noqa: E402
+    except ImportError as e:
+        raise ImportError(f"cannot import {TOOLS_DIR / 'sch_build.py'} ({e}); "
+                          "is sexpdata installed in the server venv?") from e
+    return sch_build
+
+
+def _flat_symbol(lib_id: str, symbols_dir: str) -> list:
+    """Flattened (extends-resolved) symbol sexp for a Library:Symbol id.
+    Raises ValueError when the library or the symbol cannot be found."""
+    lib, sep, name = lib_id.partition(":")
+    if not sep or not lib or not name:
+        raise ValueError(f"lib_id '{lib_id}' must be 'Library:Symbol' (e.g. Device:R)")
+    sb = _sch_build()
+    cache = _SYM_CACHE.setdefault(symbols_dir, {})
+    try:
+        return sb.flatten(cache, symbols_dir, lib, name)
+    except sb.SymbolLibError as e:  # library missing / unparsable / symbol absent
+        raise ValueError(str(e)) from e
+    except (FileNotFoundError, KeyError) as e:
+        raise ValueError(f"symbol {lib_id} not found under {symbols_dir}: {e}") from e
+
+
+def _pin_offsets_of(flat: list) -> dict[str, dict[str, float]]:
+    """{pin number | pin name: {x, y}} schematic-space offsets (mm, y negated —
+    symbol files are +Y up, a placed symbol is +Y down) for rotation 0: the
+    pipeline's own symlib.pin_offsets (re-exported by sch_build), i.e. the same
+    math build_pin_sidecars.py uses, so sidecar and derived maps agree."""
+    sb = _sch_build()
+    return {k: {"x": float(v["x"]), "y": float(v["y"])}
+            for k, v in sb.pin_offsets(flat).items()}
+
+
+def _new_sch(path: str) -> dict[str, Any]:
+    return {"uuid": str(uuid.uuid4()), "paper": "A4", "project": Path(path).stem,
             "symbols": [], "wires": [], "labels": [], "power": []}
 
 
@@ -86,56 +212,129 @@ def _pins_sidecar(lib_id: str, near: str) -> dict | None:
     """Load a pin map mapping pin name/number -> {x, y} schematic-space offsets (mm).
 
     Searched in order: a `pins/` dir next to the schematic, then the server's
-    central `pins/` dir (so sidecars built once are reused across projects)."""
+    central `pins/` dir (so sidecars built once are reused across projects).
+    A sidecar, when present, overrides the symbol-derived offsets."""
     safe = lib_id.replace(":", "_")
-    candidates = [
-        Path(near).parent / "pins" / f"{safe}.pins.json",
-        Path(__file__).parent / "pins" / f"{safe}.pins.json",
-    ]
+    candidates = [Path(near).parent / "pins" / f"{safe}.pins.json",
+                  PINS_DIR / f"{safe}.pins.json"]
     for cand in candidates:
         if cand.is_file():
             try:
-                return json.loads(cand.read_text())
-            except Exception:
-                return None
+                return json.loads(cand.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                raise ValueError(f"malformed pin sidecar {cand}: {e}") from e
     return None
 
 
+def _pin_map(lib_id: str, near: str) -> dict:
+    """Pin offsets for a lib_id: the sidecar if one exists, else derived from the
+    KiCad symbol library. Raises ValueError when neither source is available."""
+    side = _pins_sidecar(lib_id, near)
+    if side is not None:
+        return side
+    syms = _symbols_dir()
+    if not syms:
+        raise ValueError(
+            f"Pin coordinates for {lib_id} are unknown: no sidecar at "
+            f"pins/{lib_id.replace(':', '_')}.pins.json and the KiCad symbol "
+            f"libraries were not found (install KiCad or set KICAD_PATH), or use "
+            f"the explicit-coordinate tools (add_wire/add_label/add_power_port).")
+    return _pin_offsets_of(_flat_symbol(lib_id, syms))
+
+
+def _rotate_offset(dx: float, dy: float, rot: int) -> tuple[float, float]:
+    """Rotate a rotation-0 schematic-space pin offset by the symbol's (at ... rot).
+    KiCad rotates counter-clockwise on screen; the sheet is +Y down."""
+    r = int(rot) % 360
+    if r == 0:
+        return dx, dy
+    if r == 90:
+        return dy, -dx
+    if r == 180:
+        return -dx, -dy
+    if r == 270:
+        return -dy, dx
+    raise ValueError(f"rotation must be one of 0/90/180/270, got {rot}")
+
+
 # ----------------------------------------------------------------------------
-# S-expression emission
+# S-expression emission — the same file format as server/tools/sch_build.py
 # ----------------------------------------------------------------------------
-def _emit(model: dict[str, Any]) -> str:
-    L: list[str] = []
-    L.append("(kicad_sch")
-    L.append("  (version 20231120)")
-    L.append('  (generator "kicad-eda")')
-    L.append(f'  (uuid "{model["uuid"]}")')
-    L.append(f'  (paper "{model["paper"]}")')
-    # lib_symbols left as a cache placeholder; KiCad resolves graphics from its
-    # configured libraries on open / cache rebuild.
-    L.append("  (lib_symbols)")
+def _q(s: Any) -> str:
+    """Quote a string atom for a KiCad S-expression."""
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _lib_symbols(model: dict[str, Any], symbols_dir: str | None
+                 ) -> tuple[list[str], dict[str, dict[int, list[str]]], list[str]]:
+    """Flatten + embed every distinct lib_id in the model.
+    Returns (lib_symbols lines, {lib_id: {unit: [pin numbers]}}, unresolved lib_ids)."""
+    lib_ids = list(dict.fromkeys(s["lib_id"] for s in model["symbols"]))
+    if not symbols_dir or not lib_ids:
+        return [], {}, []
+    sb = _sch_build()
+    blocks: list[str] = []
+    units: dict[str, dict[int, list[str]]] = {}
+    unresolved: list[str] = []
+    for lib_id in lib_ids:
+        try:
+            flat = _flat_symbol(lib_id, symbols_dir)
+        except ValueError:
+            unresolved.append(lib_id)
+            continue
+        blocks.append("\t\t" + sb.dumps(sb.embed(flat, lib_id)))
+        units[lib_id] = sb.unit_pins(flat)
+    return blocks, units, unresolved
+
+
+def _symbol_lines(s: dict[str, Any], unit_pins: dict[int, list[str]],
+                  root: str, project: str) -> list[str]:
+    x, y, rot, unit = float(s["x"]), float(s["y"]), int(s.get("rot", 0)), int(s.get("unit", 1))
+    font = "(effects (font (size 1.27 1.27)))"
+    lines = [
+        "\t(symbol",
+        f"\t\t(lib_id {_q(s['lib_id'])})",
+        f"\t\t(at {x:.4f} {y:.4f} {rot})",
+        f"\t\t(unit {unit})",
+        "\t\t(exclude_from_sim no)", "\t\t(in_bom yes)", "\t\t(on_board yes)", "\t\t(dnp no)",
+        f"\t\t(uuid \"{s['uuid']}\")",
+        f"\t\t(property \"Reference\" {_q(s['ref'])} (at {x:.4f} {y - 7.62:.4f} 0) {font})",
+        f"\t\t(property \"Value\" {_q(s.get('value', ''))} (at {x:.4f} {y + 7.62:.4f} 0) {font})",
+        f"\t\t(property \"Footprint\" {_q(s.get('footprint', ''))} (at {x:.4f} {y:.4f} 0) "
+        "(effects (font (size 1.27 1.27)) (hide yes)))",
+    ]
+    lines += [f"\t\t(pin {_q(num)} (uuid \"{uuid.uuid4()}\"))"
+              for num in unit_pins.get(unit, [])]
+    lines += [f"\t\t(instances (project {_q(project)} (path \"/{root}\" "
+              f"(reference {_q(s['ref'])}) (unit {unit}))))", "\t)"]
+    return lines
+
+
+def _emit(model: dict[str, Any], symbols_dir: str | None) -> tuple[str, list[str]]:
+    """Render the model as a KiCad 9/10-format .kicad_sch (identical structure to
+    sch_build.py's output). Returns (text, lib_ids that could not be embedded)."""
+    blocks, units, unresolved = _lib_symbols(model, symbols_dir)
+    root, project = model["uuid"], model.get("project", "design")
+    L = ["(kicad_sch", f"\t(version {SCH_FORMAT_VERSION})",
+         f"\t(generator {_q(SCH_GENERATOR)})",
+         f"\t(generator_version {_q(SCH_GENERATOR_VERSION)})",
+         f"\t(uuid \"{root}\")", f"\t(paper {_q(model['paper'])})",
+         "\t(lib_symbols", *blocks, "\t)"]
     for s in model["symbols"]:
-        L.append(f'  (symbol (lib_id "{s["lib_id"]}") '
-                 f'(at {s["x"]:.4f} {s["y"]:.4f} {s["rot"]}) (unit 1)')
-        L.append(f'    (uuid "{s["uuid"]}")')
-        L.append(f'    (property "Reference" "{s["ref"]}" (at {s["x"]:.4f} {s["y"]-2.54:.4f} 0))')
-        L.append(f'    (property "Value" "{s["value"]}" (at {s["x"]:.4f} {s["y"]+2.54:.4f} 0))')
-        if s.get("footprint"):
-            L.append(f'    (property "Footprint" "{s["footprint"]}" (at {s["x"]:.4f} {s["y"]:.4f} 0))')
-        L.append("  )")
+        L += _symbol_lines(s, units.get(s["lib_id"], {}), root, project)
     for w in model["wires"]:
         (x1, y1), (x2, y2) = w["a"], w["b"]
-        L.append(f'  (wire (pts (xy {x1:.4f} {y1:.4f}) (xy {x2:.4f} {y2:.4f})) '
-                 f'(stroke (width 0) (type default)) (uuid "{uuid.uuid4()}"))')
+        L.append(f"\t(wire (pts (xy {x1:.4f} {y1:.4f}) (xy {x2:.4f} {y2:.4f})) "
+                 f"(stroke (width 0) (type default)) (uuid \"{uuid.uuid4()}\"))")
     for lb in model["labels"]:
-        L.append(f'  (label "{lb["net"]}" (at {lb["x"]:.4f} {lb["y"]:.4f} {lb.get("rot",0)}) '
-                 f'(effects (font (size 1.27 1.27))) (uuid "{uuid.uuid4()}"))')
+        L.append(f"\t(label {_q(lb['net'])} (at {lb['x']:.4f} {lb['y']:.4f} {int(lb.get('rot', 0))}) "
+                 f"(effects (font (size 1.27 1.27)) (justify left bottom)) (uuid \"{uuid.uuid4()}\"))")
     for p in model["power"]:
-        L.append(f'  (global_label "{p["net"]}" (shape input) '
-                 f'(at {p["x"]:.4f} {p["y"]:.4f} 0) '
-                 f'(effects (font (size 1.27 1.27))) (uuid "{uuid.uuid4()}"))')
-    L.append(")")
-    return "\n".join(L) + "\n"
+        L.append(f"\t(global_label {_q(p['net'])} (shape input) (at {p['x']:.4f} {p['y']:.4f} 0) "
+                 f"(effects (font (size 1.27 1.27))) (uuid \"{uuid.uuid4()}\"))")
+    L += ["\t(sheet_instances", "\t\t(path \"/\" (page \"1\"))", "\t)",
+          "\t(embedded_fonts no)", ")"]
+    return "\n".join(L) + "\n", unresolved
 
 
 def _require(path: str) -> dict[str, Any]:
@@ -149,59 +348,100 @@ def _require(path: str) -> dict[str, Any]:
 # ----------------------------------------------------------------------------
 @mcp.tool()
 def create_schematic(path: str, paper: str = "A4") -> dict:
-    """Create a new, empty schematic in memory for the given .kicad_sch path."""
-    m = _new_sch()
-    m["paper"] = paper
+    """Create a new, empty schematic in memory for the given .kicad_sch path.
+    Nothing touches disk until save_schematic."""
+    if not path.endswith(".kicad_sch"):
+        raise ValueError(f"path must end in .kicad_sch, got '{path}'")
+    m = {**_new_sch(path), "paper": paper}
     SCH[path] = m
-    return {"ok": True, "path": path, "uuid": m["uuid"]}
+    return {"ok": True, "path": path, "uuid": m["uuid"], "project": m["project"]}
 
 
 @mcp.tool()
 def load_schematic(path: str) -> dict:
-    """Load an existing .kicad_sch from disk into memory (best-effort parse of instances)."""
+    """Register an existing .kicad_sch path for editing. NOTE: the file is NOT
+    parsed — the in-memory model starts empty and save_schematic will REPLACE the
+    file with the model. Use it to rebuild a schematic in place, not to append."""
     if not Path(path).is_file():
         raise ValueError(f"File not found: {path}")
-    # Baseline: register the path with a fresh model; full round-trip parsing is
-    # the drop-in point for the mature parser.
-    SCH[path] = _new_sch()
-    return {"ok": True, "path": path, "note": "registered; full parse is the drop-in point"}
+    SCH[path] = _new_sch(path)
+    return {"ok": True, "path": path,
+            "note": "registered with an EMPTY model; the existing file is not parsed "
+                    "and will be overwritten by save_schematic"}
+
+
+def _save_result(m: dict[str, Any], sch: str, symbols_dir: str | None,
+                 unresolved: list[str]) -> dict:
+    res = {"ok": True, "path": sch, "symbols": len(m["symbols"]),
+           "wires": len(m["wires"]), "labels": len(m["labels"]),
+           "power_ports": len(m["power"])}
+    if not symbols_dir:
+        return {**res, "warning": "lib_symbols empty: KiCad symbol libraries not found; "
+                                  "KiCad will rebuild from its configured libraries on open"}
+    if unresolved:
+        return {**res, "ok": False, "written": True,
+                "unresolved_symbols": unresolved,
+                "reason": f"file written but lib_symbols is incomplete: {unresolved} not "
+                          f"found under {symbols_dir}. Fix the lib_id(s) (Library:Symbol, "
+                          f"e.g. Device:R) and call save_schematic again."}
+    return res
 
 
 @mcp.tool()
-def save_schematic(sch: str) -> dict:
-    """Write the in-memory schematic to disk as a .kicad_sch file."""
+def save_schematic(sch: str, symbols_dir: str = "") -> dict:
+    """Write the in-memory schematic to disk as a .kicad_sch (KiCad 9/10 format,
+    library symbols embedded from KiCad's stock libraries or `symbols_dir`).
+    Refuses to overwrite a file that is open in a running KiCad editor."""
     m = _require(sch)
+    guard = _write_guard(sch)
+    if guard:
+        return guard
+    syms = _symbols_dir(symbols_dir)
+    text, unresolved = _emit(m, syms)
     Path(sch).parent.mkdir(parents=True, exist_ok=True)
-    Path(sch).write_text(_emit(m), encoding="utf-8")
-    return {"ok": True, "path": sch, "symbols": len(m["symbols"]),
-            "wires": len(m["wires"]), "labels": len(m["labels"])}
+    Path(sch).write_text(text, encoding="utf-8")
+    return _save_result(m, sch, syms, unresolved)
+
+
+def _symbol_entry(c: dict[str, Any]) -> dict[str, Any]:
+    """Validate one component dict and build the model entry."""
+    for key in ("ref", "lib_id", "x", "y"):
+        if key not in c:
+            raise ValueError(f"component is missing '{key}': {c}")
+    lib_id = str(c["lib_id"])
+    if lib_id.count(":") != 1 or not all(lib_id.split(":")):
+        raise ValueError(f"lib_id '{lib_id}' must be 'Library:Symbol' (e.g. Device:R)")
+    rot = int(c.get("rot", 0))
+    if rot % 90 or not 0 <= rot < 360:
+        raise ValueError(f"rot must be one of 0/90/180/270 for {c['ref']}, got {rot}")
+    return {"ref": str(c["ref"]), "lib_id": lib_id, "value": str(c.get("value", "")),
+            "x": float(c["x"]), "y": float(c["y"]), "rot": rot,
+            "unit": int(c.get("unit", 1)), "footprint": str(c.get("footprint", "")),
+            "uuid": str(uuid.uuid4())}
 
 
 @mcp.tool()
 def add_component(sch: str, ref: str, lib_id: str, value: str,
-                  x: float, y: float, rot: int = 0, footprint: str = "") -> dict:
-    """Place one component. Coordinates in mm. rot in {0,90,180,270}."""
+                  x: float, y: float, rot: int = 0, footprint: str = "",
+                  unit: int = 1) -> dict:
+    """Place one component. Coordinates in mm. rot in {0,90,180,270}. `unit` for
+    multi-unit parts (op-amps, logic); defaults to 1."""
     m = _require(sch)
-    sym = {"ref": ref, "lib_id": lib_id, "value": value, "x": x, "y": y,
-           "rot": rot, "footprint": footprint, "uuid": str(uuid.uuid4())}
+    sym = _symbol_entry({"ref": ref, "lib_id": lib_id, "value": value, "x": x, "y": y,
+                         "rot": rot, "footprint": footprint, "unit": unit})
     m["symbols"].append(sym)
     return {"ok": True, "ref": ref, "uuid": sym["uuid"]}
 
 
 @mcp.tool()
 def add_components_batch(sch: str, components: list[dict]) -> dict:
-    """Place many components in one write. Each dict: ref, lib_id, value, x, y, [rot], [footprint].
-
-    Prefer this over repeated add_component calls — it builds all symbols then
-    writes once, eliminating read-modify-write corruption on large schematics."""
+    """Place many components in one call. Each dict: ref, lib_id, value, x, y,
+    [rot], [footprint], [unit]. Prefer this over repeated add_component calls.
+    Validates every entry BEFORE adding any, so a bad entry adds nothing."""
     m = _require(sch)
-    placed = []
-    for c in components:
-        sym = {"ref": c["ref"], "lib_id": c["lib_id"], "value": c.get("value", ""),
-               "x": float(c["x"]), "y": float(c["y"]), "rot": int(c.get("rot", 0)),
-               "footprint": c.get("footprint", ""), "uuid": str(uuid.uuid4())}
-        m["symbols"].append(sym)
-        placed.append(sym["ref"])
+    syms = [_symbol_entry(c) for c in components]
+    m["symbols"].extend(syms)
+    placed = [s["ref"] for s in syms]
     return {"ok": True, "placed": placed, "count": len(placed)}
 
 
@@ -230,23 +470,27 @@ def add_power_port(sch: str, net: str, x: float, y: float) -> dict:
 
 
 def _pin_xy(sch: str, ref: str, pin: str) -> tuple[float, float]:
+    """Absolute schematic coordinate (mm) of a component pin, by pin number or
+    name: sidecar offsets when present, else derived from the library symbol,
+    rotated by the symbol's placement rotation."""
     m = _require(sch)
     sym = next((s for s in m["symbols"] if s["ref"] == ref), None)
     if not sym:
         raise ValueError(f"No component {ref} in {sch}.")
-    pins = _pins_sidecar(sym["lib_id"], sch)
-    if not pins or pin not in pins:
+    pins = _pin_map(sym["lib_id"], sch)
+    if pin not in pins:
         raise ValueError(
-            f"Pin coordinates for {ref}.{pin} ({sym['lib_id']}) are unknown. "
-            f"Provide a pin sidecar at pins/{sym['lib_id'].replace(':','_')}.pins.json "
-            f"or use the explicit-coordinate tools (add_wire/add_label/add_power_port).")
+            f"{sym['lib_id']} has no pin '{pin}' (known: {sorted(pins)[:40]}). "
+            f"Use the pin number or name as printed in the KiCad symbol.")
     off = pins[pin]
-    return sym["x"] + float(off["x"]), sym["y"] + float(off["y"])
+    dx, dy = _rotate_offset(float(off["x"]), float(off["y"]), sym.get("rot", 0))
+    return round(sym["x"] + dx, 4), round(sym["y"] + dy, 4)
 
 
 @mcp.tool()
 def wire_by_ref(sch: str, ref_a: str, pin_a: str, ref_b: str, pin_b: str) -> dict:
-    """Connect two component pins by reference, resolving coordinates from the pin sidecar."""
+    """Connect two component pins by reference, resolving coordinates from the pin
+    sidecar or, failing that, the KiCad symbol library."""
     ax, ay = _pin_xy(sch, ref_a, pin_a)
     bx, by = _pin_xy(sch, ref_b, pin_b)
     _require(sch)["wires"].append({"a": (ax, ay), "b": (bx, by)})
@@ -255,7 +499,8 @@ def wire_by_ref(sch: str, ref_a: str, pin_a: str, ref_b: str, pin_b: str) -> dic
 
 @mcp.tool()
 def label_pin(sch: str, ref: str, pin: str, net_name: str) -> dict:
-    """Place a net label at a component pin, resolving its coordinate from the pin sidecar."""
+    """Place a net label at a component pin, resolving its coordinate from the pin
+    sidecar or, failing that, the KiCad symbol library."""
     x, y = _pin_xy(sch, ref, pin)
     _require(sch)["labels"].append({"net": net_name, "x": x, "y": y, "rot": 0})
     return {"ok": True, "at": f"{ref}.{pin}", "net": net_name}
@@ -263,7 +508,8 @@ def label_pin(sch: str, ref: str, pin: str, net_name: str) -> dict:
 
 @mcp.tool()
 def power_pin(sch: str, ref: str, pin: str, net_name: str) -> dict:
-    """Place a power port at a component power pin, resolving its coordinate from the pin sidecar."""
+    """Place a power port at a component power pin, resolving its coordinate from
+    the pin sidecar or, failing that, the KiCad symbol library."""
     x, y = _pin_xy(sch, ref, pin)
     _require(sch)["power"].append({"net": net_name, "x": x, "y": y})
     return {"ok": True, "at": f"{ref}.{pin}", "net": net_name}
@@ -285,17 +531,62 @@ def list_nets(sch: str) -> dict:
     return {"nets": nets, "count": len(nets)}
 
 
+# ERC severities that never count as violations: the user excluded them in the
+# editor, or the rule is set to "ignore" in the project's ERC settings.
+_ERC_SUPPRESSED = frozenset({"exclusion", "ignore"})
+
+
+def _erc_severity_counts(report: dict) -> dict[str, int]:
+    """{severity: count} over every sheet of a kicad-cli ERC JSON report."""
+    return dict(Counter(str(v.get("severity", "unknown"))
+                        for s in report.get("sheets", [])
+                        for v in s.get("violations", [])))
+
+
+def _erc_json(sch: str, rpt: str, severity_error: bool = True) -> dict:
+    """Run kicad-cli ERC with a JSON report and count violations across sheets.
+
+    kicad-cli's --severity-error filters its console summary ("Found N
+    violations") but NOT the JSON report — KiCad 9.0.4 still writes every
+    warning into it — so the count is taken from each violation's own
+    `severity`: errors only when severity_error, else every non-suppressed
+    severity. erc_ok is False (with erc_error) whenever the report cannot be
+    produced or parsed."""
+    args = [KICAD_CLI, "sch", "erc", "--format", "json", "-o", rpt]
+    if severity_error:
+        args.append("--severity-error")
+    e = _run(args + [sch], timeout=KICAD_CLI_TIMEOUT_S)
+    try:
+        report = json.loads(Path(rpt).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as ex:
+        return {"erc_ok": False, "erc_report": rpt,
+                "erc_error": f"ERC report unreadable ({ex}): {(e.stdout + e.stderr)[-600:]}"}
+    by_sev = _erc_severity_counts(report)
+    if severity_error:
+        n = by_sev.get("error", 0)
+    else:
+        n = sum(c for sev, c in by_sev.items() if sev not in _ERC_SUPPRESSED)
+    return {"erc_ok": n == 0, "erc_violations": n, "erc_by_severity": by_sev,
+            "erc_report": rpt, "report": report}
+
+
 @mcp.tool()
-def run_erc(sch: str) -> dict:
-    """Run KiCad's Electrical Rules Check via kicad-cli (KiCad 9 required)."""
+def run_erc(sch: str, errors_only: bool = False) -> dict:
+    """Run KiCad's Electrical Rules Check via kicad-cli and return the parsed JSON
+    report plus a violation count: errors AND warnings by default, errors only
+    with errors_only (the count is filtered by each violation's severity, since
+    kicad-cli writes every severity into the JSON report regardless of its
+    --severity flags). by_severity holds the full histogram either way."""
     if not KICAD_CLI:
         return {"ok": False, "reason": "kicad-cli not found on PATH; install KiCad 9."}
-    out = Path(sch).with_suffix(".erc.json")
-    r = subprocess.run([KICAD_CLI, "sch", "erc", "--format", "json",
-                        "-o", str(out), sch], capture_output=True, text=True)
-    report = json.loads(out.read_text()) if out.is_file() else {}
-    return {"ok": r.returncode == 0, "stdout": r.stdout[-2000:],
-            "stderr": r.stderr[-2000:], "report": report}
+    if not Path(sch).is_file():
+        raise ValueError(f"Schematic not found on disk: {sch} (call save_schematic first)")
+    res = _erc_json(sch, str(Path(sch).with_suffix(".erc.json")), severity_error=errors_only)
+    if "erc_error" in res:
+        return {"ok": False, "reason": res["erc_error"], "report_path": res["erc_report"]}
+    return {"ok": True, "violations": res["erc_violations"], "erc_ok": res["erc_ok"],
+            "by_severity": res["erc_by_severity"], "report_path": res["erc_report"],
+            "report": res["report"]}
 
 
 @mcp.tool()
@@ -313,41 +604,202 @@ def render_sch(sch: str, out_png: str = "") -> dict:
 # ----------------------------------------------------------------------------
 # PCB TOOLS (KiCad 9 IPC API via kipy)
 # ----------------------------------------------------------------------------
-def _kipy():
-    """Return a connected KiCad board, or a dict describing why not."""
+_ENABLE_API_HINT = ("Open KiCad with the API server enabled (Preferences > Plugins and "
+                    "Content Manager > Enable KiCad API; KiCad 9: Preferences > API).")
+_EDITOR_NAMES = {"pcb": "Pcbnew (PCB editor)", "schematic": "Eeschema (schematic editor)",
+                 "project": "project manager"}
+# (kind, DocumentType enum name) — queried in this order; a KiCad without a
+# schematic API answers the schematic query with an ApiError, which is tolerated.
+_DOC_QUERIES = (("pcb", "DOCTYPE_PCB"), ("schematic", "DOCTYPE_SCHEMATIC"),
+                ("project", "DOCTYPE_PROJECT"))
+
+
+def _kicad_version_of(kicad) -> tuple[str, tuple[int, ...]]:
+    """(full version string, numeric tuple) from a connected KiCad."""
+    v = kicad.get_version()
+    full = str(getattr(v, "full_version", "") or v)
+    parts = tuple(getattr(v, a, None) for a in ("major", "minor", "patch"))
+    if all(isinstance(p, int) for p in parts):
+        return full, parts  # type: ignore[return-value]
+    return full, _version_tuple(full)
+
+
+def _doc_path(doc, kind: str) -> str:
+    """Absolute file path of an open DocumentSpecifier, best effort."""
+    has_project = False
+    try:
+        has_project = doc.HasField("project")
+    except ValueError:
+        has_project = False
+    pdir = doc.project.path if has_project else ""
+    pname = doc.project.name if has_project else ""
+    if kind == "pcb":
+        fn = doc.board_filename or (f"{pname}.kicad_pcb" if pname else "")
+        if fn and not Path(fn).is_absolute() and pdir:
+            return str(Path(pdir) / fn)
+        return fn
+    if kind == "schematic":
+        return str(Path(pdir) / f"{pname}.kicad_sch") if pdir and pname else ""
+    if kind == "project":
+        return str(Path(pdir) / f"{pname}.kicad_pro") if pdir and pname else pdir
+    return ""
+
+
+def _open_documents(kicad) -> tuple[list[dict[str, str]], list[str]]:
+    """[{type, path}] for every document open in KiCad, plus probe notes for
+    queries KiCad refused (e.g. DOCTYPE_SCHEMATIC on KiCad 9/10)."""
+    from kipy.proto.common.types import DocumentType
+    docs: list[dict[str, str]] = []
+    notes: list[str] = []
+    for kind, enum_name in _DOC_QUERIES:
+        try:
+            found = kicad.get_open_documents(getattr(DocumentType, enum_name))
+        except Exception as e:  # kipy ApiError on unsupported doc types
+            notes.append(f"{kind}: {type(e).__name__}: {str(e)[:120]}")
+            continue
+        docs += [{"type": kind, "path": _doc_path(d, kind)} for d in found]
+    return docs, notes
+
+
+def _kipy_connect() -> dict:
+    """Connect to a running KiCad (no board required). Returns a dict with
+    ipc_connected, kicad_version, open_documents, capabilities and the live
+    `kicad` client — or {"ipc_connected": False, "reason": ...}."""
     try:
         from kipy import KiCad  # type: ignore
-    except Exception:
-        return {"ipc_connected": False,
-                "reason": "kicad-python (kipy) not installed in the server venv."}
-    try:
-        kicad = KiCad()
-        board = kicad.get_board()
-        return {"ipc_connected": True, "kicad": kicad, "board": board}
     except Exception as e:
         return {"ipc_connected": False,
-                "reason": f"KiCad IPC API not reachable ({e}). Open Pcbnew and enable the API server."}
+                "reason": f"kicad-python (kipy) not importable in the server venv ({e})."}
+    try:
+        kicad = KiCad()
+        full, ver = _kicad_version_of(kicad)
+    except Exception as e:
+        return {"ipc_connected": False,
+                "reason": f"KiCad IPC API not reachable ({e}). {_ENABLE_API_HINT}"}
+    docs, notes = _open_documents(kicad)
+    out = {"ipc_connected": True, "kicad": kicad, "kicad_version": full,
+           "open_documents": docs, "capabilities": _capabilities(ver)}
+    return {**out, "open_documents_note": "; ".join(notes)} if notes else out
+
+
+def _public(k: dict) -> dict:
+    """Strip live client objects so the dict can be returned to the caller."""
+    return {kk: v for kk, v in k.items() if kk not in ("kicad", "board")}
+
+
+def _kipy() -> dict:
+    """Connected KiCad + the board open in Pcbnew (keys `kicad`, `board`), or a
+    JSON-safe dict describing why not (no `board` key)."""
+    k = _kipy_connect()
+    if not k.get("ipc_connected"):
+        return k
+    try:
+        board = k["kicad"].get_board()
+    except Exception as e:
+        return {**_public(k), "ok": False,
+                "reason": f"KiCad IPC is reachable but no board is open in Pcbnew ({e}). "
+                          "Open the .kicad_pcb in the PCB editor and retry."}
+    return {**k, "board": board}
+
+
+def _holding_kind(k: dict, path: str) -> str | None:
+    """Which editor kind ('pcb'/'schematic'/'project') in the connection dict
+    `k` (from _kipy_connect) has `path` open; None when it is not open or the
+    connection failed (unknown never blocks). One path-resolution rule for
+    every guard: absolute + normcase on both sides."""
+    if not k.get("ipc_connected"):
+        return None
+    target = os.path.normcase(os.path.abspath(path))
+    for d in k["open_documents"]:
+        if d["path"] and os.path.normcase(os.path.abspath(d["path"])) == target:
+            return d["type"]
+    return None
+
+
+def _editor_holding(path: str) -> str | None:
+    """Which KiCad editor kind has `path` open (fresh IPC connection), or None."""
+    return _holding_kind(_kipy_connect(), path)
+
+
+def _open_in_editor(path: str) -> bool:
+    """True when `path` is currently open in a running KiCad editor."""
+    return _editor_holding(path) is not None
+
+
+def _write_refusal(path: str, kind: str) -> dict:
+    """The refusal every WRITE tool returns for a file open in a KiCad editor
+    (writing it from outside would be lost or corrupt the editor's copy)."""
+    return {"ok": False,
+            "reason": f"{path} is open in KiCad {_EDITOR_NAMES.get(kind, kind)}; close it "
+                      "(or save+close) before writing, then reopen to see the result."}
+
+
+def _write_guard(path: str) -> dict | None:
+    """Refusal dict when `path` is open in a KiCad editor, else None."""
+    kind = _editor_holding(path)
+    return None if kind is None else _write_refusal(path, kind)
+
+
+def _live_board_report(k: dict, target: str) -> dict:
+    """create_pcb's answer when `target` is the board already open in Pcbnew:
+    report it (ipc_connected true) instead of creating anything."""
+    res = {"ipc_connected": True, "ok": True, "created": False, "pcb": target,
+           "note": "this board is already open in KiCad; nothing was created"}
+    try:
+        res["footprints"] = len(k["kicad"].get_board().get_footprints())
+    except Exception as e:  # kipy ApiError: editor busy / board not yet loaded
+        res["footprints_error"] = str(e)[:200]
+    return res
 
 
 @mcp.tool()
-def create_pcb(sch: str = "", pcb: str = "") -> dict:
-    """Create a PCB from the schematic netlist. Requires KiCad 9 IPC.
-
-    With the IPC workflow, create the .kicad_pcb in KiCad and open it in Pcbnew;
-    this tool then verifies the connection and reports the board summary."""
-    k = _kipy()
-    if not k.get("ipc_connected"):
-        return k
-    board = k["board"]
-    return {"ipc_connected": True, "ok": True,
-            "footprints": len(board.get_footprints())}
+def create_pcb(pcb: str, sch: str = "", overwrite: bool = False) -> dict:
+    """Create an empty .kicad_pcb (+ sibling .kicad_pro) on disk with KiCad's own
+    pcbnew (no hand-written S-expressions). No running KiCad needed. If KiCad has
+    THIS file open already, reports the live board instead (ipc_connected true).
+    Footprints reach the board from the schematic via Update PCB from Schematic
+    (F8) in KiCad; `sch` is recorded for that step. Refuses to overwrite an
+    existing file unless `overwrite` is true."""
+    if not pcb.endswith(".kicad_pcb"):
+        raise ValueError(f"pcb must end in .kicad_pcb, got '{pcb}'")
+    target = str(Path(pcb).resolve())
+    # one IPC connection, one path-resolution rule (the same _holding_kind the
+    # write guards use, so a relative board_filename resolves via its project)
+    k = _kipy_connect()
+    kind = _holding_kind(k, target)
+    if kind == "pcb":
+        return _live_board_report(k, target)
+    if Path(target).is_file() and not overwrite:
+        return {"ok": False, "created": False, "pcb": target,
+                "reason": f"{target} already exists; pass overwrite=true to replace it"}
+    if kind is not None:
+        return _write_refusal(target, kind)
+    kpy = _kicad_python()
+    if not kpy:
+        return {"ok": False, "reason": f"KiCad bundled Python (pcbnew) not found: {_KPY['error']}"}
+    Path(target).parent.mkdir(parents=True, exist_ok=True)
+    code = ("import sys, pcbnew\n"
+            "board = pcbnew.CreateEmptyBoard()\n"
+            "pcbnew.SaveBoard(sys.argv[1], board)\n")
+    r = _run([kpy, "-c", code, target], timeout=120)
+    if r.returncode != 0 or not Path(target).is_file():
+        return {"ok": False, "created": False, "pcb": target,
+                "reason": "pcbnew failed to create the board", "stderr": r.stderr[-1200:]}
+    pro = Path(target).with_suffix(".kicad_pro")
+    res = {"ok": True, "pcb": target, "created": True,
+           "project": str(pro) if pro.is_file() else None,
+           "next": "Open it in KiCad (Pcbnew) with the API enabled, then call test_kicad_connection"}
+    if sch:
+        res["sch"] = sch
+        res["next"] += "; run Tools > Update PCB from Schematic (F8) to import the footprints"
+    return res
 
 
 @mcp.tool()
 def get_pcb_summary() -> dict:
     """Summarize the open board: footprint count, nets, layer count, size."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     board = k["board"]
     fps = board.get_footprints()
@@ -412,18 +864,24 @@ def _boxes_overlap(a, b) -> bool:
 
 @mcp.tool()
 def test_kicad_connection() -> dict:
-    """Ping the running KiCad instance and confirm the IPC API is live (MANDATORY first PCB step)."""
-    k = _kipy()
+    """Probe the running KiCad over IPC (MANDATORY first PCB step): version, every
+    open document ({type: pcb|schematic|project, path}) and the version-derived
+    capabilities (schematic_api / place_footprint_from_library / import_netlist
+    are KiCad 11+ only). ipc_connected false + reason when unreachable."""
+    k = _kipy_connect()
     if not k.get("ipc_connected"):
-        return k
-    kc, board = k["kicad"], k["board"]
-    try:
-        ver = str(kc.get_version())
-    except Exception:
-        ver = "unknown"
-    return {"ipc_connected": True, "kicad_version": ver,
-            "board": getattr(board, "name", "?"),
-            "footprints": len(board.get_footprints())}
+        # same shape as the connected result so callers can always read
+        # capabilities / open_documents without a key check (C1)
+        return {**k, "kicad_version": None, "open_documents": [],
+                "capabilities": _capabilities(())}
+    res = _public(k)
+    boards = [d["path"] for d in k["open_documents"] if d["type"] == "pcb"]
+    if boards:
+        try:
+            res["footprints"] = len(k["kicad"].get_board().get_footprints())
+        except Exception as e:
+            res["footprints_error"] = str(e)[:200]
+    return res
 
 
 @mcp.tool()
@@ -434,7 +892,7 @@ def add_footprint_to_pcb(ref: str, lib_id: str, x: float, y: float,
     via Tools > Update PCB from Schematic (F8). Use move_footprint to position one that
     is already on the board."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     existing = _fp_by_ref(k["board"], ref)
     if existing is not None:
@@ -452,7 +910,7 @@ def add_footprints_batch(footprints: list[dict]) -> dict:
     Footprints must already be on the board (imported via Update PCB from Schematic);
     this moves each to its target location."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     from kipy.board_types import Vector2, Angle
     board = k["board"]
@@ -477,7 +935,7 @@ def add_footprints_batch(footprints: list[dict]) -> dict:
 def move_footprint(ref: str, x: float, y: float, rot: float = 0) -> dict:
     """Move a placed footprint to (x,y) mm with rotation (degrees). Requires IPC."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     from kipy.board_types import Vector2, Angle
     board = k["board"]
@@ -495,7 +953,7 @@ def move_footprint(ref: str, x: float, y: float, rot: float = 0) -> dict:
 def remove_footprint(ref: str) -> dict:
     """Remove a footprint from the board by reference. Requires IPC."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     board = k["board"]
     fp = _fp_by_ref(board, ref)
@@ -510,7 +968,7 @@ def remove_footprint(ref: str) -> dict:
 def get_footprint_pads(ref: str) -> dict:
     """Return pad numbers, nets, and absolute positions (mm) for a footprint. Requires IPC."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     board = k["board"]
     fp = _fp_by_ref(board, ref)
@@ -536,7 +994,7 @@ def register_net(net_name: str) -> dict:
     """Confirm a net exists on the board before routing it. Nets originate from the
     schematic netlist; this reports presence rather than creating a bare net. Requires IPC."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     exists = any(n.name == net_name for n in k["board"].get_nets())
     return {"ipc_connected": True, "ok": exists, "net": net_name, "exists": exists,
@@ -550,7 +1008,7 @@ def add_trace(net_name: str, layer: str, x1: float, y1: float,
               x2: float, y2: float, width: float = 0.25) -> dict:
     """Add a copper trace segment on a net/layer between two points (mm). Requires IPC."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     from kipy.board_types import Track, Vector2, from_mm
     board = k["board"]
@@ -570,7 +1028,7 @@ def add_via(net_name: str, x: float, y: float,
             drill: float = 0.3, diameter: float = 0.6) -> dict:
     """Add a via on a net at (x,y) mm. Requires IPC."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     from kipy.board_types import Via, Vector2, from_mm
     board = k["board"]
@@ -588,7 +1046,7 @@ def add_via(net_name: str, x: float, y: float,
 def add_copper_zone(net_name: str, layer: str, polygon: list[list[float]]) -> dict:
     """Add a copper pour/zone on a net and layer bounded by a polygon (list of [x,y] mm). Requires IPC."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     from kipy.board_types import Zone, Vector2
     from kipy.geometry import PolyLine
@@ -618,7 +1076,7 @@ def add_copper_zone(net_name: str, layer: str, polygon: list[list[float]]) -> di
 def validate_placement() -> dict:
     """Check the current placement for courtyard/bounding-box overlaps. Requires IPC."""
     k = _kipy()
-    if not k.get("ipc_connected"):
+    if "board" not in k:
         return k
     board = k["board"]
     fps = board.get_footprints()
@@ -639,14 +1097,48 @@ def validate_placement() -> dict:
             "checked": len(boxes), "overlaps": overlaps, "ok": not overlaps}
 
 
+def _drc_counts(pcb: str) -> dict:
+    """Run kicad-cli DRC (error severity) on a saved board and summarize the JSON
+    report: {errors, unconnected, types: {type: count}, report}. When the report
+    cannot be produced or parsed the dict carries an `error` key (counts -1)."""
+    if not KICAD_CLI:
+        raise RuntimeError("kicad-cli not found; install KiCad 9.")
+    rpt = str(Path(pcb).with_suffix("")) + "_drc.json"
+    r = _run([KICAD_CLI, "pcb", "drc", pcb, "--format", "json", "--severity-error",
+              "-o", rpt], timeout=KICAD_CLI_TIMEOUT_S)
+    try:
+        d = json.loads(Path(rpt).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return {"errors": -1, "unconnected": -1, "types": {}, "report": rpt,
+                "error": f"DRC report unreadable ({e}): {(r.stdout + r.stderr)[-600:]}"}
+    violations = d.get("violations", [])
+    return {"errors": len(violations),
+            "unconnected": len(d.get("unconnected_items", [])),
+            "types": dict(Counter(v.get("type", "unknown") for v in violations)),
+            "report": rpt}
+
+
 @mcp.tool()
-def drc_pcb(fab_profile: str = "") -> dict:
-    """Run DRC against the fab profile (defaults to the plugin's configured profile). Requires KiCad 9."""
+def drc_pcb(pcb: str, fab_profile: str = "") -> dict:
+    """Run KiCad DRC (error severity) on a SAVED .kicad_pcb via kicad-cli and
+    return the error / unconnected counts, a per-type histogram and the JSON
+    report path. Read-only: safe on a board that is open in the editor, but
+    unsaved GUI changes are not reflected. The fab profile is echoed; the rules
+    themselves live in the board/.kicad_pro."""
     profile = fab_profile or FAB_PROFILE
     if not KICAD_CLI:
         return {"ok": False, "reason": "kicad-cli not found; install KiCad 9.", "profile": profile}
-    return {"ok": True, "profile": profile,
-            "note": "run kicad-cli pcb drc on the saved .kicad_pcb and parse the JSON report"}
+    if not Path(pcb).is_file():
+        raise ValueError(f"PCB not found: {pcb}")
+    c = _drc_counts(pcb)
+    if "error" in c:
+        return {"ok": False, "reason": c["error"], "report": c["report"], "profile": profile}
+    res = {"ok": c["errors"] == 0 and c["unconnected"] == 0, "errors": c["errors"],
+           "unconnected": c["unconnected"], "types": c["types"], "report": c["report"],
+           "profile": profile}
+    if _open_in_editor(pcb):
+        res["note"] = "file is open in the editor; unsaved GUI changes are not reflected"
+    return res
 
 
 @mcp.tool()
@@ -686,24 +1178,48 @@ def render_pcb(pcb: str, side: str = "top", out_png: str = "") -> dict:
 # sexpdata), the SWIG board/route steps under KiCad's bundled Python (needs
 # pcbnew), and Freerouting under Java.
 # ----------------------------------------------------------------------------
-TOOLS_DIR = Path(__file__).parent / "tools"
+_KPY: dict[str, Any] = {"checked": False, "path": None, "error": None}
+
+
+def _kicad_python_candidates() -> list[Path]:
+    if not KICAD_CLI:
+        return []
+    bin_dir = Path(KICAD_CLI).parent
+    if os.name == "nt":
+        return [bin_dir / "python.exe"]
+    # macOS app bundle keeps its Python in Frameworks/, Linux uses the system one
+    return [bin_dir / "python3",
+            bin_dir.parent / "Frameworks" / "Python.framework" / "Versions" / "Current" / "bin" / "python3",
+            Path(shutil.which("python3") or "")]
 
 
 def _kicad_python() -> str | None:
-    """KiCad's bundled Python (ships the `pcbnew` SWIG module) — beside kicad-cli."""
-    if KICAD_CLI:
-        cand = Path(KICAD_CLI).parent / ("python.exe" if os.name == "nt" else "python3")
-        if cand.is_file():
-            return str(cand)
-    return None
-
-
-def _kicad_share() -> Path | None:
-    """KiCad's shared data dir (.../share/kicad) holding symbols/ and footprints/."""
-    if KICAD_CLI:
-        share = Path(KICAD_CLI).parent.parent / "share" / "kicad"
-        if share.is_dir():
-            return share
+    """KiCad's bundled Python, VERIFIED to import `pcbnew` (checked once per
+    process; the failure text is kept in _KPY['error'] for server_status)."""
+    if _KPY["checked"]:
+        return _KPY["path"]
+    _KPY["checked"] = True
+    if not KICAD_CLI:
+        _KPY["error"] = "kicad-cli not found, so KiCad's bundled Python could not be located"
+        return None
+    errors: list[str] = []
+    for cand in _kicad_python_candidates():
+        if not cand.is_file():
+            continue
+        try:
+            r = subprocess.run([str(cand), "-c", "import pcbnew"], capture_output=True,
+                               text=True, timeout=PCBNEW_PROBE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            errors.append(f"{cand}: 'import pcbnew' timed out after {PCBNEW_PROBE_TIMEOUT_S} s")
+            continue
+        except OSError as e:
+            errors.append(f"{cand}: cannot start ({e})")
+            continue
+        if r.returncode == 0:
+            _KPY["path"] = str(cand)
+            return _KPY["path"]
+        errors.append(f"{cand}: cannot import pcbnew: {r.stderr.strip()[-400:]}")
+    _KPY["error"] = "; ".join(errors) or f"no bundled Python found beside {KICAD_CLI}"
     return None
 
 
@@ -777,10 +1293,13 @@ def build_schematic_from_netlist(netlist: str, out_sch: str = "",
     if not script.is_file():
         return {"ok": False, "reason": f"missing {script}"}
     out = out_sch or str(Path(netlist).with_suffix(".kicad_sch"))
-    syms = symbols_dir or (str(_kicad_share() / "symbols") if _kicad_share() else "")
-    sides = sidecars_dir or str(Path(__file__).parent / "pins")
+    syms = _symbols_dir(symbols_dir)
+    sides = sidecars_dir or str(PINS_DIR)
     if not syms:
         return {"ok": False, "reason": "symbols_dir not given and KiCad share dir not found"}
+    guard = _write_guard(out)
+    if guard:
+        return guard
     r = _run([sys.executable, str(script), netlist, out, syms, sides])
     res = _last_json(r.stdout) or {}
     res["ok"] = r.returncode == 0 and res.get("ok", False)
@@ -788,18 +1307,11 @@ def build_schematic_from_netlist(netlist: str, out_sch: str = "",
     if r.stderr:
         res["stderr"] = r.stderr[-1200:]
     if res["ok"] and run_erc and KICAD_CLI:
-        rpt = str(Path(out).with_suffix("")) + "_erc.rpt"
         # gate on ERRORS only (warnings inform but don't block — e.g. the
         # pin_to_pin warning for an address-strap pin tied to a power net is a
         # known false positive); same severity policy as the DRC gate.
-        e = _run([KICAD_CLI, "sch", "erc", out, "--severity-error", "-o", rpt])
-        res["erc_ok"] = "Failed to load" not in (e.stdout + e.stderr)
-        # kicad-cli prints "Found N violations"
-        for tok in (e.stdout + e.stderr).split():
-            if tok.isdigit():
-                res["erc_violations"] = int(tok)
-                break
-        res["erc_report"] = rpt
+        erc = _erc_json(out, str(Path(out).with_suffix("")) + "_erc.json")
+        res.update({k: v for k, v in erc.items() if k != "report"})
     return res
 
 
@@ -826,6 +1338,9 @@ def build_board_from_netlist(netlist: str, board_w: float, board_h: float,
     fps = footprints_dir or (str(_kicad_share() / "footprints") if _kicad_share() else "")
     if not fps:
         return {"ok": False, "reason": "footprints_dir not given and KiCad share dir not found"}
+    guard = _write_guard(out)
+    if guard:
+        return guard
     args = [kpy, str(script), netlist, out, fps, str(board_w), str(board_h)]
     if placement:
         args.append(placement)
@@ -836,33 +1351,45 @@ def build_board_from_netlist(netlist: str, board_w: float, board_h: float,
     res["pcb"] = out
     if r.stderr:
         res["stderr"] = r.stderr[-1200:]
-
-    # Resolve electrical intent (net_specs + reliability class) into IPC-2221
-    # net classes and write them into the .kicad_pro so BOTH the Specctra DSN
-    # export (Freerouting routes power copper wider) and kicad-cli DRC honor
-    # per-net widths/clearances. Default class 3 (high-reliability) unless the
-    # netlist overrides "class". No-op for a netlist with no power intent.
     if res["ok"]:
-        try:
-            if str(TOOLS_DIR) not in sys.path:
-                sys.path.insert(0, str(TOOLS_DIR))
-            import netclass_writer
-            design = json.loads(Path(netlist).read_text(encoding="utf-8"))
-            pro = str(Path(out).with_suffix(".kicad_pro"))
-            # nets backed by a poured plane ("In1.Cu:GND") or by designer
-            # preroutes are exempt from track-width classing — the plane or
-            # the prerouted copper carries the current, and a width class
-            # would make the net's signal taps unreachable for the router
-            planes = tuple(z.split(":", 1)[1] for z in res.get("zones", [])
-                           if ":" in z)
-            planes += tuple(p["net"] for p in design.get("preroutes", []))
-            nc = netclass_writer.apply_to_project(
-                pro, design, int(design.get("class", 3)), plane_nets=planes)
-            res["netclasses"] = {"profile": nc.get("class_profile"),
-                                 "written": nc.get("classes_written", [])}
-        except Exception as e:  # never fail the build on a rules-annotation slip
-            res["netclasses"] = {"error": str(e)}
+        res.update(_apply_netclasses(netlist, out, res.get("zones", [])))
     return res
+
+
+def _apply_netclasses(netlist: str, out_pcb: str, zones: list[str]) -> dict:
+    """Resolve electrical intent (net_specs + reliability class) into IPC-2221
+    net classes and write them into the .kicad_pro so BOTH the Specctra DSN
+    export (Freerouting routes power copper wider) and kicad-cli DRC honor
+    per-net widths/clearances. Default class 3 (high-reliability) unless the
+    netlist overrides "class". A netlist WITH net_specs whose classes cannot be
+    written fails the build (ok False) — a board routed at default widths must
+    never pass silently. A netlist without net_specs only reports the slip."""
+    design = json.loads(Path(netlist).read_text(encoding="utf-8"))
+    has_specs = bool(design.get("net_specs"))
+    try:
+        if str(TOOLS_DIR) not in sys.path:
+            sys.path.insert(0, str(TOOLS_DIR))
+        import netclass_writer
+        pro = str(Path(out_pcb).with_suffix(".kicad_pro"))
+        # nets backed by a poured plane ("In1.Cu:GND") or by designer preroutes
+        # are exempt from track-width classing — the plane or the prerouted
+        # copper carries the current, and a width class would make the net's
+        # signal taps unreachable for the router
+        planes = tuple(z.split(":", 1)[1] for z in zones if ":" in z)
+        planes += tuple(p["net"] for p in design.get("preroutes", []))
+        nc = netclass_writer.apply_to_project(
+            pro, design, int(design.get("class", 3)), plane_nets=planes)
+    except Exception as e:
+        nc = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+    summary = {"profile": nc.get("class_profile"), "written": nc.get("classes_written", []),
+               "warnings": nc.get("warnings", [])}
+    if nc.get("ok"):
+        return {"netclasses": summary}
+    failure = {"netclasses": {**summary, "error": nc.get("reason", "unknown failure")}}
+    if not has_specs:
+        return failure
+    return {**failure, "ok": False,
+            "reason": f"net classes not written: {nc.get('reason', 'unknown failure')}"}
 
 
 @mcp.tool()
@@ -882,6 +1409,9 @@ def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
         return {"ok": False, "reason": "java not found (Freerouting needs a JRE/JDK)"}
     if not fj:
         return {"ok": False, "reason": "freerouting jar not found in server/tools or $FREEROUTING_JAR"}
+    guard = _write_guard(pcb)
+    if guard:
+        return guard
     base = str(Path(pcb).with_suffix(""))
     dsn, ses = base + ".dsn", base + ".ses"
     d = _run([kpy, str(TOOLS_DIR / "swig_export_dsn.py"), pcb, dsn], timeout=120)
@@ -934,25 +1464,40 @@ def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
     if not Path(ses).is_file():
         return {"ok": False, "step": "route", "stderr": fr_out}
     im = _run([kpy, str(TOOLS_DIR / "swig_import_ses.py"), pcb, ses], timeout=180)
-    tracks = None
-    for tok in im.stdout.split():
-        if tok.isdigit():
-            tracks = int(tok)
+    imp = _parse_ses_import(im.stdout)
+    if not imp["ok"]:
+        return {"ok": False, "step": "import", "pcb": pcb, "dsn": dsn, "ses": ses,
+                "reason": imp.get("error") or "SES import failed",
+                "warnings": imp["warnings"], "import_log": (im.stdout + im.stderr)[-600:]}
     # verify route completeness — Freerouting is non-deterministic and may leave a
     # stub; report the unconnected count so the caller can re-run if it isn't zero.
     unconnected = None
+    drc_note = None
     if KICAD_CLI:
-        rpt = base + "_drc.json"
-        _run([KICAD_CLI, "pcb", "drc", pcb, "-o", rpt, "--format", "json"])
-        try:
-            unconnected = len(json.loads(Path(rpt).read_text()).get("unconnected_items", []))
-        except Exception:
-            pass
-    return {"ok": "True" in im.stdout and (unconnected in (0, None)),
-            "pcb": pcb, "dsn": dsn, "ses": ses, "tracks": tracks,
-            "unconnected": unconnected, "import_log": im.stdout.strip()[-300:],
-            "note": None if unconnected in (0, None) else
-                    f"{unconnected} net(s) left unrouted — re-run autoroute_board to converge"}
+        c = _drc_counts(pcb)
+        unconnected = c["unconnected"] if "error" not in c else None
+        drc_note = c.get("error")
+    res = {"ok": unconnected in (0, None), "pcb": pcb, "dsn": dsn, "ses": ses,
+           "tracks": imp["tracks"], "vias": imp["vias"], "unconnected": unconnected,
+           "warnings": imp["warnings"] + ([drc_note] if drc_note else []),
+           "import_log": im.stdout.strip()[-300:],
+           "note": None if unconnected in (0, None) else
+                   f"{unconnected} net(s) left unrouted — re-run autoroute_board to converge"}
+    return res
+
+
+def _parse_ses_import(stdout: str) -> dict:
+    """Result of swig_import_ses.py: its final JSON line
+    {"ok", "tracks", "vias", "warnings"[, "error"]} when present, else the
+    legacy 'ses_import True tracks N' token line."""
+    j = _last_json(stdout)
+    if j is not None and "ok" in j:
+        return {"ok": bool(j.get("ok")), "tracks": j.get("tracks"), "vias": j.get("vias"),
+                "warnings": list(j.get("warnings", [])), "error": j.get("error")}
+    digits = [int(tok) for tok in stdout.split() if tok.isdigit()]
+    return {"ok": "True" in stdout, "tracks": digits[-1] if digits else None,
+            "vias": None, "warnings": [],
+            "error": None if "True" in stdout else stdout.strip()[-300:]}
 
 
 @mcp.tool()
@@ -1022,13 +1567,18 @@ def build_pin_sidecars(symbols: str, out_dir: str = "", symbols_dir: str = "") -
     script = TOOLS_DIR / "build_pin_sidecars.py"
     if not script.is_file():
         return {"ok": False, "reason": f"missing {script}"}
-    syms = symbols_dir or (str(_kicad_share() / "symbols") if _kicad_share() else "")
-    out = out_dir or str(Path(__file__).parent / "pins")
+    syms = _symbols_dir(symbols_dir)
+    out = out_dir or str(PINS_DIR)
     if not syms:
         return {"ok": False, "reason": "symbols_dir not given and KiCad share dir not found"}
-    args = [sys.executable, str(script), syms, out] + [s.strip() for s in symbols.split(",") if s.strip()]
-    r = _run(args)
-    return {"ok": r.returncode == 0, "out_dir": out,
+    ids = [s.strip() for s in symbols.split(",") if s.strip()]
+    if not ids:
+        raise ValueError("symbols must list at least one Library:Symbol id")
+    r = _run([sys.executable, str(script), syms, out] + ids)
+    summary = _last_json(r.stdout) or {}
+    return {"ok": r.returncode == 0 and summary.get("ok", r.returncode == 0),
+            "out_dir": out, "written": summary.get("written", []),
+            "failed": summary.get("failed", []),
             "stdout": r.stdout[-800:], "stderr": r.stderr[-800:]}
 
 
@@ -1047,7 +1597,7 @@ def design_report(netlist: str, symbols_dir: str = "", out_md: str = "") -> dict
     except Exception as e:
         return {"ok": False, "reason": f"design_report import failed: {e}"}
     design = json.loads(Path(netlist).read_text(encoding="utf-8"))
-    syms = symbols_dir or (str(_kicad_share() / "symbols") if _kicad_share() else "")
+    syms = _symbols_dir(symbols_dir) or ""
     rep = dr.analyze(design, syms)
     md = dr.to_markdown(rep)
     md_path = out_md or (str(Path(netlist).with_suffix("")) + "_report.md")
@@ -1087,10 +1637,15 @@ def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.
     autoroute_board, BEFORE export_fab_package. Runs under KiCad's bundled Python."""
     kpy = _kicad_python()
     if not kpy:
-        return {"ok": False, "reason": "KiCad bundled Python (pcbnew) not found"}
+        return {"ok": False, "reason": f"KiCad bundled Python (pcbnew) not found: {_KPY['error']}"}
     script = TOOLS_DIR / "emc_stitch.py"
     if not script.is_file():
         return {"ok": False, "reason": f"missing {script}"}
+    if not Path(pcb).is_file():
+        raise ValueError(f"PCB not found: {pcb}")
+    guard = _write_guard(pcb)
+    if guard:
+        return guard
     # TRANSACTIONAL: stitching must never make the board worse. Apply, verify
     # with DRC; on any violation/unconnected roll back and retry fence-only
     # (a dense interior grid can fragment a power plane); if even the fence
@@ -1098,58 +1653,63 @@ def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.
     bak = pcb + ".prestitch"
     shutil.copyfile(pcb, bak)
 
-    def _drc_counts() -> tuple[int, int]:  # noqa: E306
-        rpt = str(Path(pcb).with_suffix("")) + "_drc.json"
-        _run([KICAD_CLI, "pcb", "drc", pcb, "--severity-error", "-o", rpt,
-              "--format", "json"])
-        try:
-            d = json.loads(Path(rpt).read_text())
-            return (len(d.get("violations", [])),
-                    len(d.get("unconnected_items", [])))
-        except Exception:
-            return (-1, -1)
-
     # a board that isn't already G4-clean can't be judged after stitching —
     # require a clean baseline before adding anything
     if KICAD_CLI:
-        b_errs, b_unc = _drc_counts()
-        if b_errs or b_unc:
+        base = _drc_counts(pcb)
+        if "error" in base:
+            Path(bak).unlink(missing_ok=True)
+            return {"ok": False, "reason": f"baseline DRC failed: {base['error']}"}
+        if base["errors"] or base["unconnected"]:
             Path(bak).unlink(missing_ok=True)
             return {"ok": False, "reason": f"board not clean before stitching "
-                    f"({b_errs} violations, {b_unc} unconnected) — pass the G4 "
-                    f"layout gate first"}
+                    f"({base['errors']} violations, {base['unconnected']} unconnected) "
+                    f"— pass the G4 layout gate first", "types": base["types"]}
 
-    for mode in ("full", "fence"):
-        r = _run([kpy, str(script), pcb, str(max_freq_hz), mode], timeout=180)
-        res = _last_json(r.stdout) or {"ok": False}
+    # emc_stitch.py argv: <pcb> <max_freq_hz> <mode> [gnd_net] [er] [via_dia_mm] [via_drill_mm]
+    extra = [gnd_net, str(er), str(via_diameter_mm), str(via_drill_mm)]
+    res: dict = {"ok": False}
+    for mode in (("full", "fence") if interior else ("fence",)):
+        r = _run([kpy, str(script), pcb, str(max_freq_hz), mode] + extra, timeout=180)
+        res = _last_json(r.stdout) or {"ok": False, "stderr": (r.stdout + r.stderr)[-600:]}
         if not res.get("ok"):
             break
         if not KICAD_CLI:
-            res["mode"] = mode
-            return res
-        errs, unc = _drc_counts()
-        if errs == 0 and unc == 0:
-            res.update({"mode": mode, "drc_errors": 0, "unconnected": 0})
             Path(bak).unlink(missing_ok=True)
-            return res
+            return {**res, "mode": mode, "note": "kicad-cli not found: stitching NOT DRC-verified"}
+        after = _drc_counts(pcb)
+        if "error" not in after and after["errors"] == 0 and after["unconnected"] == 0:
+            Path(bak).unlink(missing_ok=True)
+            return {**res, "mode": mode, "drc_errors": 0, "unconnected": 0}
         shutil.copyfile(bak, pcb)            # roll back, try the next mode
-        res = {"ok": False, "mode": mode, "drc_errors": errs, "unconnected": unc}
+        res = {"ok": False, "mode": mode, "drc_errors": after["errors"],
+               "unconnected": after["unconnected"], "types": after["types"],
+               **({"drc_error": after["error"]} if "error" in after else {})}
     Path(bak).unlink(missing_ok=True)
-    res["reason"] = ("stitching rolled back — it violated DRC or broke plane "
-                     "connectivity even fence-only; board left unmodified")
-    return res
+    return {**res, "reason": res.get("reason") or res.get("error") or
+            "stitching rolled back — it violated DRC or broke plane connectivity "
+            "even fence-only; board left unmodified"}
 
 
 # ----------------------------------------------------------------------------
 @mcp.tool()
 def server_status() -> dict:
-    """Report what this server can do right now: KiCad CLI, bundled Python (pcbnew),
-    Java + Freerouting, IPC, fab profile. The net-map pipeline needs kicad_cli +
-    kicad_python; autoroute additionally needs java + freerouting_jar."""
+    """Report what this server can do right now: KiCad CLI, bundled Python
+    (verified to import pcbnew; kicad_python_error says why not), symbol/footprint
+    libraries, Java + Freerouting, IPC (version, open documents, capabilities),
+    fab profile. The net-map pipeline needs kicad_cli + kicad_python; autoroute
+    additionally needs java + freerouting_jar; the live PCB tools need ipc."""
+    k = _kipy_connect()
+    ipc = _public(k)
     return {"kicad_cli": bool(KICAD_CLI), "kicad_cli_path": KICAD_CLI,
-            "kicad_python": _kicad_python(), "kicad_share": str(_kicad_share() or ""),
+            "kicad_python": _kicad_python(), "kicad_python_error": _KPY["error"],
+            "kicad_share": str(_kicad_share() or ""), "symbols_dir": _symbols_dir(),
             "java": _find_java(), "freerouting_jar": _freerouting_jar(),
-            "ipc": _kipy().get("ipc_connected", False),
+            "ipc": bool(ipc.get("ipc_connected")),
+            "ipc_reason": ipc.get("reason"),
+            "kicad_version": ipc.get("kicad_version"),
+            "open_documents": ipc.get("open_documents", []),
+            "capabilities": ipc.get("capabilities", _capabilities(())),
             "fab_profile": FAB_PROFILE, "units": WORK_UNITS,
             "schematics_open": list(SCH.keys())}
 

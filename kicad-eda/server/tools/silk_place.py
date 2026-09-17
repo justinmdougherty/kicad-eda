@@ -10,7 +10,10 @@ authored label but participate as obstacles and in the edge clamp.
 
 Importable (place_refs(board)) and runnable:
     kicad-python silk_place.py <board.kicad_pcb>
+The runnable form prints the summary dict as JSON on its last stdout line:
+    {"adjacent": n, "centered": n, "clamped": n, "errors": ["<ref>: <why>", ...]}
 """
+import json
 import sys
 
 import pcbnew
@@ -29,15 +32,22 @@ def _to(v):
     return pcbnew.ToMM(v)
 
 
-def _courtyard_bbox(fp):
+def _courtyard_bbox(fp, errors):
+    """The footprint's courtyard bbox, or its body bbox when the courtyard
+    cannot be read. The fallback is a DEGRADED obstacle model (a body bbox is
+    usually smaller than the courtyard, so a neighbour's ref may land inside
+    this part's courtyard), so it is recorded in ``errors`` rather than
+    silently used. A footprint with NO courtyard outline (common for test
+    points / holes) falls back without a record — that is not a failure."""
     layer = (pcbnew.F_CrtYd if fp.GetLayer() == pcbnew.F_Cu
              else pcbnew.B_CrtYd)
     try:
         cy = fp.GetCourtyard(layer)
         if cy and cy.OutlineCount() > 0:
             return cy.BBox()
-    except Exception:
-        pass
+    except (AttributeError, RuntimeError, TypeError) as e:
+        errors.append(f"{fp.GetReference()}: courtyard unavailable "
+                      f"({type(e).__name__}: {e}); footprint bbox used")
     return fp.GetBoundingBox(False, False)
 
 
@@ -47,15 +57,20 @@ def _side(fp):
 
 def place_refs(board):
     """Re-place every reference designator for legibility. Returns a summary
-    dict {adjacent: n, centered: n, clamped: n}."""
+    dict {adjacent: n, centered: n, clamped: n, errors: [str]} — a footprint
+    whose text could not be handled is skipped and named in ``errors``."""
     edges = board.GetBoardEdgesBoundingBox()
     bx0, by0 = _to(edges.GetLeft()) + MARGIN, _to(edges.GetTop()) + MARGIN
     bx1, by1 = _to(edges.GetRight()) - MARGIN, _to(edges.GetBottom()) - MARGIN
 
+    stats = {"adjacent": 0, "centered": 0, "clamped": 0, "errors": []}
     fps = sorted(board.GetFootprints(), key=lambda f: f.GetReference())
     courtyards = {"F": [], "B": []}
+    own_bbox = {}                      # ref -> its own obstacle bbox (measured once)
     for fp in fps:
-        courtyards[_side(fp)].append(_courtyard_bbox(fp))
+        bb = _courtyard_bbox(fp, stats["errors"])
+        own_bbox[fp.GetReference()] = bb
+        courtyards[_side(fp)].append(bb)
     placed = {"F": [], "B": []}        # accepted ref-text bboxes
 
     # fixed-label parts (J/H/TP) are obstacles for the chip refs
@@ -66,10 +81,10 @@ def place_refs(board):
         if not is_chip(fp.GetReference()):
             try:
                 placed[_side(fp)].append(fp.Reference().GetBoundingBox())
-            except Exception:
-                pass
+            except Exception as e:
+                stats["errors"].append(f"{fp.GetReference()}: fixed-label bbox "
+                                       f"unavailable ({type(e).__name__}: {e})")
 
-    stats = {"adjacent": 0, "centered": 0, "clamped": 0}
     for fp in fps:
         if not is_chip(fp.GetReference()):
             continue
@@ -79,7 +94,7 @@ def place_refs(board):
             t.SetTextThickness(_mm(STROKE_MM))
             t.SetTextAngleDegrees(0)
             side = _side(fp)
-            own = _courtyard_bbox(fp)
+            own = own_bbox[fp.GetReference()]
             ccx, ccy = own.GetCenter().x, own.GetCenter().y
 
             # text half-extents at this size (measure once, in place)
@@ -113,8 +128,9 @@ def place_refs(board):
             else:
                 stats["adjacent"] += 1
             placed[side].append(t.GetBoundingBox())
-        except Exception:
-            pass
+        except Exception as e:
+            stats["errors"].append(f"{fp.GetReference()}: ref not placed "
+                                   f"({type(e).__name__}: {e})")
 
     # clamp EVERY ref (incl. connectors/holes) inside the outline
     for fp in fps:
@@ -134,18 +150,23 @@ def place_refs(board):
                 p = t.GetPosition()
                 t.SetPosition(pcbnew.VECTOR2I(p.x + _mm(dx), p.y + _mm(dy)))
                 stats["clamped"] += 1
-        except Exception:
-            pass
+        except Exception as e:
+            stats["errors"].append(f"{fp.GetReference()}: ref not clamped "
+                                   f"({type(e).__name__}: {e})")
     return stats
 
 
-def main():
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 2
     pcb = sys.argv[1]
     board = pcbnew.LoadBoard(pcb)
     stats = place_refs(board)
     pcbnew.SaveBoard(pcb, board)
-    print(stats)
+    print(json.dumps(stats))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

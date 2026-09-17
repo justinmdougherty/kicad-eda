@@ -16,7 +16,9 @@ rules).
    `<venv-python> "${CLAUDE_PLUGIN_ROOT}/pipeline/run_pipeline.py" <netlist.json> <w> <h>`
    (`<venv-python>` is the venv the server launcher built — on Windows
    `%CLAUDE_PLUGIN_DATA%/.venv/Scripts/python.exe`, else `.venv/bin/python`.
-   Routing can take many minutes on dense boards; run it in the background.)
+   Routing can take many minutes on dense boards; run it in the background.
+   Without a shell, the `netlist-pipeline` skill lists the MCP tools that run
+   the same steps one at a time, minus the auto-remediation loop.)
 4. Read the gate report. PASS -> announce the fab zip path, render top/bottom
    with `kicad-cli pcb render`, and show the user. FAIL -> the report names
    every blocker and which remediations were auto-applied; fix the

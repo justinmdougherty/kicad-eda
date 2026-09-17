@@ -17,16 +17,29 @@ the wall reads as continuous. Pass `max_freq_hz` and the pitch is derived
 Every via is placed only where it clears all non-GND copper (pads + tracks) and
 every existing hole, so the board stays DRC-clean. Vias land on GND, span all
 copper layers, and connect the planes/pours already present.
+
+Usage:
+  <kicad-python> emc_stitch.py <pcb> [max_freq_hz=0] [mode=grid|fence]
+                               [gnd_net=GND] [er=4.2] [via_dia_mm=0.6] [via_drill_mm=0.3]
+All arguments after <pcb> are positional and optional; the three-argument form
+behaves exactly as before. The last stdout line is the JSON result.
 """
 from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 
 import pcbnew
 
 C0 = 299_792_458.0  # m/s
+
+DEFAULT_GND_NET = "GND"
+DEFAULT_ER = 4.2            # FR-4 relative permittivity
+DEFAULT_VIA_DIA_MM = 0.6
+DEFAULT_VIA_DRILL_MM = 0.3
+USAGE_EXIT = 2
 
 
 def _pitch_mm(max_freq_hz: float, er: float, default: float) -> float:
@@ -87,9 +100,10 @@ def _obstacles(board, gnd_code: int):
     return circles, holes, clr
 
 
-def add_stitching(board, gnd_name="GND", via_d_mm=0.6, via_drill_mm=0.3,
-                  fence_inset_mm=0.5, max_freq_hz=0.0, er=4.2,
-                  default_pitch_mm=3.0, interior=True) -> dict:
+def add_stitching(board, gnd_name=DEFAULT_GND_NET, via_d_mm=DEFAULT_VIA_DIA_MM,
+                  via_drill_mm=DEFAULT_VIA_DRILL_MM, fence_inset_mm=0.5,
+                  max_freq_hz=0.0, er=DEFAULT_ER, default_pitch_mm=3.0,
+                  interior=True) -> dict:
     gnd_code = _gnd_netcode(board, gnd_name)
     if gnd_code is None:
         return {"ok": False, "reason": f"no '{gnd_name}' net on board"}
@@ -172,15 +186,59 @@ def add_stitching(board, gnd_name="GND", via_d_mm=0.6, via_drill_mm=0.3,
             y += pitch
 
     return {"ok": True, "gnd": gnd_name, "pitch_mm": round(pcbnew.ToMM(pitch), 2),
-            "vias_added": placed["fence"] + placed["interior"], **placed}
+            "via_dia_mm": via_d_mm, "via_drill_mm": via_drill_mm, "er": er,
+            "vias_added": placed["fence"] + placed["interior"], **placed,
+            "warnings": []}
 
 
-def main():
-    pcb = sys.argv[1]
-    max_freq = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
-    interior = (sys.argv[3].lower() != "fence") if len(sys.argv) > 3 else True
-    board = pcbnew.LoadBoard(pcb)
-    res = add_stitching(board, max_freq_hz=max_freq, interior=interior)
+def parse_args(argv: list) -> dict:
+    """<pcb> [max_freq_hz] [mode] [gnd_net] [er] [via_dia_mm] [via_drill_mm] —
+    positional, optional, validated. Raises ValueError with a clear message."""
+    if len(argv) < 2:
+        raise ValueError("usage: emc_stitch.py <pcb> [max_freq_hz] [grid|fence] "
+                         "[gnd_net] [er] [via_dia_mm] [via_drill_mm]")
+
+    def num(i, default, name):
+        if len(argv) <= i or argv[i] == "":
+            return default
+        try:
+            return float(argv[i])
+        except ValueError as e:
+            raise ValueError(f"{name} must be a number, got {argv[i]!r}") from e
+
+    if not os.path.isfile(argv[1]):
+        raise ValueError(f"board file not found: {argv[1]}")
+    args = {
+        "pcb": argv[1],
+        "max_freq_hz": num(2, 0.0, "max_freq_hz"),
+        "interior": (argv[3].lower() != "fence") if len(argv) > 3 else True,
+        "gnd_net": argv[4] if len(argv) > 4 and argv[4] else DEFAULT_GND_NET,
+        "er": num(5, DEFAULT_ER, "er"),
+        "via_d_mm": num(6, DEFAULT_VIA_DIA_MM, "via_dia_mm"),
+        "via_drill_mm": num(7, DEFAULT_VIA_DRILL_MM, "via_drill_mm"),
+    }
+    if args["er"] <= 0:
+        raise ValueError(f"er must be > 0, got {args['er']}")
+    if args["via_drill_mm"] <= 0 or args["via_d_mm"] <= args["via_drill_mm"]:
+        raise ValueError(f"need via_dia_mm > via_drill_mm > 0, got "
+                         f"{args['via_d_mm']} / {args['via_drill_mm']}")
+    return args
+
+
+def main() -> int:
+    try:
+        a = parse_args(sys.argv)
+    except ValueError as e:
+        print(json.dumps({"ok": False, "reason": str(e)}))
+        return USAGE_EXIT
+    # pcbnew.LoadBoard returns None (no exception) for an unreadable board
+    board = pcbnew.LoadBoard(a["pcb"])
+    if board is None:
+        print(json.dumps({"ok": False, "reason": f"cannot load board: {a['pcb']}"}))
+        return 1
+    res = add_stitching(board, gnd_name=a["gnd_net"], via_d_mm=a["via_d_mm"],
+                        via_drill_mm=a["via_drill_mm"], max_freq_hz=a["max_freq_hz"],
+                        er=a["er"], interior=a["interior"])
     if res.get("ok"):
         board.BuildConnectivity()
         # refill zones so every non-GND plane (e.g. an In2.Cu power pour) opens a
@@ -188,11 +246,14 @@ def main():
         # short/violate the power plane they pass through.
         try:
             pcbnew.ZONE_FILLER(board).Fill(board.Zones())
-        except Exception:
-            pass
-        pcbnew.SaveBoard(pcb, board)
+        except Exception as e:
+            res["warnings"].append(f"zone refill failed ({type(e).__name__}: {e}) "
+                                   f"— power planes may not clear the new vias; "
+                                   f"DRC will report it")
+        pcbnew.SaveBoard(a["pcb"], board)
     print(json.dumps(res))
+    return 0 if res.get("ok") else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

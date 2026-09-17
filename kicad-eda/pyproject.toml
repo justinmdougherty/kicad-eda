@@ -1,0 +1,20 @@
+# Fast unit-test tier for the pure-Python modules (no KiCad needed).
+# Run from this directory:  python -m pytest -q
+# With coverage:            python -m pytest -q --cov=server/tools --cov-report=term-missing
+#   (the data file lands in logs/, which is gitignored; COVERAGE_FILE overrides)
+# The slow board matrix (pipeline/run_all.py) is a separate CI job and is not
+# collected here (testpaths pins collection to tests/).
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["server", "server/tools", "pipeline"]
+# the suite runs in ~2 s; a .pytest_cache/ in the plugin tree buys nothing
+addopts = "-p no:cacheprovider"
+
+[tool.coverage.run]
+# logs/ is gitignored and coverage creates it when missing, so a local --cov run
+# leaves no untracked .coverage at the plugin root
+data_file = "logs/.coverage"
+
+[tool.coverage.report]
+# CLI self-test blocks are not library behaviour; do not count them as misses
+exclude_also = ['if __name__ == "__main__":']

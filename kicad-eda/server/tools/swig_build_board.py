@@ -40,6 +40,38 @@ from board_shapes import add_keepout, add_outline, add_plane  # noqa: E402
 from place_engine import (fp_extent, fp_mouth, functional_place,  # noqa: E402
                           shelf_pack)
 
+# JLCPCB-class fab floors (mm), applied to the board design settings.
+# The via drill floor is ``m_MinThroughDrill`` (KiCad >= 9); the pre-9 field
+# ``m_ViasMinDrill`` is deliberately absent so a current pcbnew applies every
+# rule with no "skipped" warning.
+FAB_RULES_MM = {"m_MinClearance": 0.15, "m_TrackMinWidth": 0.15,
+                "m_ViasMinSize": 0.45, "m_MinThroughDrill": 0.2,
+                "m_MicroViasMinSize": 0.2, "m_MicroViasMinDrill": 0.15,
+                "m_CopperEdgeClearance": 0.3}
+
+
+def apply_design_rules(board, rules_mm=FAB_RULES_MM):
+    """Set the fab floors on the board's design settings. Returns the list of
+    fields this pcbnew does not expose so the caller can report them; setattr
+    on a missing SWIG field would silently create a dead Python attribute, so
+    those are skipped, never faked. Raises RuntimeError if the settings object
+    exposes none of the fields or a set fails."""
+    ds = board.GetDesignSettings()
+    skipped = [attr for attr in rules_mm if not hasattr(ds, attr)]
+    if len(skipped) == len(rules_mm):
+        raise RuntimeError(f"design settings expose none of {sorted(rules_mm)} "
+                           f"in this pcbnew ({pcbnew.GetBuildVersion()}); "
+                           f"fab rules not applied")
+    for attr, val in rules_mm.items():
+        if attr in skipped:
+            continue
+        try:
+            setattr(ds, attr, pcbnew.FromMM(val))
+        except Exception as e:
+            raise RuntimeError(f"cannot set design rule {attr}={val} mm: "
+                               f"{type(e).__name__}: {e}") from e
+    return skipped
+
 
 def main():
     netlist_path, out_path, fp_dir = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -57,27 +89,33 @@ def main():
 
     board = pcbnew.CreateEmptyBoard()
     board.SetCopperLayerCount(4)
+    warnings = []   # non-fatal degradations, reported in the result JSON
 
     # JLCPCB-class design rules (so default-rule DRC reflects the real fab).
-    try:
-        ds = board.GetDesignSettings()
-        rules_mm = {"m_MinClearance": 0.15, "m_TrackMinWidth": 0.15,
-                    "m_ViasMinSize": 0.45, "m_ViasMinDrill": 0.2,
-                    "m_MinThroughDrill": 0.2, "m_MicroViasMinSize": 0.2,
-                    "m_MicroViasMinDrill": 0.15, "m_CopperEdgeClearance": 0.3}
-        for attr, val in rules_mm.items():
-            if hasattr(ds, attr):
-                setattr(ds, attr, pcbnew.FromMM(val))
-    except Exception:
-        pass
+    # A rule that silently fails to apply means every later DRC runs against
+    # the wrong fab floors, so a failed set is a hard error and a field this
+    # pcbnew version lacks is reported, not hidden.
+    skipped_rules = apply_design_rules(board)
+    if skipped_rules:
+        warnings.append(f"design rules not exposed by pcbnew "
+                        f"{pcbnew.GetBuildVersion()} and skipped: "
+                        f"{', '.join(skipped_rules)}")
 
+    # The board is centred on an A4 sheet. CreateEmptyBoard() already defaults
+    # the page to A4 (verified: the saved file carries ``(paper "A4")`` under
+    # pcbnew 9.0.4, whose GetPageSettings() is an opaque SWIG object with no
+    # PAGE_INFO API at all). The explicit set is only attempted where a real
+    # SetType exists, so a version that genuinely fails to apply it is
+    # reported and one that simply has no API is not.
     SHEET_W, SHEET_H = 297.0, 210.0
-    try:
-        ps = board.GetPageSettings()
-        ps.SetType("A4")
-        board.SetPageSettings(ps)
-    except Exception:
-        pass
+    ps = board.GetPageSettings()
+    if hasattr(ps, "SetType"):
+        try:
+            ps.SetType("A4")
+            board.SetPageSettings(ps)
+        except Exception as e:
+            warnings.append(f"page settings not applied ({type(e).__name__}: "
+                            f"{e}); sheet stays at the pcbnew default")
 
     # --- load + measure every footprint (at the origin) ---
     placed, missing_pads = {}, []
@@ -392,28 +430,31 @@ def main():
     # clamped inside Edge.Cuts. Shared with the post-route fixer.
     try:
         import silk_place
-        silk_place.place_refs(board)
-    except Exception:
+        silk = silk_place.place_refs(board)
+        warnings += [f"silkscreen: {e}" for e in silk.get("errors", [])]
+    except Exception as e:
         traceback.print_exc()
+        warnings.append(f"silkscreen ref placement failed ({type(e).__name__}: "
+                        f"{e}); refs left at their footprint defaults")
 
     # connectivity rebuild + save
     try:
         board.BuildConnectivity()
-    except Exception:
-        pass
+    except Exception as e:
+        warnings.append(f"BuildConnectivity failed before save "
+                        f"({type(e).__name__}: {e}); ratsnest rebuilt on load")
     pcbnew.SaveBoard(out_path, board)
 
     # Fill zones on a FRESHLY LOADED board — the in-memory board built from
     # CreateEmptyBoard lacks the connectivity the headless ZONE_FILLER needs and
-    # segfaults; a reloaded board fills cleanly.
+    # segfaults; a reloaded board fills cleanly. An unfilled plane is a board
+    # with no ground/power copper, so a fill failure is fatal (the __main__
+    # wrapper reports it as ok=false with the trace).
     if zones_added:
-        try:
-            b2 = pcbnew.LoadBoard(out_path)
-            b2.BuildConnectivity()
-            pcbnew.ZONE_FILLER(b2).Fill(b2.Zones())
-            pcbnew.SaveBoard(out_path, b2)
-        except Exception:
-            pass
+        b2 = pcbnew.LoadBoard(out_path)
+        b2.BuildConnectivity()
+        pcbnew.ZONE_FILLER(b2).Fill(b2.Zones())
+        pcbnew.SaveBoard(out_path, b2)
 
     print(json.dumps({
         "ok": not missing_pads,
@@ -426,6 +467,7 @@ def main():
         "antenna_keepout": keepout_added,
         "mounting_holes": holes_added,
         "board_mm": [board_w, board_h],
+        "warnings": warnings,
     }))
 
 

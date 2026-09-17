@@ -15,10 +15,13 @@
 const { spawnSync, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { ROOT, VENV_PY, WIN } = require('./venv');
 
-const ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(__dirname, '..');
-const WIN = process.platform === 'win32';
 const mode = process.argv[2] || '';
+const IPC_PROBE_TIMEOUT_MS = 8000;
+const IPC_PROBE = 'from kipy import KiCad; k=KiCad(); print(k.get_version())';
+const ENABLE_API_HINT = 'Preferences > Plugins and Content Manager > Enable KiCad API '
+  + '(KiCad 9: Preferences > API)';
 
 function tryRun(cmd, args) {
   const r = spawnSync(cmd, args, { encoding: 'utf8' });
@@ -77,6 +80,55 @@ function findJava() {
   return cands.some((c) => fs.existsSync(c));
 }
 
+/**
+ * Is a KiCad GUI process alive? true / false, or null when the probe itself
+ * failed (unknown).
+ */
+function kicadProcessRunning() {
+  try {
+    if (WIN) {
+      const out = execSync('tasklist /FI "IMAGENAME eq kicad.exe" /FO CSV /NH', { encoding: 'utf8' })
+        + execSync('tasklist /FI "IMAGENAME eq pcbnew.exe" /FO CSV /NH', { encoding: 'utf8' });
+      return /"(kicad|pcbnew)\.exe"/i.test(out);
+    }
+    // Process NAMES only (`comm`: bare name on Linux, full path on macOS) —
+    // matching whole `ps ax` lines would hit this very hook, whose command
+    // line contains the plugin dir ".../kicad-eda/".
+    const out = execSync('ps -eo comm=', { encoding: 'utf8' });
+    return /(^|\/)(kicad|pcbnew|eeschema)\s*$/im.test(out);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ask KiCad's IPC API for its version through the server venv (where kipy
+ * lives). Returns 'ok', 'no-kipy' (module missing -> caller falls back to the
+ * process check), 'unreachable' (KiCad answered nothing), or 'unknown' (the
+ * probe itself could not run / timed out — never block on that).
+ */
+function probeIpc() {
+  if (!fs.existsSync(VENV_PY)) return 'no-kipy';
+  const r = spawnSync(VENV_PY, ['-c', IPC_PROBE],
+                      { encoding: 'utf8', timeout: IPC_PROBE_TIMEOUT_MS });
+  if (r.error) return 'unknown';
+  if (r.status === 0) return 'ok';
+  if (/ModuleNotFoundError/.test(r.stderr || '')) return 'no-kipy';
+  return 'unreachable';
+}
+
+function blockMessage(running) {
+  const why = running === false
+    ? 'KiCad is not running.'
+    : running === true
+      ? `KiCad is running but its API server is not enabled (${ENABLE_API_HINT}).`
+      : `KiCad's API server did not answer (is KiCad running with ${ENABLE_API_HINT}?).`;
+  return 'BLOCKED: this tool needs KiCad\'s IPC API. ' + why
+    + ' Open the board in KiCad with the API enabled and retry — or use the '
+    + 'headless tools (create_pcb, build_board_from_netlist, autoroute_board, '
+    + 'drc_pcb, export_fab_package), which do not need the GUI.\n';
+}
+
 if (mode === 'session-start') {
   const cli = findKicadCli();
   const kicad = cli ? (tryRun(cli, ['version']) || 'found') : null;
@@ -88,28 +140,27 @@ if (mode === 'session-start') {
   lines.push(java
     ? 'kicad-eda: Java present (Freerouting autorouter available).'
     : 'kicad-eda: Java not found — run /kicad-eda:setup to enable autorouting.');
+  lines.push(fs.existsSync(VENV_PY)
+    ? 'kicad-eda: server venv present.'
+    : 'kicad-eda: server venv not created yet (it is built on first MCP server start).');
   process.stdout.write(lines.join('\n') + '\n');
   process.exit(0);
 }
 
 if (mode === 'check-ipc') {
-  // The IPC-API tool family needs a running KiCad GUI. The headless pipeline
-  // (build_board_from_netlist / autoroute_board / export_fab_package) does
-  // NOT go through here. Best-effort process probe; unknown = allow.
-  let running = false;
-  try {
-    const out = WIN
-      ? execSync('tasklist /FI "IMAGENAME eq kicad.exe" /FO CSV /NH', { encoding: 'utf8' })
-        + execSync('tasklist /FI "IMAGENAME eq pcbnew.exe" /FO CSV /NH', { encoding: 'utf8' })
-      : execSync('ps ax', { encoding: 'utf8' });
-    running = /kicad|pcbnew/i.test(out);
-  } catch { process.exit(0); }
-  if (running) process.exit(0);
-  process.stderr.write(
-    'BLOCKED: this tool talks to KiCad\'s IPC API, but KiCad does not appear '
-    + 'to be running. Open the board in KiCad with Preferences > API enabled '
-    + 'and retry — or use the headless tools (build_board_from_netlist, '
-    + 'autoroute_board, export_fab_package), which do not need the GUI.\n');
+  // The IPC-API tool family needs a running KiCad GUI with the API server
+  // enabled. The headless pipeline (create_pcb / build_board_from_netlist /
+  // autoroute_board / drc_pcb / export_fab_package) does NOT go through here.
+  // Probe the API socket through the venv first; fall back to a process scan
+  // when kipy is absent. Unknown = allow.
+  const ipc = probeIpc();
+  if (ipc === 'ok' || ipc === 'unknown') process.exit(0);
+  const running = kicadProcessRunning();
+  if (ipc === 'no-kipy') {
+    // cannot ask the API; the process check is the best we have
+    if (running === true || running === null) process.exit(0);
+  }
+  process.stderr.write(blockMessage(running));
   process.exit(2);
 }
 
@@ -119,8 +170,8 @@ if (mode === 'validate-schematic') {
   let input = '';
   try { input = fs.readFileSync(0, 'utf8'); } catch { process.exit(0); }
   const cands = WIN
-    ? [['py', ['-3']], ['python', []], ['python3', []]]
-    : [['python3', []], ['python', []]];
+    ? [[VENV_PY, []], ['py', ['-3']], ['python', []], ['python3', []]]
+    : [[VENV_PY, []], ['python3', []], ['python', []]];
   for (const [cmd, args] of cands) {
     const probe = spawnSync(cmd, [...args, '--version'], { stdio: 'ignore' });
     if (probe.status !== 0) continue;

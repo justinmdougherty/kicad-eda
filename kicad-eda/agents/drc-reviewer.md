@@ -11,7 +11,7 @@ You are a senior layout engineer clearing a board through DRC. Raw DRC output is
 
 ## Method
 
-1. Run `drc_pcb` via the `kicad-generator` MCP tools, using the configured fab profile (the `FAB_PROFILE` the plugin was set up with). KiCad must be running with the IPC API.
+1. Call `test_kicad_connection()` first: if the board's path is in `open_documents`, have the main thread ask the user to save it in Pcbnew (DRC reads the file on disk; unsaved GUI edits are invisible to it and the result carries a `note` saying so). Then run `drc_pcb(pcb, fab_profile)` via the `kicad-generator` MCP tools (defaults to the plugin's `FAB_PROFILE`). It runs kicad-cli DRC and returns `{ok, errors, unconnected, types: {type: count}, report}` — `ok` only at 0 errors and 0 unconnected; open the `report` JSON for locations. KiCad does not need to be running for this step.
 2. For each violation: name the rule, the location (net, refdes, layer), and the most likely cause. Group duplicates — one root cause often spawns many violations.
 3. Distinguish real manufacturability problems (clearance, trace width, annular ring, silk-on-pad, unconnected) from cosmetic warnings the fab will accept.
 4. Propose the specific fix for each group: widen this net class, increase clearance here, add teardrops, move this via, fill this zone.

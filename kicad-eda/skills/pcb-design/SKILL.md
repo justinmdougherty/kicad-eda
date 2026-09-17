@@ -1,6 +1,6 @@
 ---
 name: pcb-design
-description: End-to-end PCB design in KiCad 9 from concept through schematic creation, ERC, design review, PCB layout, placement, routing, DRC, and Gerber export. Use whenever the user wants to design, lay out, route, or fabricate a printed circuit board, or mentions KiCad, schematics, footprints, Gerbers, or a board respin.
+description: End-to-end PCB design in KiCad (9/10 today; 11 nightly for the API path) from concept through schematic creation, ERC, design review, PCB layout, placement, routing, DRC, and Gerber export. Use whenever the user wants to design, lay out, route, or fabricate a printed circuit board, or mentions KiCad, schematics, footprints, Gerbers, or a board respin.
 ---
 
 # KiCad PCB Design — Concept to Fabrication
@@ -19,7 +19,25 @@ You are the lead. At each gate, hand the review to the matching subagent and act
 - **Stage 9 (DRC):** delegate to the `drc-reviewer` subagent.
 - **Stage 10 (Fab):** delegate to the `fab-checker` subagent.
 
-The PCB stages require KiCad 9 running with the IPC API enabled; a plugin hook blocks PCB tool calls when it is not. A second hook validates schematic files after each write. The fab profile and KiCad path come from the plugin's userConfig.
+The live PCB stages (6–10) require KiCad (9/10 today; 11 nightly for the API path) running with the IPC API enabled; the IPC tools return `ipc_connected: false` when it is not, and a plugin hook blocks them when the KiCad API is unreachable (it probes the API through the server venv; a kicad/pcbnew process scan is only the fallback when kipy is missing). A second hook validates schematic files after each write. The fab profile and KiCad path come from the plugin's userConfig.
+
+## The kicad-generator tool surface (call these by name — nothing else exists)
+
+| Stage | Tool | Notes |
+|---|---|---|
+| 3 | `create_schematic(path, paper="A4")` → `add_components_batch(sch, components=[{ref, lib_id, value, x, y, rot?, footprint?}])` | new in-memory schematic for that `.kicad_sch` path, then ONE batch call: a real list of dicts, key is `ref`; prefer over `add_component` |
+| 3 | `wire_by_ref(sch, ref_a, pin_a, ref_b, pin_b)` / `label_pin(sch, ref, pin, net_name)` / `power_pin(sch, ref, pin, net_name)` | pin coordinates are resolved from the KiCad symbol (by pin number or name) and rotated by the symbol's `rot`; a sidecar in `server/pins/<Lib_Symbol>.pins.json` overrides. On a ValueError fix the pin id or `lib_id` named in the message — `build_pin_sidecars` is optional (an id check / override), not a prerequisite |
+| 3 | `add_wire(sch, x1, y1, x2, y2)` / `add_label(sch, net, x, y, rot=0)` / `add_power_port(sch, net, x, y)` | explicit-coordinate fallbacks |
+| 3–4 | `save_schematic(sch)` → `run_erc(sch)` → `render_sch(sch)` | write (embeds symbols), check, look. `list_symbols(sch)` / `list_nets(sch)` inspect the model |
+| 6 | `create_pcb(pcb, sch="", overwrite=False)` | creates an empty `.kicad_pcb` headlessly (KiCad's bundled Python); if THIS file is already open in Pcbnew it reports the live board instead of creating anything |
+| 6–9 | `test_kicad_connection()` | MANDATORY gate: `ipc_connected`, `kicad_version`, `open_documents[{type, path}]`, `capabilities{schematic_api, place_footprint_from_library, import_netlist}` |
+| 7 | `add_footprints_batch(footprints=[{ref, x, y, rot?}])` / `move_footprint(ref, x, y, rot)` / `add_footprint_to_pcb(ref, lib_id, x, y, rot)`; `validate_placement()` / `get_pcb_summary()` / `get_footprint_pads(ref)` / `remove_footprint(ref)` | position footprints ALREADY on the board (F8 puts them there); `add_footprint_to_pcb` only moves an existing one on KiCad 9/10; `validate_placement` takes no arguments |
+| 8 | `autoroute_board(pcb, max_passes=100, jar="", route_timeout=300)` / `add_ground_stitching(pcb, gnd_net, max_freq_hz, er, interior, via_diameter_mm, via_drill_mm)` | headless Freerouting, then a DRC-safe GND via fence; the board file must be CLOSED in the editor |
+| 8 | `add_trace(net_name, layer, x1, y1, x2, y2, width)` / `add_via(net_name, x, y, drill, diameter)` / `add_copper_zone(net_name, layer, polygon)` / `register_net(net_name)` | targeted manual copper over IPC |
+| 9 | `drc_pcb(pcb, fab_profile="")` | real kicad-cli DRC: `{ok, errors, unconnected, types, report, profile, note?}` |
+| 10 | `export_gerbers(pcb, out_dir)` / `export_fab_package(pcb, out_dir, zip_name, netlist)` / `render_pcb(pcb, side)`; `server_status()` | kicad-cli on the SAVED file; `server_status` reports kicad-cli, bundled Python, Java/Freerouting, IPC, open documents, capabilities |
+
+**Hard rule — files open in a KiCad editor.** The server refuses to write a schematic or board that is currently open in Eeschema/Pcbnew: `save_schematic`, `build_schematic_from_netlist`, `build_board_from_netlist`, `autoroute_board` and `add_ground_stitching` return `ok: false` with the reason. Before any of them, check `test_kicad_connection().open_documents`; if the file is listed, ask the user to close it (saving first if they changed anything) and reopen it after the write. Never open a file in KiCad — or let the user keep it open — while you still intend to write it. Read-only tools (`drc_pcb`, `render_*`, `export_*`) work on the saved file at any time, but unsaved GUI edits are not reflected in them.
 
 ---
 
@@ -160,11 +178,11 @@ Architecture documented. All key ICs selected with part numbers. Passive values 
 
 ## STAGE 3: SCHEMATIC CREATION
 
-### Using the KiCad GUI (Eeschema)
+### How the Schematic Gets Made
 
-Open the schematic file in KiCad Schematic Editor.
+You build it with the MCP schematic tools (see "Creating and Persisting the Schematic" below) — never by hand-writing S-expressions, and never while the file is open in Eeschema. The shortcuts below are for the user, if they choose to touch up the file after your last `save_schematic`.
 
-**Essential Keyboard Shortcuts:**
+**Essential Keyboard Shortcuts (user, in Eeschema):**
 
 | Action | Shortcut |
 |--------|----------|
@@ -442,9 +460,8 @@ Block: SENSOR (x: 270–350)
 **Rules:**
 
 - Log component ref, part, center position, rotation, block name, and pin NAMES — not pin coordinates
-- For MCP/programmatic tools: use the **ref-based tools** — `wire_by_ref`, `label_pin`, `power_pin` — which accept component ref + pin name and resolve coordinates automatically from the pin sidecar. You NEVER need to read `.pins.json` files or compute rotation transforms.
-- To inspect pin positions, call `get_pin_positions` with an optional component ref — it returns all pin names, types, and absolute x/y coordinates.
-- For GUI workflow: use KiCad's built-in tool to query pin positions — after placing all components, use **Inspect > Net Inspector** or click on a component and press **E** to see pin locations. Do NOT manually compute rotation transforms.
+- Use the **ref-based tools** — `wire_by_ref`, `label_pin`, `power_pin` — which accept component ref + pin name (or number) and resolve the absolute coordinate for you. Never compute rotation transforms by hand.
+- Pin coordinates are derived from the KiCad symbol itself (keyed by pin number AND pin name) and rotated by the symbol's placed `rot`, so any rotation is fine. A sidecar in `server/pins/<Lib_Symbol>.pins.json`, when one exists, overrides the symbol-derived offsets. If `wire_by_ref` / `label_pin` / `power_pin` raise a ValueError, read it: "has no pin 'X'" means use the pin number or name as printed in the KiCad symbol; "symbol ... not found" means the `lib_id` is wrong; "coordinates ... unknown" means the KiCad symbol libraries were not found (install KiCad or set `KICAD_PATH`, or use the explicit-coordinate tools). `build_pin_sidecars("Lib:Symbol")` is optional — a symbol-id check that also writes an override sidecar — and it fails in the same no-libraries case, so it is not a fix for that.
 
 ### Step A: Build the Net Map (MANDATORY — Do Before Any Wiring)
 
@@ -584,7 +601,7 @@ Wire section by section, completing ALL connections in each section before movin
 
 3. **MCU signal pins — one net at a time**: Go through the Net Connection List net by net. For each net:
    - Wire or label EVERY endpoint listed for that net before moving to the next net
-   - For MCP tools: call `label_pin(sch, ref, pin, net_name)` — the tool resolves coordinates from the pin sidecar
+   - For MCP tools: call `label_pin(sch, ref, pin, net_name)` — the tool resolves coordinates from the KiCad symbol (a sidecar overrides)
    - To wire two pins directly: call `wire_by_ref(sch, ref1, pin1, ref2, pin2)` — no coordinate lookup needed
    - For GUI: navigate to each pin, draw a short wire stub (W key), place a net label (L key)
    - If two pins are in the same block and < 30mm apart, use a direct wire instead of labels
@@ -595,26 +612,26 @@ Wire section by section, completing ALL connections in each section before movin
 5. **Expansion/debug connectors**: Wire each connector pin to its assigned net label or to the MCU pin per the signal assignment table.
 
 6. **Unused pins — EVERY one**: For every pin not in the signal assignment table:
-   - Unused MCU GPIOs → wire to expansion header OR add no-connect flag (Q key)
-   - Unused IC pins → add no-connect flag (Q key)
-   - **Zero floating pins allowed**
+   - Unused MCU GPIOs → wire to an expansion header where the design allows it
+   - Everything else → list it explicitly as **unused (needs NC flag)** in the Component Placement Log. The MCP wiring tools place no no-connect flags: the user adds them in Eeschema (Q key) after your LAST `save_schematic`, then you re-run `run_erc`; or use the netlist path (`build_schematic_from_netlist` adds them itself)
+   - **Zero unaccounted pins allowed** — every unused pin is either wired to a header or on the NC list
 
 ### Step C: Wiring Verification (MANDATORY — Do After All Wiring)
 
 After completing all wiring, perform this verification:
 
-1. **Visual scan every IC**: Click on each IC in the schematic. Look at EVERY pin. Each pin must have either:
+1. **Visual scan every IC**: `save_schematic(sch)`, `render_sch(sch)`, and look at each IC. Look at EVERY pin. Each pin must have either:
    - A wire connecting it to something
    - A net label attached via a wire stub
    - A power symbol (GND, +3V3, etc.)
-   - A no-connect flag (X symbol)
+   - A no-connect flag (X symbol) — or it is on your NC list for the user to flag after the last save
    - If ANY pin has none of these → it's unwired. Fix it now.
 
 2. **Net label matching**: For every net label in the schematic, there must be at LEAST two instances of that label (one source, one destination). A net label that appears only once is a dead-end — the signal goes nowhere.
 
 3. **Count check**: The number of unique net names in your signal assignment table should match the number of unique net labels in the schematic. If they don't match, something is missing.
 
-4. **Click on a net label** and verify the highlight shows connectivity to the expected pins.
+4. **`list_nets(sch)`** must return exactly the nets in your table — a net that is absent was never labelled; an extra one is a misspelling.
 
 ### Wiring Rules — Complete Reference
 
@@ -694,29 +711,26 @@ After completing all wiring, perform this verification:
 | Decoupling cap across the sheet from its IC | Looks wrong on schematic AND PCB | Move cap next to its IC |
 | Daisy-chain power wire | Creates long noisy power trace on PCB | Use individual power symbols at each IC |
 
-### Batch Placement (MCP Tools)
+### Creating and Persisting the Schematic (MCP Tools)
 
-When using MCP tools to place many components, prefer `add_components_batch` over repeated `add_component` calls. The batch tool reads the file once, builds all symbol blocks in memory, and writes once — eliminating the read-modify-write corruption that occurs with 17+ sequential calls.
+The schematic lives in the server's memory until you save it. The sequence is always:
 
 ```
-# Example: place all components in one call
-add_components_batch(sch_path, json.dumps([
-    {"lib_id": "Device:R", "reference": "R1", "value": "5.1k", "x": 48, "y": 165, "footprint": "Resistor_SMD:R_0402_1005Metric"},
-    {"lib_id": "Device:R", "reference": "R2", "value": "5.1k", "x": 55, "y": 165, "footprint": "Resistor_SMD:R_0402_1005Metric"},
-    # ... all components
-]))
+create_schematic(path)                 # registers an empty model for that .kicad_sch path
+add_components_batch(sch, components=[ # ONE call, a real list of dicts — the key is "ref"
+    {"ref": "R1", "lib_id": "Device:R", "value": "5.1k", "x": 48, "y": 165, "footprint": "Resistor_SMD:R_0402_1005Metric"},
+    {"ref": "R2", "lib_id": "Device:R", "value": "5.1k", "x": 55, "y": 165, "rot": 0, "footprint": "Resistor_SMD:R_0402_1005Metric"},
+])
+wire_by_ref / label_pin / power_pin    # or add_wire / add_label / add_power_port with explicit coordinates
+save_schematic(sch)                    # writes the .kicad_sch (embeds the symbols); the PostToolUse hook validates it
+run_erc(sch)                           # kicad-cli ERC on the saved file
+render_sch(sch)                        # SVG for inspection
 ```
 
-After batch placement, call `populate_lib_symbols` once, then wire using `label_pin`, `power_pin`, and `wire_by_ref`.
+### Verification After Schematic Creation
 
-### GUI Verification After Schematic Creation
-
-After completing wiring via MCP tools:
-1. Open the schematic in Eeschema
-2. Visually verify component placement and label readability
-3. Fix any overlapping labels or misplaced components using drag (M key)
-4. Run ERC: Inspect > Electrical Rules Checker
-5. Save (Ctrl+S) — KiCad's save NEVER corrupts files
+1. `render_sch(sch)` and inspect the image: placement, label readability, no overlaps. Fix problems with the tools and `save_schematic` again — never hand-edit the file.
+2. If the user wants to touch it up in Eeschema, that happens AFTER your last `save_schematic`. Once it is open there you must not write it again (`save_schematic` refuses while the path is in `test_kicad_connection().open_documents`); ask the user to close it before any further MCP write, and let their Eeschema save win.
 
 ### Standard Library References
 
@@ -734,7 +748,7 @@ USB-C:        Connector_USB:USB_C_Receptacle_USB2.0
 
 ### Assigning Footprints
 
-Double-click each component or press E to open properties. Set the Footprint field:
+Set `footprint` on every component in `add_components_batch` (the user can also edit it in Eeschema with E). Standard choices:
 
 ```
 0402 Resistor:  Resistor_SMD:R_0402_1005Metric
@@ -768,9 +782,9 @@ ALL of the following must be true before advancing:
 6. Every IC ground pin wired to GND
 7. Every signal in the Net Connection List has matching net labels at BOTH endpoints (or a direct wire)
 8. Every endpoint in the Net Connection List is marked DONE
-9. Every unused pin has a no-connect flag
+9. Every unused pin is either wired to a header or on the NC list handed to the user (they add the flags in Eeschema after your last `save_schematic`; the netlist path adds them itself) — a listed-and-acknowledged unused pin passes
 10. Zero floating pins on any IC
-11. Save the schematic (Ctrl+S)
+11. `save_schematic(sch)` returned ok (the PostToolUse hook validated the file)
 
 ---
 
@@ -786,16 +800,16 @@ ERC will flag every unconnected pin. If you see dozens of "Pin not connected" er
 
 **Before running ERC, do a manual pre-check:**
 
-1. Open the schematic and select each IC one at a time
+1. `list_nets(sch)` — every net in your Net Connection List must appear; `render_sch(sch)` and look at each IC
 2. Count the pins with connections vs. the total pin count
 3. If an IC has many unconnected pins that should be wired (per the signal assignment table), fix the wiring FIRST
 4. Only then run ERC
 
 ### Running ERC
 
-1. Save the schematic (Ctrl+S)
-2. Run: Inspect > Electrical Rules Checker > Run ERC
-3. Or use `finalize_schematic` which includes ERC validation
+1. `save_schematic(sch)` — ERC runs on the file on disk, never on the in-memory model
+2. `run_erc(sch)` — kicad-cli ERC; the JSON report comes back in `report`
+3. Delegate to the `erc-reviewer` subagent (it re-runs `run_erc` itself and audits beyond it)
 
 ### Interpreting ERC Results
 
@@ -803,7 +817,7 @@ ERC will flag every unconnected pin. If you see dozens of "Pin not connected" er
 
 | Error | Meaning | Fix |
 |-------|---------|-----|
-| Pin unconnected | A pin has no wire, label, or no-connect flag | Wire it or add no-connect (Q key) |
+| Pin unconnected | A pin has no wire, label, or no-connect flag | Wire it — or, if genuinely unused, the user adds a no-connect in Eeschema (Q key) after the last save; the MCP tools cannot |
 | Power pin not driven | A VCC/GND pin has no power source | Add appropriate power symbol |
 | Conflicting pin types | Output driving another output | Check your connections — two outputs on the same net |
 | Missing power flag | A power net exists but has no power symbol | Add the missing power symbol |
@@ -818,13 +832,13 @@ ERC will flag every unconnected pin. If you see dozens of "Pin not connected" er
 
 ### Common ERC Pitfalls
 
-- **No-connect on pins that should be connected**: `finalize_schematic` may auto-add no-connects to pins it can't find wires for. If your wiring missed a pin due to coordinate errors, the pin gets a no-connect instead of flagging as unconnected. Always review the no-connect list against your design intent.
+- **No-connect on pins that should be connected**: the headless `build_schematic_from_netlist` auto-adds a no_connect flag to every pin absent from the netlist. If the netlist missed a pin, it gets a no-connect instead of an ERC error. Always review the no-connect list against design intent. (The MCP wiring tools place no no-connect flags; unused pins surface in ERC as "pin not connected" — either the user adds NC flags in Eeschema after your last save, or use the netlist path.)
 - **Power flags**: Some KiCad symbols need a `PWR_FLAG` to tell the ERC that a net is intentionally powered. USB VBUS and battery nets often need this.
 - **Multi-unit symbols**: Some symbols (like op-amps) have multiple units — each unit's power pins must be connected even if only one unit is placed.
 
 ### Stage 4 Gate
 
-Zero ERC errors. All warnings evaluated and either fixed or documented as intentional. Every no-connect flag verified as intentional (not masking a missing connection). Save the schematic.
+Zero ERC errors. All warnings evaluated and either fixed or documented as intentional. Every no-connect flag verified as intentional (not masking a missing connection). The file on disk is current (`save_schematic` after any fix, then re-run `run_erc`).
 
 ---
 
@@ -928,10 +942,9 @@ If `render_pcb` shows missing components or corruption, STOP and restore from ch
 ### Cowork Rendering Limitations
 
 When using the Cowork environment (browser-based):
-- `render_pcb` and `render_sch` produce PNG images that are displayed inline.
+- `render_pcb` produces a PNG, `render_sch` an SVG (`kicad-cli sch export svg`; see `output_dir` in the result); both display inline where the client supports the format.
 - The rendering is a snapshot — it does NOT update live as you edit.
 - Large PCBs (>200 components) may render slowly or timeout.
-- If rendering fails, use `validate_kicad_file` as a structural integrity check instead.
 - The rendered image may not show all layers — check the actual .kicad_pcb in KiCad for full layer visibility.
 
 ---
@@ -940,50 +953,34 @@ When using the Cowork environment (browser-based):
 
 ### KiCad IPC API Requirement (Stages 6–10)
 
-> **MANDATORY FIRST STEP:** Before calling ANY PCB tool (except `create_pcb`), you MUST call `test_kicad_connection()`. This tool pings the running KiCad instance and confirms the IPC API is live. If it returns `"ipc_connected": true`, proceed — all PCB tools will use the IPC API automatically. If it returns `"ipc_connected": false`, STOP and tell the user to open KiCad 9 with their PCB file before continuing. **Do NOT proceed with PCB tools when the IPC API is not connected.**
+> **MANDATORY FIRST STEP:** Before calling ANY IPC tool, call `test_kicad_connection()`. It returns `ipc_connected`, `kicad_version`, `open_documents` (`[{type: "pcb"|"schematic"|"project"|"other", path}]`) and `capabilities` (`schematic_api`, `place_footprint_from_library`, `import_netlist` — true only on KiCad 11+; a nightly reports 10.99). If `ipc_connected` is false, STOP and tell the user to open the board in Pcbnew with **Preferences > API > Enable KiCad API server** turned on. The IPC tools (`add_footprint_to_pcb`, `add_footprints_batch`, `move_footprint`, `remove_footprint`, `get_pcb_summary`, `validate_placement`, `get_footprint_pads`, `register_net`, `add_trace`, `add_via`, `add_copper_zone`) return `ipc_connected: false` otherwise — there is no other path for live board edits.
 
-**KiCad 9 must be running with the IPC API server enabled** for all PCB tools from this stage onward. The MCP PCB tools (`add_footprint_to_pcb`, `add_footprints_batch`, `add_trace`, `add_via`, `add_copper_zone`, `move_footprint`, `remove_footprint`, `get_pcb_summary`, `validate_placement`, `get_footprint_pads`, `register_net`) communicate with KiCad via the IPC API (protocol buffers over a local socket). This eliminates file corruption bugs that occurred with direct file manipulation.
+**Tools that do NOT need KiCad running:** `create_pcb` (KiCad's bundled Python), `drc_pcb`, `render_pcb`, `export_gerbers`, `export_fab_package` (kicad-cli on the saved file), and the headless `autoroute_board` / `add_ground_stitching` — which REQUIRE the board to be closed in the editor (hard rule above). All schematic tools also work without KiCad running.
 
-**Setup:** Open KiCad 9 and ensure the API server is running (enabled by default in KiCad 9). The PCB file must be open in the PCB editor (Pcbnew) before calling any PCB tool.
-
-**The IPC API is the ONLY supported path for PCB manipulation.** The text-based fallback exists for backward compatibility but is unreliable for boards with >30 footprints. When the IPC API is connected, tools MUST use it — never fall back to text-based file manipulation while KiCad is running.
-
-**Tools that do NOT require a running KiCad instance:** `create_pcb` (creates the initial file), `render_pcb` (uses kicad-cli), `export_gerbers` (uses kicad-cli), `drc_pcb` (uses kicad-cli), `route_pcb` (uses kicad-tools autorouter). All schematic tools also work without KiCad running.
-
-**Typical PCB session workflow:**
+**Typical PCB session workflow (KiCad 9/10):**
 ```
-1. create_pcb(...)                    ← creates the .kicad_pcb file
-2. User opens the PCB in KiCad 9
-3. test_kicad_connection()            ← MANDATORY: confirms IPC API is live
-4. add_footprints_batch(...)          ← places components via IPC API
-5. add_trace(...), add_via(...)       ← routing via IPC API
-6. ... all further PCB tools ...
+1. create_pcb(pcb="<project>.kicad_pcb", sch="<project>.kicad_sch")   ← empty board file, no KiCad needed
+2. User opens it in Pcbnew (API enabled), Tools > Update PCB from Schematic (F8)
+3. test_kicad_connection()            ← MANDATORY: ipc_connected true, the board listed in open_documents
+4. add_footprints_batch([...])        ← positions the footprints F8 imported (IPC, live in the editor)
+5. validate_placement()               ← then the placement-reviewer gate; user saves (Ctrl+S) in Pcbnew
+6. Routing: user closes the board → autoroute_board(pcb) → reopens; or routes in the interactive router
+7. drc_pcb(pcb) → export_fab_package(pcb) / export_gerbers(pcb)      ← on the SAVED file
 ```
 
 ### What You Do
 
 Create the PCB file, define the board outline, configure the layer stackup, set design rules, and establish net classes. This is the foundation for placement and routing — errors here propagate into every trace.
 
-### Step 0: Verify KiCad IPC API Connection (MANDATORY — DO FIRST)
+### Step 1: Create the PCB and Import the Netlist
 
-**Before `create_pcb` or any other PCB tool, call `test_kicad_connection()`.**
-
-- If the response shows `"ipc_connected": true` → proceed with PCB design. All tools will use the IPC API.
-- If the response shows `"ipc_connected": false` → **STOP. Do NOT proceed.** Tell the user: *"Please open KiCad 9 and enable the API server (Preferences > API > Enable KiCad API) before I can continue with PCB layout."* Do NOT fall back to text-based manipulation.
-
-This check is non-negotiable. Skipping it risks silent fallback to the unreliable text-based path, which corrupts boards with >30 footprints.
-
-### Step 1: Create the PCB from Schematic
-
-1. In KiCad, open the PCB editor (Pcbnew)
-2. Tools > Update PCB from Schematic (F8) — this imports all footprints and netlist
-3. All components appear in a cluster near the origin — you'll arrange them in Stage 7
-
-Or use the `create_pcb` MCP tool if available, which creates the PCB file directly from the schematic netlist.
+1. `create_pcb(pcb, sch)` — creates an empty `.kicad_pcb` (refuses to overwrite an existing file unless `overwrite=True`). If THIS file is already open in Pcbnew (IPC connected, matching path) it reports the live board instead of creating anything; a different open board does not stop it.
+2. Ask the user to open it in Pcbnew and run Tools > Update PCB from Schematic (F8). On KiCad 9/10 this is the ONLY way footprints and nets reach the board — the API cannot place footprints from a library (`capabilities.place_footprint_from_library` is false). KiCad 11 lifts that restriction; the tool surface for it arrives later, do not invent tool names for it.
+3. `test_kicad_connection()` — confirm `ipc_connected` and that the board path is in `open_documents`. All components sit in a cluster near the origin — you arrange them in Stage 7.
 
 ### Step 2: Board Outline
 
-Draw the board edge on the `Edge.Cuts` layer:
+The user does Steps 2–5 in Pcbnew (Board Setup) — the GUI flow has no MCP tool for outline, stackup, rules or net classes; the headless `build_board_from_netlist` derives all four from `netlist.json`. Draw the board edge on the `Edge.Cuts` layer:
 
 - Use the rectangle or line tool on Edge.Cuts
 - Standard corner radius: 1mm (for manufacturability)
@@ -1073,9 +1070,9 @@ For 90Ω differential on this stackup: W ≈ 0.18mm, S ≈ 0.18mm gives Zdiff �
 
 ### Step 6: Board Size Feasibility Check (MANDATORY)
 
-Before calling `create_pcb`, verify the board is large enough:
+After the F8 import and before placement, verify the board is large enough:
 
-1. Call `get_footprint_pads` for the 3 largest components to get courtyard dimensions
+1. Call `get_footprint_pads(ref)` for the 3 largest components (pad extents approximate the body; courtyards come from the land pattern in the datasheet)
 2. Sum all courtyard areas (width × height for each component)
 3. Compare total footprint area against board area minus edge margins
 4. **If utilization exceeds 60%, the board is too small** — increase board size or plan for:
@@ -1083,11 +1080,11 @@ Before calling `create_pcb`, verify the board is large enough:
    - Module overhang (any section of a module without pins can overhang the edge)
    - Double-sided placement (back side adds 100% area but increases assembly cost)
 
-**RF Module Special Case:** ESP32/WiFi module courtyards in KiCad include the full Espressif RF keep-out recommendation (~48×41mm), but the actual module body is only ~18×25.5mm. Use the `ignore_courtyard_for` parameter in `validate_placement` for these modules. The antenna section (top 6-8mm) can safely overhang past the board edge.
+**RF Module Special Case:** ESP32/WiFi module courtyards in KiCad include the full Espressif RF keep-out recommendation (~48×41mm), but the actual module body is only ~18×25.5mm. `validate_placement()` takes no arguments and reports every bounding-box overlap; an overlap that involves only the module's keep-out (not its body) is acceptable — document it in the Stage 7 gate rationale instead of moving parts. The antenna section (top 6-8mm) can safely overhang past the board edge.
 
 ### Step 7: Verify Setup
 
-Before proceeding to placement, run a quick DRC (Inspect > Design Rules Checker) on the empty board to verify your rules are configured correctly. Zero violations expected on an empty board with just the outline.
+Before proceeding to placement, have the user save the board and run `drc_pcb(pcb)` to verify the rules are configured correctly (kicad-cli reads the saved file; the result carries a `note` when the board is open in the editor). Zero `errors` expected — `unconnected` stays nonzero until routing, ignore it here.
 
 ### Stage 6 Gate
 
@@ -1107,7 +1104,7 @@ Before placing ANY RF module, switching regulator, or sensor with thermal/mechan
 
 ### Pre-Placement: Calculate ALL Positions Before ANY Tool Calls
 
-Build a **placement table** in a text block before making any `add_footprint_to_pcb` calls:
+Build a **placement table** in a text block before making any `add_footprints_batch` call:
 
 ```
 === PLACEMENT TABLE ===
@@ -1242,21 +1239,18 @@ Before moving to routing, verify:
 
 ### Batch Placement (MCP Tools)
 
-**Note:** With the IPC API active, `add_footprints_batch` and `add_footprint_to_pcb` communicate directly with KiCad's running instance. KiCad resolves footprints from its library system and places them atomically — no file parsing or S-expression manipulation. After placement, call `board.save()` (handled automatically) to persist changes to disk. You will see footprints appear in real time in the PCB editor.
-
-When using MCP tools, prefer `add_footprints_batch` over sequential `add_footprint_to_pcb` calls. Build ALL footprint specs from your placement table, then place in one call:
+On KiCad 9/10 footprints reach the board ONLY via the user's Tools > Update PCB from Schematic (F8). The IPC tools then **position** them, live in the open editor: `add_footprints_batch` moves many, `move_footprint` moves one, and `add_footprint_to_pcb(ref, lib_id, x, y, rot)` only moves a footprint that already exists (otherwise it returns `ok: false` with the F8 instruction). KiCad 11 (`capabilities.place_footprint_from_library == true`) will allow direct placement from a library; the tool surface for that arrives later — do not invent it. Build ALL positions from your placement table, then place in one call (no `pcb` argument — the tools act on the board open in Pcbnew):
 
 ```
-add_footprints_batch(pcb_path, json.dumps([
-    {"lib_id": "Connector_USB:USB_C_Receptacle_USB2.0", "reference": "J1", "value": "USB-C",
-     "x": 5.0, "y": 25.0, "rotation": 270, "net_assignments": {"A1": "GND", "A4": "VBUS", ...}},
-    {"lib_id": "RF_Module:ESP32-S3-WROOM-1", "reference": "U1", "value": "ESP32-S3",
-     "x": 25.0, "y": 10.0, "rotation": 0, "net_assignments": {...}},
+add_footprints_batch(footprints=[
+    {"ref": "J1", "x": 5.0,  "y": 25.0, "rot": 270},
+    {"ref": "U1", "x": 25.0, "y": 10.0, "rot": 0},
     # ... all remaining footprints
-]))
+])
+# -> {"ok": true, "moved": [...], "missing": [...]}   a ref in "missing" is not on the board yet: F8 first
 ```
 
-After batch placement, call `validate_placement` (with `ignore_courtyard_for='["U1"]'` for ESP32 modules) to verify no overlaps or out-of-bounds issues. Fix any errors by calling `move_footprint` on individual components.
+Then `validate_placement()` (no arguments) to list overlapping pairs; fix with `move_footprint(ref, x, y, rot)`. IPC edits live in the editor's document: ask the user to save in Pcbnew (Ctrl+S) before any kicad-cli tool (`drc_pcb`, `render_pcb`, `export_*`) reads the file.
 
 ### Visual Inspection After Placement
 
@@ -1268,14 +1262,13 @@ Switch to **3D Viewer** (Alt+3) to check:
 
 ### GUI Verification After MCP Placement
 
-After programmatic placement:
-1. Open PCB in Pcbnew
-2. Visually verify placement — drag components to fix spacing (M key)
-3. Check courtyard overlaps: View > Show Courtyards
-4. Use 3D Viewer (Alt+3) to verify connector orientation
-5. Save (Ctrl+S) — KiCad's save NEVER corrupts files
+The board is already open in Pcbnew (IPC edits land there live), so the user can:
+1. Visually verify placement — drag components to fix spacing (M key)
+2. Check courtyard overlaps: View > Show Courtyards
+3. Use 3D Viewer (Alt+3) to verify connector orientation
+4. Save (Ctrl+S); then you call `render_pcb(pcb, side)` on the saved file and inspect it
 
-**Key Principle:** MCP tools for bulk creation, KiCad GUI for verification and correction. Never modify a file 30 times with `move_footprint` when you can drag a component in the GUI in 2 seconds.
+**Key Principle:** MCP tools for bulk positioning, KiCad GUI for verification and correction. Never call `move_footprint` 30 times when the user can drag a component in 2 seconds.
 
 ### Pcbnew Keyboard Shortcuts Reference
 
@@ -1303,6 +1296,11 @@ All footprints placed. `validate_placement` passes (or remaining warnings are do
 ### What You Do
 
 Convert every ratsnest line into a physical copper trace. Routing is where signal integrity, power delivery, and EMC performance are realized or destroyed. A clean route follows naturally from good placement — if routing is fighting you, go back and fix placement first.
+
+### Two Ways to Route
+
+- **Headless:** the user saves and CLOSES the board in Pcbnew; you call `autoroute_board(pcb, max_passes, jar, route_timeout)` (Freerouting via Specctra DSN/SES, zones refilled; returns `tracks` and `unconnected` — re-run until `unconnected` is 0), optionally `add_ground_stitching(pcb, ...)`; the user reopens the board. Both refuse to run while the file is open in the editor.
+- **Interactive:** the user routes in Pcbnew's router (below). `add_trace` / `add_via` / `add_copper_zone` are for targeted manual copper only (a specific stub, a thermal via array, a pour outline) — `register_net(net_name)` first to confirm the net exists. Never try to route a board segment by segment through them.
 
 ### Step 1: Routing Sequence
 
@@ -1545,10 +1543,9 @@ Run the comprehensive DRC to verify every manufacturing and electrical constrain
 
 ### Running DRC
 
-1. Inspect > Design Rules Checker
-2. Enable all check categories
-3. Click "Run DRC"
-4. Review every error AND every warning
+1. `test_kicad_connection()` — if the board is in `open_documents`, ask the user to save in Pcbnew first (DRC reads the file on disk; unsaved GUI edits are not reflected, and the result carries a `note` saying so)
+2. `drc_pcb(pcb, fab_profile="")` — kicad-cli DRC at error severity; returns `{ok, errors, unconnected, types: {type: count}, report, profile}`; `ok` is true only at 0 errors AND 0 unconnected
+3. Delegate the punch list to the `drc-reviewer` subagent; review every error AND every warning it surfaces
 
 ### Common DRC Issues and Fixes
 
@@ -1588,6 +1585,8 @@ Zero DRC errors. All warnings reviewed and resolved or documented as acceptable.
 Export manufacturing files and review them in a Gerber viewer to catch visual issues before submitting to the fab house.
 
 ### Export Procedure
+
+**Tools:** `export_fab_package(pcb, out_dir="", zip_name="", netlist="")` — Gerbers + drill + pick-and-place (+ JLCPCB BOM.csv/CPL.csv when a `netlist.json` is given), zipped; or `export_gerbers(pcb, out_dir)` for Gerbers + drill only. Both run kicad-cli on the SAVED file. Delegate the check to the `fab-checker` subagent. The equivalent GUI menus:
 
 **Gerber files:** File > Fabrication Outputs > Gerbers (.gbr)
 
@@ -1658,24 +1657,24 @@ Gerber files exported and visually reviewed. Drill file verified. Pick-and-place
 
 ## TERMINAL COMMANDS REFERENCE
 
-When you need to use KiCad's command-line tools:
+When you need KiCad's command-line tools directly (`server_status()` reports the resolved `kicad_cli_path`; on Windows it is `<KiCad>\bin\kicad-cli.exe`, e.g. under `C:\Program Files\KiCad\10.0`):
 
 ```
 # Export schematic to SVG (for visual review)
-& "C:\Program Files\KiCad\9.0\bin\kicad-cli.exe" sch export svg -o exports/ schematic.kicad_sch
+kicad-cli sch export svg -o exports/ schematic.kicad_sch
 
 # Run ERC from command line
-& "C:\Program Files\KiCad\9.0\bin\kicad-cli.exe" sch erc --output erc_report.rpt schematic.kicad_sch
+kicad-cli sch erc --output erc_report.rpt schematic.kicad_sch
 
 # Export PCB to SVG
-& "C:\Program Files\KiCad\9.0\bin\kicad-cli.exe" pcb export svg -o exports/ board.kicad_pcb
+kicad-cli pcb export svg -o exports/ board.kicad_pcb
 
 # Run DRC from command line
-& "C:\Program Files\KiCad\9.0\bin\kicad-cli.exe" pcb drc --output drc_report.rpt board.kicad_pcb
+kicad-cli pcb drc --output drc_report.rpt board.kicad_pcb
 
 # Export Gerbers
-& "C:\Program Files\KiCad\9.0\bin\kicad-cli.exe" pcb export gerbers --output gerbers/ board.kicad_pcb
+kicad-cli pcb export gerbers --output gerbers/ board.kicad_pcb
 
 # Export drill files
-& "C:\Program Files\KiCad\9.0\bin\kicad-cli.exe" pcb export drill --output gerbers/ board.kicad_pcb
+kicad-cli pcb export drill --output gerbers/ board.kicad_pcb
 ```
