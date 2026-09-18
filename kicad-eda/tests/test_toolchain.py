@@ -134,3 +134,36 @@ def test_erc_json_runs_the_newest_cli(machine, nightly, stable, tmp_path, monkey
     res = tc.erc_json(str(tmp_path / "s.kicad_sch"), str(tmp_path / "s_erc.json"))
     assert calls[0][0] == str(nightly.kicad_cli) and calls[0][1:3] == ["sch", "erc"]
     assert res["erc_ok"] and res["erc_violations"] == 0
+
+
+# ----------------------------------------------------------------------------
+# subprocess helper: stdin must never be the MCP server's pipe
+# ----------------------------------------------------------------------------
+def test_run_detaches_stdin_by_default(monkeypatch) -> None:
+    seen: dict = {}
+    monkeypatch.setattr(tc.subprocess, "run", lambda args, **kw: seen.update(kw) or args)
+    tc.run(["kicad-cli", "version"], timeout=5)
+    assert seen["stdin"] is tc.subprocess.DEVNULL
+    assert seen["capture_output"] is True and seen["text"] is True and seen["timeout"] == 5
+
+
+def test_run_keeps_an_explicit_stdin(monkeypatch) -> None:
+    seen: dict = {}
+    monkeypatch.setattr(tc.subprocess, "run", lambda args, **kw: seen.update(kw) or args)
+    tc.run(["kicad-cli", "version"], stdin=None)
+    assert seen["stdin"] is None
+
+
+def test_rescan_tool_drops_the_cache_and_reports_fresh_picks(machine, stable, monkeypatch) -> None:
+    import board_pipeline_tools as bpt
+    cleared: list[bool] = []
+    monkeypatch.setattr(env, "clear_cache", lambda: cleared.append(True))
+    machine(stable)
+    res = bpt.rescan_kicad_installs()
+    assert cleared == [True]
+    assert res["kicad_cli_board"] == str(stable.kicad_cli)
+    assert res["kicad_python"] == str(stable.python)
+    assert res["kicad_python_error"] is None and res["install_probe_errors"] == []
+    assert [i["version"] for i in res["installs"]] == [stable.version]
+    assert bpt.rescan_kicad_installs in bpt.TOOLS
+

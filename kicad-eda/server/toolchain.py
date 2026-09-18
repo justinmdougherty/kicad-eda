@@ -172,6 +172,11 @@ def freerouting_jar(explicit: str = "") -> str | None:
 # Subprocess helpers
 # ----------------------------------------------------------------------------
 def run(args: list[str], **kw) -> subprocess.CompletedProcess:
+    """subprocess.run with captured output and stdin DETACHED. Inside an MCP
+    stdio server the parent's stdin is the protocol pipe (with a read pending);
+    a python.exe child that inherits it blocks at start-up until the timeout
+    (kicad_env._run has the details). Callers may still pass stdin= explicitly."""
+    kw.setdefault("stdin", subprocess.DEVNULL)
     return subprocess.run(args, capture_output=True, text=True, **kw)
 
 

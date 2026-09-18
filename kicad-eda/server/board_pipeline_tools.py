@@ -23,6 +23,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+import kicad_env as env
 import kicad_ipc as ipc
 import toolchain as tc
 
@@ -418,5 +419,18 @@ def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.
             "even fence-only; board left unmodified"}
 
 
+def rescan_kicad_installs() -> dict:
+    """Forget every cached KiCad probe (versions, bundled-Python pcbnew checks,
+    api-server support) and discover the installs again, without restarting
+    the server. Use after installing or removing a KiCad, or when
+    server_status shows kicad_python null with a transient reason (a probe
+    that timed out or could not start). Returns the fresh picks."""
+    env.clear_cache()
+    return {"installs": tc.installs(), "kicad_cli_schematic": tc.kicad_cli(),
+            "kicad_cli_board": tc.board_cli(), "kicad_python": tc.kicad_python(),
+            "kicad_python_error": tc.kicad_python_error(),
+            "install_probe_errors": env.probe_errors()}
+
+
 TOOLS = (drc_pcb, export_gerbers, render_pcb, build_board_from_netlist, autoroute_board,
-         export_fab_package, check_design_gates, add_ground_stitching)
+         export_fab_package, check_design_gates, add_ground_stitching, rescan_kicad_installs)

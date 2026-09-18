@@ -43,6 +43,7 @@ exist as `kicad-generator` MCP tools for driving a board one stage at a time:
 - `export_fab_package(pcb, out_dir, zip_name, netlist)` — G5: Gerbers, drill, CPL, BOM, zipped.
 - `build_pin_sidecars("Lib:Symbol,...")` — optional: both flows derive pin coordinates from the symbol; a sidecar in `server/pins/` overrides for both. Still a valid symbol-id check (exits 1 on an unknown symbol).
 - `server_status()` — every installed KiCad (`installs`), the kicad-cli / bundled Python / libraries in use, `schematic_backend` ("api" | "file") with the reason when it is "file", Java/Freerouting, IPC, open documents, capabilities.
+- `rescan_kicad_installs()` — drop every cached KiCad probe and discover again (after installing/removing a KiCad, or when `kicad_python` is null with a timeout / cannot-start reason); returns the fresh picks.
 
 Every writer above refuses a file that is open in a KiCad editor — close it
 first (`test_kicad_connection().open_documents` shows what is open).

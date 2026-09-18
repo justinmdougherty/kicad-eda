@@ -32,8 +32,10 @@ def _erc_argv(kicad_cli: Path, sch_path: Path, report: Path) -> list[str]:
 
 
 def _run_cli(argv: list[str], timeout_s: float) -> subprocess.CompletedProcess:
+    # stdin detached: see kicad_env._run (children must not inherit the MCP pipe)
     try:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
+                              stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired as exc:
         raise SchematicApiError(f"kicad-cli ERC timed out after {timeout_s:g} s") from exc
     except OSError as exc:

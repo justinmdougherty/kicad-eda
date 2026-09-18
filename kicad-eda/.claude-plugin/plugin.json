@@ -13,7 +13,6 @@
   "license": "MIT",
   "keywords": ["kicad", "pcb", "eda", "schematic", "gerber", "autorouting", "hardware", "electronics"],
   "mcpServers": "./.mcp.json",
-  "hooks": "./hooks/hooks.json",
   "userConfig": {
     "kicad_path": {
       "type": "directory",

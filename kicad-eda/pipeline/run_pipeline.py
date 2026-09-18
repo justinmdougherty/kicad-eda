@@ -45,7 +45,7 @@ def _drc(pcb: str) -> dict:
     rpt = str(Path(pcb).with_suffix("")) + "_drc.json"
     cli = _board_cli()
     subprocess.run([cli, "pcb", "drc", pcb, "--severity-error",
-                    "-o", rpt, "--format", "json"], capture_output=True, text=True)
+                    "-o", rpt, "--format", "json"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
     d = json.loads(Path(rpt).read_text())
     return {"errors": len(d.get("violations", [])),
             "unconnected": len(d.get("unconnected_items", [])),
@@ -69,7 +69,7 @@ def _gate_check(mode: str, pcb: str, netlist: str) -> dict:
     if not kpy or not script.is_file():
         return {"issues": [f"gate check unavailable ({mode})"], "warnings": []}
     r = subprocess.run([kpy, str(script), mode, pcb, netlist],
-                       capture_output=True, text=True, timeout=300)
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300)
     for line in reversed(r.stdout.strip().splitlines()):
         if line.startswith("{"):
             try:
@@ -91,7 +91,7 @@ def _board_fix(pcb: str, netlist: str, mode: str) -> list:
     if not kpy or not script.is_file():
         return []
     r = subprocess.run([kpy, str(script), pcb, netlist, drc_rpt, mode],
-                       capture_output=True, text=True, timeout=300)
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300)
     for line in reversed(r.stdout.strip().splitlines()):
         if line.startswith("{"):
             try:
@@ -160,7 +160,7 @@ def _render(pcb: str, tag: str, quality: str = "basic") -> list:
                 [cli, "pcb", "render", pcb, "-o", png,
                  "--side", side, "--quality", quality,
                  "--width", "1600", "--height", "1400"],
-                capture_output=True, text=True, timeout=300)
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300)
             if r.returncode == 0 and Path(png).is_file():
                 out.append(png)
         except Exception:
@@ -178,7 +178,7 @@ def _emc_stitch(pcb: str, emc: dict) -> dict:
     r = subprocess.run(
         [kpy, str(script), pcb, str(emc.get("max_freq_hz", 0)),
          "fence" if emc.get("fence_only") else "grid"],
-        capture_output=True, text=True, timeout=600)
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600)
     for line in reversed(r.stdout.strip().splitlines()):
         if line.startswith("{"):
             try:

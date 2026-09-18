@@ -47,6 +47,7 @@ from pathlib import Path
 SERVER_DIR = Path(__file__).resolve().parent
 VENDOR_DIR = SERVER_DIR / "vendor"
 PROBE_TIMEOUT_S = 30
+PYTHON_PROBE_TIMEOUT_S = 90               # a cold `import pcbnew` can take a while
 API_SERVER_MIN_VERSION = (10, 99, 0)      # a KiCad 11 nightly reports itself as 10.99.x
 IS_WINDOWS = os.name == "nt"               # tests patch these two to fake a platform
 CLI_NAME = "kicad-cli.exe" if IS_WINDOWS else "kicad-cli"
@@ -102,9 +103,11 @@ class KiCadInstall:
 # Probing (one subprocess per question per kicad-cli path, cached per process)
 # ----------------------------------------------------------------------------
 _VERSION: dict[str, tuple[str | None, str | None]] = {}   # key -> (version, error)
-_PYTHON: dict[str, tuple[Path | None, str | None]] = {}   # key -> (python, error)
+_PYTHON: dict[str, tuple[Path | None, str | None]] = {}   # key -> (python, error), settled
+_PYTHON_TRANSIENT: dict[str, str] = {}                     # key -> error of an unsettled probe
 _API: dict[str, bool] = {}
 _INSTALLS: tuple[KiCadInstall, ...] | None = None
+TRANSIENT_RC = -1                          # ProbeResult.returncode for timeout / cannot start
 
 
 def clear_cache() -> None:
@@ -112,6 +115,7 @@ def clear_cache() -> None:
     global _INSTALLS
     _VERSION.clear()
     _PYTHON.clear()
+    _PYTHON_TRANSIENT.clear()
     _API.clear()
     _INSTALLS = None
 
@@ -121,13 +125,20 @@ def _key(path: Path | str) -> str:
 
 
 def _run(argv: list[str], timeout_s: float = PROBE_TIMEOUT_S) -> ProbeResult:
-    """Run a probe; tests monkeypatch this to feed canned answers."""
+    """Run a probe; tests monkeypatch this to feed canned answers.
+
+    stdin is DETACHED on purpose: inside an MCP stdio server the parent's stdin
+    is the protocol pipe with a read pending on it, and a python.exe child that
+    inherits that handle blocks at interpreter start-up (verified on Windows:
+    even `python -c "print(1)"` hangs until the timeout; kicad-cli does not).
+    Every subprocess the server spawns must follow this rule."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
+                           stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return ProbeResult(-1, "", f"{argv[0]}: timed out after {timeout_s:g} s")
+        return ProbeResult(TRANSIENT_RC, "", f"{argv[0]}: timed out after {timeout_s:g} s")
     except OSError as e:
-        return ProbeResult(-1, "", f"{argv[0]}: cannot start ({e})")
+        return ProbeResult(TRANSIENT_RC, "", f"{argv[0]}: cannot start ({e})")
     return ProbeResult(r.returncode, r.stdout, r.stderr)
 
 
@@ -174,27 +185,46 @@ def python_candidates(kicad_cli: Path) -> list[Path]:
 
 def bundled_python(kicad_cli: Path) -> Path | None:
     """The install's Python, VERIFIED to import pcbnew; None otherwise (why is
-    kept for python_probe_error). Cached per path."""
+    kept for python_probe_error). A settled answer (it imports, or it fails
+    with a real error) is cached per path; a timeout or a launch failure is
+    NOT, so the next call probes again instead of disabling board builds for
+    the life of the process."""
     key = _key(kicad_cli)
-    if key not in _PYTHON:
-        _PYTHON[key] = _probe_python(kicad_cli)
-    return _PYTHON[key][0]
+    if key in _PYTHON:
+        return _PYTHON[key][0]
+    python, error, settled = _probe_python(kicad_cli)
+    if settled:
+        _PYTHON[key] = (python, error)
+        _PYTHON_TRANSIENT.pop(key, None)
+    else:
+        _PYTHON_TRANSIENT[key] = error or "unsettled probe"
+    return python
 
 
-def _probe_python(kicad_cli: Path) -> tuple[Path | None, str | None]:
+def _probe_python(kicad_cli: Path) -> tuple[Path | None, str | None, bool]:
+    """(python, error, settled). settled is False when every candidate's probe
+    timed out or could not start (nothing definitive was learned)."""
     errors: list[str] = []
+    settled = True
     for cand in python_candidates(kicad_cli):
         if not cand.is_file():
             continue
-        r = _run([str(cand), "-c", "import pcbnew"])
+        r = _run([str(cand), "-c", "import pcbnew"], timeout_s=PYTHON_PROBE_TIMEOUT_S)
         if r.ok:
-            return (cand, None)
+            return (cand, None, True)
+        if r.returncode == TRANSIENT_RC:
+            settled = False
         errors.append(f"{cand}: cannot import pcbnew: {r.stderr.strip()[-400:]}")
-    return (None, "; ".join(errors) or f"no bundled Python found beside {kicad_cli}")
+    if not errors:
+        return (None, f"no bundled Python found beside {kicad_cli}", True)
+    return (None, "; ".join(errors), settled)
 
 
 def python_probe_error(kicad_cli: Path) -> str | None:
-    return _PYTHON.get(_key(kicad_cli), (None, None))[1]
+    key = _key(kicad_cli)
+    if key in _PYTHON:
+        return _PYTHON[key][1]
+    return _PYTHON_TRANSIENT.get(key)
 
 
 def has_api_server(kicad_cli: Path, version_tuple: tuple[int, int, int]) -> bool:

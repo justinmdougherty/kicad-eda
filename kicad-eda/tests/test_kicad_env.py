@@ -238,9 +238,76 @@ def test_api_server_needs_version_and_probe(tmp_path: Path, fake_world: FakeProb
 
 def test_run_reports_launch_failure_and_timeout(tmp_path: Path) -> None:
     missing = env._run([str(tmp_path / "no-such-kicad-cli.exe"), "version"])
-    assert missing.returncode == -1 and not missing.ok and "cannot start" in missing.stderr
+    assert missing.returncode == env.TRANSIENT_RC and not missing.ok and "cannot start" in missing.stderr
     slow = env._run([sys.executable, "-c", "import time; time.sleep(30)"], timeout_s=0.5)
-    assert slow.returncode == -1 and "timed out after 0.5 s" in slow.stderr
+    assert slow.returncode == env.TRANSIENT_RC and "timed out after 0.5 s" in slow.stderr
+
+
+def test_run_detaches_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Children must not inherit the MCP server's stdin pipe: a python.exe
+    that does blocks at start-up until the timeout (seen on Windows)."""
+    seen: dict = {}
+
+    def fake_run(argv, **kw):
+        seen.update(kw)
+        return types.SimpleNamespace(returncode=0, stdout="9.0.4", stderr="")
+    monkeypatch.setattr(env.subprocess, "run", fake_run)
+    assert env._run(["kicad-cli", "version"]).ok
+    assert seen["stdin"] is env.subprocess.DEVNULL
+    assert seen["capture_output"] is True and seen["timeout"] == env.PROBE_TIMEOUT_S
+
+
+def test_python_probe_uses_the_longer_timeout(tmp_path: Path, fake_world: FakeProbes,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    timeouts: list[float] = []
+
+    def run(argv, timeout_s=0):
+        timeouts.append(timeout_s)
+        return fake_world.run(argv, timeout_s)
+    monkeypatch.setattr(env, "_run", run)
+    cli = make_install(tmp_path / "pf" / "KiCad" / "9.0", python=True)
+    fake_world.versions[env._key(cli)] = "9.0.4"
+    fake_world.pcbnew_ok.add(env._key(cli.parent / "python.exe"))
+    env.discover()
+    assert env.PYTHON_PROBE_TIMEOUT_S in timeouts and env.PYTHON_PROBE_TIMEOUT_S > env.PROBE_TIMEOUT_S
+
+
+def test_python_probe_timeout_is_not_cached(tmp_path: Path, fake_world: FakeProbes,
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """A probe that timed out (or could not start) settles nothing: the next
+    discovery probes again instead of disabling board builds for the process."""
+    cli = make_install(tmp_path / "pf" / "KiCad" / "9.0", python=True)
+    py = cli.parent / "python.exe"
+    fake_world.versions[env._key(cli)] = "9.0.4"
+    slow = {"left": 1}
+
+    def run(argv, timeout_s=0):
+        if argv[1:] == ["-c", "import pcbnew"] and slow["left"]:
+            slow["left"] -= 1
+            fake_world.calls.append(list(argv))
+            return env.ProbeResult(env.TRANSIENT_RC, "", f"{argv[0]}: timed out after {timeout_s:g} s")
+        return fake_world.run(argv, timeout_s)
+    monkeypatch.setattr(env, "_run", run)
+    fake_world.pcbnew_ok.add(env._key(py))
+
+    (first,) = env.discover()
+    assert first.python is None and "timed out after 90 s" in (first.python_error or "")
+    assert env.python_probe_error(cli) and "timed out" in env.python_probe_error(cli)
+    (second,) = env.discover(refresh=True)                 # probes again, now answers
+    assert second.python == py and second.python_error is None
+    assert env.python_probe_error(cli) is None
+    assert fake_world.count(py, "-c", "import pcbnew") == 2
+    env.discover(refresh=True)                             # a settled answer IS cached
+    assert fake_world.count(py, "-c", "import pcbnew") == 2
+
+
+def test_python_probe_real_failure_is_cached(tmp_path: Path, fake_world: FakeProbes) -> None:
+    cli = make_install(tmp_path / "pf" / "KiCad" / "9.0", python=True)
+    fake_world.versions[env._key(cli)] = "9.0.4"          # pcbnew import fails for real
+    env.discover()
+    env.discover(refresh=True)
+    assert fake_world.count(cli.parent / "python.exe", "-c", "import pcbnew") == 1
+    assert env.python_probe_error(cli) and PCBNEW_MISSING in env.python_probe_error(cli)
 
 
 # ----------------------------------------------------------------------------
