@@ -15,12 +15,14 @@ status tools; the other tool families live beside it and are registered here.
                  the file open (mode "gui").
         "file" — the in-memory file model (server/sch_file_model.py), the
                  fallback whenever the API is unavailable.
-  PCB: live IPC tools (pcb_ipc_tools.py) and the headless board pipeline
+  PCB: live IPC tools (pcb_ipc_tools.py), the headless board pipeline
       (board_pipeline_tools.py: kicad-cli, KiCad's bundled Python,
-      Freerouting). build_schematic_from_netlist (here) uses the API backend
+      Freerouting) and agent routing on KiCad's board API (board_route_tools.py,
+      its own board registry). build_schematic_from_netlist (here) uses the API backend
       when available, else server/tools/sch_build.py.
-  TOOLCHAIN (kicad_env + toolchain.py): newest kicad-cli for schematics, the
-      pcbnew install's kicad-cli for boards (KICAD_CLI_POLICY), KiCad 11 api-server.
+  TOOLCHAIN (kicad_env + toolchain.py): newest kicad-cli for schematics; for a
+      board the kicad-cli of the KiCad that WROTE the file, the pcbnew install's
+      for a new board (KICAD_CLI_POLICY); KiCad 11 api-server for both APIs.
   OPEN-DOCUMENT GUARD (kicad_ipc.py): writes refuse a file open in a KiCad
       editor, except a schematic in a KiCad 11 GUI (edited there in place).
 
@@ -31,6 +33,7 @@ those names are kept here as thin wrappers (k.KICAD_CLI = the BOARD kicad-cli).
 
 from __future__ import annotations
 
+import atexit
 import json
 import sys
 from dataclasses import dataclass
@@ -46,6 +49,7 @@ import kicad_env as env                     # noqa: E402
 env.use_vendored_kipy()                     # server/vendor FIRST, before any `import kipy`
 
 import board_pipeline_tools                 # noqa: E402
+import board_route_tools                    # noqa: E402
 import kicad_ipc as ipc                     # noqa: E402
 import pcb_ipc_tools                        # noqa: E402
 import sch_file_model as sfm                # noqa: E402
@@ -55,6 +59,7 @@ from board_pipeline_tools import (          # noqa: E402,F401  (re-exported for 
     check_design_gates, drc_pcb, export_fab_package, export_gerbers, render_pcb)
 from mcp.server.fastmcp import FastMCP     # noqa: E402
 from pcb_ipc_tools import create_pcb        # noqa: E402,F401
+from session_release import Release, close_error_fields  # noqa: E402
 
 mcp = FastMCP("kicad-generator")
 
@@ -63,7 +68,7 @@ PINS_DIR = tc.PINS_DIR
 FAB_PROFILE = tc.FAB_PROFILE
 WORK_UNITS = tc.WORK_UNITS
 BACKENDS = ("auto", "api", "file")
-KICAD_CLI_POLICY = tc.KICAD_CLI_POLICY      # schematics: newest cli; boards: the pcbnew install's
+KICAD_CLI_POLICY = tc.KICAD_CLI_POLICY      # schematics: newest cli; boards: the file writer's cli
 
 
 # ----------------------------------------------------------------------------
@@ -211,6 +216,16 @@ def _forget(key: str) -> str | None:
     return None
 
 
+def _close_all_sessions() -> None:
+    """atexit: release every schematic session so a normal exit leaves no
+    headless api-server behind (unsaved edits are dropped)."""
+    for key in list(_SESSIONS):
+        _forget(key)
+
+
+atexit.register(_close_all_sessions)
+
+
 def _fail(sess: Session, reason: str) -> dict:
     return {"ok": False, "backend": sess.backend, "path": sess.path, "reason": reason}
 
@@ -239,31 +254,6 @@ def _dispatch(sch: str, method: str, *args, **kw) -> dict:
         return err
     fields = result if isinstance(result, dict) else {"result": result}
     return {"ok": True, "backend": sess.backend, **fields}
-
-
-def _close_error_fields(error: str | None) -> dict:
-    """A session that did not stop cleanly is reported, never dropped silently."""
-    return {"previous_session_close_error": error} if error else {}
-
-
-@dataclass(frozen=True)
-class Release:
-    """What _release_headless did: the refusal (a dirty session), the paths
-    whose idle headless sessions were dropped, and any close errors; fields()
-    are the extra keys for the response of the tool that triggered it."""
-    blocked: dict | None = None
-    released: tuple[str, ...] = ()
-    errors: tuple[str, ...] = ()
-
-    def fields(self) -> dict:
-        out: dict = {}
-        if self.released:
-            out["released_sessions"] = list(self.released)
-            out["released_note"] = ("the headless api-server holds one schematic at a time; "
-                                    "load_schematic a released path again to keep editing it")
-        if self.errors:
-            out["released_session_close_errors"] = list(self.errors)
-        return out
 
 
 def _release_headless(keep: str | None = None) -> Release:
@@ -312,7 +302,7 @@ def create_schematic(path: str, paper: str = "A4", backend: str = "auto") -> dic
         return {**ipc.write_refusal(path, kind), "backend": chosen,
                 "hint": "load_schematic(path) connects to a schematic open in a KiCad 11 GUI"}
     key = _key(path)
-    notes = _close_error_fields(_forget(key))   # re-creating replaces any earlier session
+    notes = close_error_fields(_forget(key))   # re-creating replaces any earlier session
     if chosen == "file":
         sess = Session(path, "file", sfm.FileSchematic(path, paper))
     else:
@@ -349,7 +339,7 @@ def load_schematic(path: str, backend: str = "auto") -> dict:
     if existing and existing.dirty:
         return _fail(existing, f"{path} already has a session with unsaved changes; "
                                "save_schematic or close_schematic it first")
-    notes = _close_error_fields(_forget(key))
+    notes = close_error_fields(_forget(key))
     if chosen == "file":
         _SESSIONS[key] = Session(path, "file", sfm.FileSchematic(path))
         return {"ok": True, "path": path, "backend": "file", "mode": "file",
@@ -607,7 +597,7 @@ def _build_via_api(netlist: str, out: str, symbols_dir: str, sidecars_dir: str) 
     release = _release_headless()
     if release.blocked:
         return release.blocked
-    notes = {**release.fields(), **_close_error_fields(_forget(_key(out)))}
+    notes = {**release.fields(), **close_error_fields(_forget(_key(out)))}
     try:
         design = json.loads(Path(netlist).read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
@@ -767,9 +757,10 @@ def test_kicad_connection() -> dict:
 def server_status() -> dict:
     """Report what this server can do right now: every installed KiCad, the
     kicad-cli / bundled Python (verified to import pcbnew; kicad_python_error
-    says why not) / libraries in use, the schematic backend ("api" needs a
-    KiCad 11 api-server), Java + Freerouting, GUI IPC (version, open
-    documents, capabilities), fab profile and the open schematic sessions."""
+    says why not) / libraries in use, the schematic backend and the board API
+    (both need a KiCad 11 api-server; the *_reason keys say why not), Java +
+    Freerouting, GUI IPC (version, open documents, capabilities), fab profile
+    and the open schematic sessions and boards."""
     cli = tc.kicad_cli()
     gui = ipc.public(ipc.connect())
     return {"kicad_cli": bool(cli), "kicad_cli_path": cli, "kicad_cli_schematic": cli,
@@ -778,7 +769,7 @@ def server_status() -> dict:
             "kicad_share": str(tc.kicad_share() or ""), "symbols_dir": tc.symbols_dir(),
             "footprints_dir": tc.footprints_dir(),
             "install_probe_errors": env.probe_errors(),
-            **_backend_status(),
+            **_backend_status(), **board_route_tools.status(),
             "java": tc.find_java(), "freerouting_jar": tc.freerouting_jar(),
             "ipc": bool(gui.get("ipc_connected")), "ipc_reason": gui.get("reason"),
             "kicad_version": gui.get("kicad_version"),
@@ -792,7 +783,7 @@ def server_status() -> dict:
 # ----------------------------------------------------------------------------
 # Tool registration for the modules beside this one
 # ----------------------------------------------------------------------------
-for _fn in pcb_ipc_tools.TOOLS + board_pipeline_tools.TOOLS:
+for _fn in pcb_ipc_tools.TOOLS + board_pipeline_tools.TOOLS + board_route_tools.TOOLS:
     mcp.tool()(_fn)
 
 

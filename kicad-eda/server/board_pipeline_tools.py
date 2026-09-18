@@ -3,10 +3,12 @@ net-map pipeline's board stages (netlist.json -> placed board -> Freerouting
 -> DRC -> EMC stitching -> fab zip).
 
 They shell out to the scripts in server/tools/ — the SWIG board/route steps
-under KiCad's bundled Python (needs pcbnew: pick_swig, KiCad 9/10), DRC /
-Gerbers / drill / pos / render with the kicad-cli of that SAME install
-(toolchain.board_cli — never a newer nightly's), Freerouting under Java. No
-IPC required.
+under KiCad's bundled Python (needs pcbnew: pick_swig, KiCad 9/10; they refuse
+a board newer than that pcbnew can read, toolchain.swig_readable), DRC /
+Gerbers / drill / pos / render with the kicad-cli of the KiCad that WROTE the
+board file (toolchain.board_cli(pcb): the pcbnew install for a SWIG-built
+board, kicad-cli 11 for a board saved by the KiCad 11 API session, never a
+mismatched nightly), Freerouting under Java. No IPC required.
 
 Plain functions; kicad_server registers everything in TOOLS with FastMCP.
 """
@@ -29,30 +31,34 @@ import toolchain as tc
 
 
 def drc_pcb(pcb: str, fab_profile: str = "") -> dict:
-    """Run KiCad DRC (error severity) on a SAVED .kicad_pcb via kicad-cli and
-    return the error / unconnected counts, a per-type histogram and the JSON
-    report path. Read-only: safe on a board that is open in the editor, but
-    unsaved GUI changes are not reflected. The fab profile is echoed; the rules
-    themselves live in the board/.kicad_pro."""
+    """Run KiCad DRC (error severity) on a SAVED .kicad_pcb with the kicad-cli
+    of the KiCad that wrote it (board_cli) and return the error / unconnected
+    counts, a per-type histogram and the JSON report path. Read-only: safe on
+    a board that is open in the editor, but unsaved GUI changes are not
+    reflected. The fab profile is echoed; the rules themselves live in the
+    board/.kicad_pro. `kicad_cli_note` appears when no installed kicad-cli is
+    as new as the file and the newest one was tried."""
     profile = fab_profile or tc.FAB_PROFILE
-    if not tc.board_cli():
+    if not tc.board_cli(pcb):
         return {"ok": False, "reason": "kicad-cli not found; install KiCad.", "profile": profile}
     if not Path(pcb).is_file():
         raise ValueError(f"PCB not found: {pcb}")
     c = tc.drc_counts(pcb)
     if "error" in c:
         return {"ok": False, "reason": c["error"], "report": c["report"], "profile": profile}
+    cli_note = {"kicad_cli_note": c["kicad_cli_note"]} if c.get("kicad_cli_note") else {}
     res = {"ok": c["errors"] == 0 and c["unconnected"] == 0, "errors": c["errors"],
            "unconnected": c["unconnected"], "types": c["types"], "report": c["report"],
-           "kicad_cli": c["kicad_cli"], "profile": profile}
+           "kicad_cli": c["kicad_cli"], "profile": profile, **cli_note}
     if ipc.open_in_editor(pcb):
-        res["note"] = "file is open in the editor; unsaved GUI changes are not reflected"
+        return {**res, "note": "file is open in the editor; unsaved GUI changes are not reflected"}
     return res
 
 
 def export_gerbers(pcb: str, out_dir: str = "") -> dict:
-    """Export Gerbers + drill via the board install's kicad-cli (board_cli)."""
-    cli = tc.board_cli()
+    """Export Gerbers + drill with the kicad-cli of the KiCad that wrote the
+    board (board_cli(pcb))."""
+    cli = tc.board_cli(pcb)
     if not cli:
         return {"ok": False, "reason": "kicad-cli not found; install KiCad."}
     out = out_dir or str(Path(pcb).with_suffix("")) + "_gerbers"
@@ -61,17 +67,18 @@ def export_gerbers(pcb: str, out_dir: str = "") -> dict:
     d = tc.run([cli, "pcb", "export", "drill", "-o", out, pcb])
     files = [p.name for p in Path(out).iterdir()] if Path(out).is_dir() else []
     return {"ok": g.returncode == 0 and d.returncode == 0, "out_dir": out,
-            "files": files, "stderr": (g.stderr + d.stderr)[-1500:]}
+            "files": files, "kicad_cli": cli, "stderr": (g.stderr + d.stderr)[-1500:]}
 
 
 def render_pcb(pcb: str, side: str = "top", out_png: str = "") -> dict:
-    """Render the board to a PNG (top/bottom) via the board install's kicad-cli."""
-    cli = tc.board_cli()
+    """Render the board to a PNG (top/bottom) with the kicad-cli of the KiCad
+    that wrote the board (board_cli(pcb))."""
+    cli = tc.board_cli(pcb)
     if not cli:
         return {"ok": False, "reason": "kicad-cli not found; install KiCad."}
     out = out_png or str(Path(pcb).with_suffix(f".{side}.png"))
     r = tc.run([cli, "pcb", "render", "--side", side, "-o", out, pcb])
-    return {"ok": r.returncode == 0, "output": out, "stderr": r.stderr[-1000:]}
+    return {"ok": r.returncode == 0, "output": out, "kicad_cli": cli, "stderr": r.stderr[-1000:]}
 
 
 def build_board_from_netlist(netlist: str, board_w: float, board_h: float,
@@ -203,22 +210,38 @@ def _route(java: str, jar: str, dsn: str, ses: str, max_passes: int,
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _autoroute_preflight(pcb: str, jar: str) -> tuple[str, str, str] | dict:
+    """(kicad_python, java, freerouting_jar) for autoroute_board, or the refusal
+    dict: no pcbnew Python, a board it cannot read (one saved by the KiCad 11
+    API session: route it with the board API tools instead), no Java, no jar."""
+    kpy = tc.kicad_python()
+    if not kpy:
+        return {"ok": False, "reason": "KiCad bundled Python not found"}
+    refusal = tc.swig_readable(pcb)
+    if refusal:
+        return {"ok": False, "reason": refusal}
+    java = tc.find_java()
+    if not java:
+        return {"ok": False, "reason": "java not found (Freerouting needs a JRE/JDK)"}
+    fj = tc.freerouting_jar(jar)
+    if not fj:
+        return {"ok": False, "reason": "freerouting jar not found in server/tools or $FREEROUTING_JAR"}
+    return kpy, java, fj
+
+
 def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
                     route_timeout: int = 300) -> dict:
     """Autoroute a board with Freerouting: export Specctra DSN, route, import the
     SES session back, and refill zones. Signal layers route on F.Cu/B.Cu while
     GND/power return to the inner planes. The router is killed after
     route_timeout seconds so a pathological board can never hang the pipeline.
-    Returns the resulting track count and unconnected count."""
-    kpy = tc.kicad_python()
-    java = tc.find_java()
-    fj = tc.freerouting_jar(jar)
-    if not kpy:
-        return {"ok": False, "reason": "KiCad bundled Python not found"}
-    if not java:
-        return {"ok": False, "reason": "java not found (Freerouting needs a JRE/JDK)"}
-    if not fj:
-        return {"ok": False, "reason": "freerouting jar not found in server/tools or $FREEROUTING_JAR"}
+    Returns the resulting track count and unconnected count. A board newer
+    than the pcbnew install can read (one saved by the KiCad 11 API session)
+    is refused with {ok: False, reason}: route it with the board API tools."""
+    pre = _autoroute_preflight(pcb, jar)
+    if isinstance(pre, dict):
+        return pre
+    kpy, java, fj = pre
     guard = ipc.write_guard(pcb)
     if guard:
         return guard
@@ -242,7 +265,7 @@ def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
     # stub; report the unconnected count so the caller can re-run if it isn't zero.
     unconnected = None
     drc_note = None
-    if tc.board_cli():
+    if tc.board_cli(pcb):
         c = tc.drc_counts(pcb)
         unconnected = c["unconnected"] if "error" not in c else None
         drc_note = c.get("error")
@@ -303,8 +326,8 @@ def export_fab_package(pcb: str, out_dir: str = "", zip_name: str = "",
     JLCPCB format: BOM.csv (Comment/Designator/Footprint/LCSC Part #, grouped
     line items; per-component "lcsc"/"mpn" netlist keys are carried through)
     and CPL.csv (Designator/Mid X/Mid Y/Layer/Rotation). Requires kicad-cli
-    (the board install's, board_cli)."""
-    cli = tc.board_cli()
+    (the one of the KiCad that wrote the board, board_cli(pcb))."""
+    cli = tc.board_cli(pcb)
     if not cli:
         return {"ok": False, "reason": "kicad-cli not found; install KiCad."}
     out = out_dir or (str(Path(pcb).with_suffix("")) + "_gerbers")
@@ -334,11 +357,20 @@ def check_design_gates(pcb: str, netlist: str, stage: str = "placement") -> dict
     board edge, antenna keepout present if requested. stage="routed" (pre-CDR,
     G4): every net bound to an IPC net class must be routed at >= the class
     width. Returns {"passed": bool, "issues": [...]} — do NOT proceed to the next
-    pipeline stage while issues remain."""
+    pipeline stage while issues remain. A board newer than the pcbnew install
+    can read (one saved by the KiCad 11 API session): stage "routed" is then
+    judged on the board API instead (board_route_tools.routed_gate, same
+    shape, backend "api"); the other stages are refused with {ok: False, reason}."""
     kpy = tc.kicad_python()
     script = tc.TOOLS_DIR / "swig_gate_checks.py"
     if not kpy:
         return {"ok": False, "reason": "KiCad bundled Python (pcbnew) not found"}
+    refusal = tc.swig_readable(pcb)
+    if refusal:
+        if stage == "routed":
+            import board_route_tools
+            return board_route_tools.routed_gate(pcb, netlist)
+        return {"ok": False, "reason": refusal}
     if not script.is_file():
         return {"ok": False, "reason": f"missing {script}"}
     r = tc.run([kpy, str(script), stage, pcb, netlist], timeout=120)
@@ -362,6 +394,23 @@ def _stitch_baseline(pcb: str, bak: str) -> dict | None:
     return None
 
 
+def _stitch_preflight(pcb: str) -> tuple[str, Path] | dict:
+    """(kicad_python, emc_stitch.py) for add_ground_stitching, or the refusal
+    dict: no pcbnew Python, a board it cannot read (one saved by the KiCad 11
+    API session), or the script missing."""
+    kpy = tc.kicad_python()
+    if not kpy:
+        return {"ok": False, "reason": f"KiCad bundled Python (pcbnew) not found: "
+                                       f"{tc.kicad_python_error()}"}
+    refusal = tc.swig_readable(pcb)
+    if refusal:
+        return {"ok": False, "reason": refusal}
+    script = tc.TOOLS_DIR / "emc_stitch.py"
+    if not script.is_file():
+        return {"ok": False, "reason": f"missing {script}"}
+    return kpy, script
+
+
 def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.0,
                          er: float = 4.2, interior: bool = True,
                          via_diameter_mm: float = 0.6, via_drill_mm: float = 0.3) -> dict:
@@ -370,14 +419,12 @@ def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.
     path under the signal). Vias land only where they clear all non-GND copper and
     every hole, so the board stays DRC-clean. Pitch is lambda/20 at `max_freq_hz`
     (set it to your highest signal/RF frequency) or a 3 mm default. Run AFTER
-    autoroute_board, BEFORE export_fab_package. Runs under KiCad's bundled Python."""
-    kpy = tc.kicad_python()
-    if not kpy:
-        return {"ok": False, "reason": f"KiCad bundled Python (pcbnew) not found: "
-                                       f"{tc.kicad_python_error()}"}
-    script = tc.TOOLS_DIR / "emc_stitch.py"
-    if not script.is_file():
-        return {"ok": False, "reason": f"missing {script}"}
+    autoroute_board, BEFORE export_fab_package. Runs under KiCad's bundled Python;
+    a board that pcbnew cannot read (KiCad 11 format) is refused."""
+    pre = _stitch_preflight(pcb)
+    if isinstance(pre, dict):
+        return pre
+    kpy, script = pre
     if not Path(pcb).is_file():
         raise ValueError(f"PCB not found: {pcb}")
     guard = ipc.write_guard(pcb)
@@ -389,11 +436,11 @@ def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.
     # fails, restore the original board and report the open task.
     bak = pcb + ".prestitch"
     shutil.copyfile(pcb, bak)
-    cli = tc.board_cli()
+    cli = tc.board_cli(pcb)
     if cli:
-        refusal = _stitch_baseline(pcb, bak)
-        if refusal:
-            return refusal
+        baseline = _stitch_baseline(pcb, bak)
+        if baseline:
+            return baseline
     # emc_stitch.py argv: <pcb> <max_freq_hz> <mode> [gnd_net] [er] [via_dia_mm] [via_drill_mm]
     extra = [gnd_net, str(er), str(via_diameter_mm), str(via_drill_mm)]
     res: dict = {"ok": False}

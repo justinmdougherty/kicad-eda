@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "kicad-eda",
   "displayName": "KiCad EDA — Napkin to Gerbers",
-  "description": "Concept-to-Gerbers PCB design for KiCad 9/10. Two workflows: a fully HEADLESS gated pipeline (netlist.json -> schematic+ERC -> SWIG board build -> Freerouting -> DRC -> fab zip, with IEEE 15288.2-style self-remediating gates), and a GUI-assisted 10-stage flow. Bundles the kicad-generator MCP server, gate-reviewer subagents, IPC-2221/2141A rules math, the Freerouting 1.9 autorouter jar, and cross-platform guardrail hooks.",
+  "description": "Concept-to-Gerbers PCB design for KiCad 9/10/11. Two workflows: a fully HEADLESS gated pipeline (netlist.json -> schematic+ERC via the KiCad 11 API or the file writer -> SWIG board build -> routing by Claude on the KiCad 11 board API, Freerouting as the fallback -> DRC -> fab zip, with IEEE 15288.2-style self-remediating gates), and a GUI-assisted 10-stage flow. Bundles the kicad-generator MCP server, gate-reviewer and router subagents, IPC-2221/2141A rules math, the Freerouting 1.9 autorouter jar, and cross-platform guardrail hooks.",
   "version": "0.3.0",
   "author": {
     "name": "Justin Dougherty",
@@ -17,7 +17,7 @@
     "kicad_path": {
       "type": "directory",
       "title": "KiCad install path",
-      "description": "Optional: one more KiCad install root to add to auto-discovery. The plugin discovers every installed KiCad by itself and picks per job — the newest for schematics/ERC, the one with a bundled Python (pcbnew) for board builds and their DRC/Gerbers, the KiCad 11 nightly for the schematic API — so leave this blank unless KiCad lives somewhere unusual.",
+      "description": "Optional: one more KiCad install root to add to auto-discovery. The plugin discovers every installed KiCad by itself and picks per job — the newest for schematics/ERC, the one with a bundled Python (pcbnew) for board builds, the KiCad that wrote a board file for its DRC/Gerbers, the KiCad 11 nightly for the schematic and board APIs — so leave this blank unless KiCad lives somewhere unusual.",
       "required": false
     },
     "fab_profile": {

@@ -11,10 +11,16 @@ machine, probed once per process) and the rules are:
     imports pcbnew (pick_swig; KiCad 11 dropped the SWIG bindings) together
     with THAT install's footprint libraries, so board and libraries agree.
   * BOARD jobs (DRC, Gerbers, drill, pos, PNG render) use the kicad-cli of
-    that SAME install (board_cli / pick_board_cli): the stable release whose
-    pcbnew wrote the board also checks and exports it, so a nightly can never
-    change DRC semantics or Gerber output behind a stable-built board. Only
-    when no install has a pcbnew Python does board_cli fall back to the newest.
+    the KiCad that WROTE the board file (board_cli(pcb) / pick_board_cli(pcb)
+    read its `generator_version` header): a pcbnew-built board keeps its
+    stable release's DRC semantics and Gerber output, and a board saved by the
+    KiCad 11 API session (which KiCad 9/10 cannot load at all) is checked and
+    exported by kicad-cli 11. No install of that release -> the oldest install
+    that can read the file (a KiCad N cli reads files up to its own version);
+    none can -> the newest, and board_cli_note(pcb) says so. No file, or a
+    header that does not parse -> the pcbnew install, else the newest.
+  * SWIG board tools (Freerouting, gate checks, stitching) refuse a board
+    newer than the pcbnew install can read: swig_readable(pcb) is the reason.
   * symbol libraries come from the newest install (pick_cli).
 
 Also here: the subprocess helpers and the kicad-cli ERC / DRC report readers
@@ -25,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from collections import Counter
@@ -45,9 +52,18 @@ ERC_SUPPRESSED = frozenset({"exclusion", "ignore"})
 KICAD_CLI_POLICY = ("schematic jobs (ERC, SVG render) use the NEWEST installed kicad-cli: a file "
                     "written by KiCad N needs kicad-cli >= N and the API backend writes KiCad 11 "
                     "files; board jobs (DRC, Gerbers, drill, pos, PNG render) use the kicad-cli of "
-                    "the SAME install whose bundled Python (pcbnew) built the board, so a nightly "
-                    "never changes DRC semantics or fab output of a stable-built board; the newest "
-                    "kicad-cli is used for boards only when no install has a pcbnew Python")
+                    "the KiCad that WROTE the board file (its generator_version header): a "
+                    "pcbnew-built board keeps its stable release's DRC semantics and fab output, "
+                    "so a nightly never touches a stable-built board, and a board saved by the "
+                    "KiCad 11 API session is checked by kicad-cli 11; without that release the "
+                    "oldest kicad-cli that can read the file is used, and without a readable "
+                    "board file the pcbnew install's kicad-cli, else the newest")
+# A .kicad_pcb header -- (version N) (generator "pcbnew") (generator_version "9.0") -- sits
+# in the first few hundred bytes; this is how much of a board file board_file_info reads.
+HEADER_BYTES = 1024
+_HEADER_VERSION_RE = re.compile(r"\(version\s+(\d+)\s*\)")
+_HEADER_GENERATOR_RE = re.compile(r"\(generator\s+\"?([^\s\")]+)\"?\s*\)")
+_HEADER_GENERATOR_VERSION_RE = re.compile(r"\(generator_version\s+\"?([^\s\")]+)\"?\s*\)")
 
 
 # ----------------------------------------------------------------------------
@@ -60,19 +76,29 @@ def kicad_cli() -> str | None:
     return str(cli.kicad_cli) if cli else None
 
 
-def pick_board_cli() -> env.KiCadInstall | None:
-    """The install whose kicad-cli runs BOARD jobs: the one whose bundled
-    Python built the board (pick_swig), else the newest (pick_cli)."""
-    return env.pick_swig() or env.pick_cli()
+def pick_board_cli(pcb: str = "") -> env.KiCadInstall | None:
+    """The install whose kicad-cli runs BOARD jobs on `pcb`: the release that
+    WROTE the file (its generator_version header, "9.0" -> 9.0.4, "10.99" ->
+    the 11 nightly), else the oldest install that can read it, else the newest
+    (board_cli_note(pcb) explains). Without a pcb, or when its header does
+    not parse: the pcbnew install (pick_swig), else the newest (pick_cli)."""
+    return _choose_board_install(pcb)[0]
 
 
-def board_cli() -> str | None:
-    """BOARD kicad-cli (DRC, Gerbers, drill, pos, PNG render): the kicad-cli
-    shipped with the install whose pcbnew built the board, so check and
-    export semantics match the writer; the newest kicad-cli only when no
-    install has a pcbnew Python."""
-    inst = pick_board_cli()
+def board_cli(pcb: str = "") -> str | None:
+    """BOARD kicad-cli path (DRC, Gerbers, drill, pos, PNG render) for `pcb`:
+    the kicad-cli of the KiCad that wrote the file, so check and export
+    semantics match the writer (pick_board_cli has the fallbacks). None when
+    no KiCad is installed: install one or set KICAD_PATH."""
+    inst = pick_board_cli(pcb)
     return str(inst.kicad_cli) if inst else None
+
+
+def board_cli_note(pcb: str = "") -> str | None:
+    """Why board_cli(pcb) is a best-effort fallback (the file was written by a
+    KiCad newer than every installed kicad-cli), or None when the pick can
+    read the file. Surface it next to the job's result."""
+    return _choose_board_install(pcb)[1]
 
 
 def kicad_python() -> str | None:
@@ -123,6 +149,105 @@ def footprints_dir(explicit: str = "") -> str | None:
 def installs() -> list[dict]:
     """JSON view of every discovered install, newest first."""
     return [i.as_dict() for i in env.discover()]
+
+
+# ----------------------------------------------------------------------------
+# Board file headers: which KiCad wrote the file, and who can read it
+# ----------------------------------------------------------------------------
+def board_file_info(pcb: str) -> dict:
+    """{"format_version": int | None, "generator": str | None,
+    "generator_version": str | None} from the head of a .kicad_pcb, e.g.
+    20260901 / "pcbnew" / "10.99" for a board saved by the KiCad 11 API
+    session, 20241229 / "pcbnew" / "9.0" for one built by KiCad 9's pcbnew.
+    A missing, unreadable or unparsable file gives None for every field;
+    this never raises."""
+    head = _read_head(pcb)
+    version = _HEADER_VERSION_RE.search(head)
+    generator = _HEADER_GENERATOR_RE.search(head)
+    generator_version = _HEADER_GENERATOR_VERSION_RE.search(head)
+    return {"format_version": int(version.group(1)) if version else None,
+            "generator": generator.group(1) if generator else None,
+            "generator_version": generator_version.group(1) if generator_version else None}
+
+
+def _read_head(path: str) -> str:
+    """The first HEADER_BYTES of a file as text; '' when it cannot be read."""
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            return f.read(HEADER_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _writer_version(info: dict) -> tuple[int, int, int] | None:
+    """(major, minor, patch) of the KiCad that wrote a board, from
+    board_file_info's generator_version ("9.0" -> (9, 0, 0), "10.99" ->
+    (10, 99, 0)); None when the header has none or it does not parse."""
+    generator_version = info.get("generator_version")
+    vt = env.parse_version(str(generator_version)) if generator_version else (0, 0, 0)
+    return vt if vt != (0, 0, 0) else None
+
+
+def _release_matches(version: str, generator_version: str) -> bool:
+    """True when an install's `kicad-cli version` string is a release of the
+    writer's generator_version: "9.0.4" for "9.0", "10.99.0-4025-g.." for
+    "10.99" (token-safe: "10.9" never matches "10.99.0")."""
+    return (version == generator_version
+            or version.startswith(generator_version + ".")
+            or version.startswith(generator_version + "-"))
+
+
+def _choose_board_install(pcb: str) -> tuple[env.KiCadInstall | None, str | None]:
+    """(install, note) for a board job on `pcb`: the install of the release
+    that wrote the file, else the oldest install that can read it (a KiCad N
+    cli reads files up to its own version), else the newest with a note
+    saying it may fail. No pcb, or a header that does not parse: the pcbnew
+    install, else the newest (no note)."""
+    info = board_file_info(pcb) if pcb else {}
+    writer = _writer_version(info)
+    found = env.discover()
+    if writer is None or not found:
+        return env.pick_swig() or env.pick_cli(), None
+    generator_version = str(info["generator_version"])
+    same_release = [i for i in found if _release_matches(i.version, generator_version)]
+    if same_release:
+        return same_release[0], None
+    readers = [i for i in found if i.version_tuple >= writer]
+    if readers:
+        return min(readers, key=lambda i: i.version_tuple), None
+    newest = max(found, key=lambda i: i.version_tuple)
+    note = (f"{Path(pcb).name} was saved by KiCad {generator_version} "
+            f"(format {info['format_version']}) and no installed kicad-cli is that new; "
+            f"using the newest, KiCad {newest.version}, which may fail to load the board "
+            f"(install KiCad {generator_version} or newer)")
+    return newest, note
+
+
+def _release_label(vt: tuple[int, int, int]) -> str:
+    """The release a version belongs to: an x.99 nightly is the next major
+    ((10, 99, 0) -> "11"), anything else its major ((9, 0, 4) -> "9")."""
+    return str(vt[0] + 1) if vt[1] == 99 else str(vt[0])
+
+
+def swig_readable(pcb: str) -> str | None:
+    """The refusal reason when `pcb` was written by a KiCad release newer than
+    the pcbnew install (pick_swig) can load (KiCad 9/10's pcbnew cannot read
+    a board saved by the KiCad 11 API session), else None. Also None when the
+    header does not parse or no install has a pcbnew Python: the caller's
+    kicad_python check speaks for that case. Every SWIG-based board tool
+    returns the reason as {ok: False, reason}; the fix it names is to use the
+    board API tools (route_check / route_status) or a KiCad 9 GUI session."""
+    info = board_file_info(pcb)
+    writer = _writer_version(info)
+    swig = env.pick_swig()
+    if writer is None or swig is None or writer[:2] <= swig.version_tuple[:2]:
+        return None
+    return (f"{Path(pcb).name} was saved by KiCad {info['generator_version']} "
+            f"(format {info['format_version']}); KiCad {swig.version}'s pcbnew Python cannot "
+            f"read it -- use route_check / route_status for a KiCad {_release_label(writer)} "
+            f"board, or route in a KiCad {swig.version_tuple[0]} GUI session")
 
 
 # ----------------------------------------------------------------------------
@@ -235,23 +360,27 @@ def erc_json(sch: str, rpt: str, severity_error: bool = True) -> dict:
 
 
 def drc_counts(pcb: str) -> dict:
-    """Run kicad-cli DRC (error severity, board_cli) on a saved board and
-    summarize the JSON report: {errors, unconnected, types: {type: count},
-    report, kicad_cli}. When the report cannot be produced or parsed the dict
-    carries an `error` key (counts -1)."""
-    cli = board_cli()
-    if not cli:
+    """Run kicad-cli DRC (error severity) on a saved board with the kicad-cli
+    of the KiCad that wrote it (board_cli(pcb)) and summarize the JSON report:
+    {errors, unconnected, types: {type: count}, report, kicad_cli}, plus
+    `kicad_cli_note` when that cli is a fallback (board_cli_note). When the
+    report cannot be produced or parsed the dict carries an `error` key
+    (counts -1). Raises RuntimeError when no KiCad is installed."""
+    inst, note = _choose_board_install(pcb)
+    if inst is None:
         raise RuntimeError("kicad-cli not found; install KiCad.")
+    cli = str(inst.kicad_cli)
     rpt = str(Path(pcb).with_suffix("")) + "_drc.json"
     r = run([cli, "pcb", "drc", pcb, "--format", "json", "--severity-error",
              "-o", rpt], timeout=KICAD_CLI_TIMEOUT_S)
+    base = {"report": rpt, "kicad_cli": cli, **({"kicad_cli_note": note} if note else {})}
     try:
         d = json.loads(Path(rpt).read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        return {"errors": -1, "unconnected": -1, "types": {}, "report": rpt, "kicad_cli": cli,
+        return {"errors": -1, "unconnected": -1, "types": {}, **base,
                 "error": f"DRC report unreadable ({e}): {(r.stdout + r.stderr)[-600:]}"}
     violations = d.get("violations", [])
     return {"errors": len(violations),
             "unconnected": len(d.get("unconnected_items", [])),
             "types": dict(Counter(v.get("type", "unknown") for v in violations)),
-            "report": rpt, "kicad_cli": cli}
+            **base}

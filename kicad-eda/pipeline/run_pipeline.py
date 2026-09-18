@@ -32,10 +32,11 @@ import remediate               # noqa: E402
 import thermal_check           # noqa: E402
 
 
-def _board_cli() -> str:
-    """The kicad-cli for BOARD jobs: the install whose pcbnew built the board
-    (toolchain.board_cli), never a newer nightly's. Loud when absent."""
-    cli = tc.board_cli()
+def _board_cli(pcb: str) -> str:
+    """The kicad-cli for BOARD jobs on `pcb`: the one of the KiCad that wrote
+    the file (toolchain.board_cli: the pcbnew install for a SWIG-built board,
+    never a newer nightly's). Loud when absent."""
+    cli = tc.board_cli(pcb)
     if not cli:
         raise RuntimeError("kicad-cli not found; install KiCad or set KICAD_PATH")
     return cli
@@ -43,7 +44,7 @@ def _board_cli() -> str:
 
 def _drc(pcb: str) -> dict:
     rpt = str(Path(pcb).with_suffix("")) + "_drc.json"
-    cli = _board_cli()
+    cli = _board_cli(pcb)
     subprocess.run([cli, "pcb", "drc", pcb, "--severity-error",
                     "-o", rpt, "--format", "json"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
     d = json.loads(Path(rpt).read_text())
@@ -152,7 +153,7 @@ def _render(pcb: str, tag: str, quality: str = "basic") -> list:
     visual record (placement view at G3, final board at G5)."""
     out = []
     base = str(Path(pcb).with_suffix(""))
-    cli = _board_cli()
+    cli = _board_cli(pcb)
     for side in ("top", "bottom"):
         png = f"{base}_{tag}_{side}.png"
         try:

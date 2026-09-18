@@ -16,6 +16,7 @@ You are the lead. At each gate, hand the review to the matching subagent and act
 - **Stage 2 (Parts):** delegate selection to the `parts-selector` subagent.
 - **Stages 4–5 (ERC / CDR):** delegate to the `erc-reviewer` subagent.
 - **Stage 7 (Placement):** delegate to the `placement-reviewer` subagent before any routing.
+- **Stage 8 (Routing):** delegate the route / `route_check` / repair loop to the `router` subagent (agent routing through the board API; Freerouting only as the KiCad 9 format fallback).
 - **Stage 9 (DRC):** delegate to the `drc-reviewer` subagent.
 - **Stage 10 (Fab):** delegate to the `fab-checker` subagent.
 
@@ -32,8 +33,9 @@ The live PCB stages (6–10) require KiCad (9/10 today; 11 nightly for the API p
 | 6 | `create_pcb(pcb, sch="", overwrite=False)` | creates an empty `.kicad_pcb` headlessly (KiCad's bundled Python); if THIS file is already open in Pcbnew it reports the live board instead of creating anything |
 | 6–9 | `test_kicad_connection()` | MANDATORY gate: `ipc_connected`, `kicad_version`, `open_documents[{type, path}]`, `capabilities{schematic_api, place_footprint_from_library, import_netlist}` |
 | 7 | `add_footprints_batch(footprints=[{ref, x, y, rot?}])` / `move_footprint(ref, x, y, rot)` / `add_footprint_to_pcb(ref, lib_id, x, y, rot)`; `validate_placement()` / `get_pcb_summary()` / `get_footprint_pads(ref)` / `remove_footprint(ref)` | position footprints ALREADY on the board (F8 puts them there); `add_footprint_to_pcb` only moves an existing one on KiCad 9/10; `validate_placement` takes no arguments |
-| 8 | `autoroute_board(pcb, max_passes=100, jar="", route_timeout=300)` / `add_ground_stitching(pcb, gnd_net, max_freq_hz, er, interior, via_diameter_mm, via_drill_mm)` | headless Freerouting, then a DRC-safe GND via fence; the board file must be CLOSED in the editor |
-| 8 | `add_trace(net_name, layer, x1, y1, x2, y2, width)` / `add_via(net_name, x, y, drill, diameter)` / `add_copper_zone(net_name, layer, polygon)` / `register_net(net_name)` | targeted manual copper over IPC |
+| 8 | **Agent routing (default):** `open_board(pcb, mode="auto")` / `board_overview(pcb)` / `board_pads(pcb, net="", ref="")` / `unrouted_connections(pcb, net="", with_obstacles=True, clearance=0)` → `route_net(pcb, net, path, width=0, allow_narrow=False, via_diameter=0, via_drill=0)` / `add_vias(pcb, net, points, diameter=0, drill=0)` / `remove_routing(pcb, net="", ids=[])` → `route_check(pcb, refill=True, save=True, max_items=40)` → `route_status(pcb, netlist="")`; `save_board(pcb)` / `close_board(pcb, save=True)` / `list_open_boards()` | you route, net by net, through KiCad's board API (`agent-routing` skill; delegate to the `router` subagent): `path` = polylines `{layer, points: [[x, y], ...], width?}` joined by `{via: [x, y]}` elements, mm; `route_check` refills zones, saves and runs real kicad-cli DRC (`violations[*].items[*]{description, x, y}`); `route_status.passed` is the Stage 8 gate. Headless (KiCad 11 nightly — the saved file becomes a **KiCad 11 board** that KiCad 9/10 and the SWIG tools cannot read) or live in the open PCB editor (`mode: "gui"`, keeps that KiCad's format). Every response: `ok`, `backend: "api"`, `mode` |
+| 8 | `autoroute_board(pcb, max_passes=100, jar="", route_timeout=300)` / `add_ground_stitching(pcb, gnd_net, max_freq_hz, er, interior, via_diameter_mm, via_drill_mm)` | fallback: headless Freerouting, then a DRC-safe GND via fence; the board file must be CLOSED in the editor and in **KiCad 9 format** (both refuse a board saved by the KiCad 11 session) |
+| 8 | `add_trace(net_name, layer, x1, y1, x2, y2, width)` / `add_via(net_name, x, y, drill, diameter)` / `add_copper_zone(net_name, layer, polygon)` / `register_net(net_name)` | targeted manual copper over IPC in the open editor (a pour outline, a thermal via array); for routing use `route_net` |
 | 9 | `drc_pcb(pcb, fab_profile="")` | real kicad-cli DRC: `{ok, errors, unconnected, types, report, profile, note?}` |
 | 10 | `export_gerbers(pcb, out_dir)` / `export_fab_package(pcb, out_dir, zip_name, netlist)` / `render_pcb(pcb, side)`; `server_status()` | kicad-cli on the SAVED file; `server_status` reports kicad-cli, bundled Python, Java/Freerouting, IPC, open documents, capabilities |
 
@@ -962,7 +964,7 @@ When using the Cowork environment (browser-based):
 
 > **MANDATORY FIRST STEP:** Before calling ANY IPC tool, call `test_kicad_connection()`. It returns `ipc_connected`, `kicad_version`, `open_documents` (`[{type: "pcb"|"schematic"|"project"|"other", path}]`) and `capabilities` (`schematic_api`, `place_footprint_from_library`, `import_netlist` — true only on KiCad 11+; a nightly reports 10.99). If `ipc_connected` is false, STOP and tell the user to open the board in Pcbnew with **Preferences > API > Enable KiCad API server** turned on. The IPC tools (`add_footprint_to_pcb`, `add_footprints_batch`, `move_footprint`, `remove_footprint`, `get_pcb_summary`, `validate_placement`, `get_footprint_pads`, `register_net`, `add_trace`, `add_via`, `add_copper_zone`) return `ipc_connected: false` otherwise — there is no other path for live board edits.
 
-**Tools that do NOT need KiCad running:** `create_pcb` (KiCad's bundled Python), `drc_pcb`, `render_pcb`, `export_gerbers`, `export_fab_package` (kicad-cli on the saved file), and the headless `autoroute_board` / `add_ground_stitching` — which REQUIRE the board to be closed in the editor (hard rule above). All schematic tools also work without KiCad running.
+**Tools that do NOT need KiCad running:** `create_pcb` (KiCad's bundled Python), `drc_pcb`, `render_pcb`, `export_gerbers`, `export_fab_package` (kicad-cli on the saved file), the agent-routing tools (`open_board` … `route_status`: a private headless KiCad 11 when the board is not open in a GUI — its save writes a KiCad 11 file), and the headless `autoroute_board` / `add_ground_stitching` — which REQUIRE the board to be closed in the editor (hard rule above). All schematic tools also work without KiCad running.
 
 **Typical PCB session workflow (KiCad 9/10):**
 ```
@@ -971,7 +973,7 @@ When using the Cowork environment (browser-based):
 3. test_kicad_connection()            ← MANDATORY: ipc_connected true, the board listed in open_documents
 4. add_footprints_batch([...])        ← positions the footprints F8 imported (IPC, live in the editor)
 5. validate_placement()               ← then the placement-reviewer gate; user saves (Ctrl+S) in Pcbnew
-6. Routing: user closes the board → autoroute_board(pcb) → reopens; or routes in the interactive router
+6. Routing: route_net / route_check / route_status live in the open editor (router subagent, mode "gui"; keeps the KiCad 9/10 file format) — or user closes the board → autoroute_board(pcb) → reopens; or routes in the interactive router
 7. drc_pcb(pcb) → export_fab_package(pcb) / export_gerbers(pcb)      ← on the SAVED file
 ```
 
@@ -1304,10 +1306,11 @@ All footprints placed. `validate_placement` passes (or remaining warnings are do
 
 Convert every ratsnest line into a physical copper trace. Routing is where signal integrity, power delivery, and EMC performance are realized or destroyed. A clean route follows naturally from good placement — if routing is fighting you, go back and fix placement first.
 
-### Two Ways to Route
+### Three Ways to Route
 
-- **Headless:** the user saves and CLOSES the board in Pcbnew; you call `autoroute_board(pcb, max_passes, jar, route_timeout)` (Freerouting via Specctra DSN/SES, zones refilled; returns `tracks` and `unconnected` — re-run until `unconnected` is 0), optionally `add_ground_stitching(pcb, ...)`; the user reopens the board. Both refuse to run while the file is open in the editor.
-- **Interactive:** the user routes in Pcbnew's router (below). `add_trace` / `add_via` / `add_copper_zone` are for targeted manual copper only (a specific stub, a thermal via array, a pour outline) — `register_net(net_name)` first to confirm the net exists. Never try to route a board segment by segment through them.
+- **Agent routing (default):** you route the board yourself through KiCad's board API — load the `agent-routing` skill and delegate the loop to the `router` subagent. `board_overview(pcb)` (layers, planes, rules, net classes) and `unrouted_connections(pcb)` (every missing link with the foreign copper near its straight line) give the work list; `route_net(pcb, net, path)` lays polylines and vias in mm following the rules in Steps 1–9 below (exit along the pad's long axis, 45° bends, class width, plane nets by a short stub + via into the In1/In2 planes, never a track over foreign copper); `route_check(pcb)` refills the zones, saves and runs kicad-cli DRC — read every violation's `items[*]{description, x, y}`, `remove_routing(pcb, net=...)` the offender and re-route, 3–6 nets per batch, until `ok`; `route_status(pcb, netlist)` `passed` is this stage's gate. Two session modes: a board **open in the running PCB editor** with its API server enabled is routed in place (`mode: "gui"`, the file keeps that KiCad's format — KiCad 9 included); otherwise the server launches a **headless KiCad 11** with the file preloaded — its first save turns the file into a **KiCad 11 board** that KiCad 9/10, their kicad-cli/pcbnew and every SWIG tool (`autoroute_board`, `check_design_gates`, `add_ground_stitching`) can no longer read (DRC / Gerbers / render still work: `board_cli` picks kicad-cli 11 from the file header). Tell the user that before the first `route_check`, and copy the file first if Freerouting must stay an option.
+- **Freerouting (fallback, KiCad 9 format only):** the user saves and CLOSES the board in Pcbnew; you call `autoroute_board(pcb, max_passes, jar, route_timeout)` (Freerouting via Specctra DSN/SES, zones refilled; returns `tracks` and `unconnected` — re-run until `unconnected` is 0), optionally `add_ground_stitching(pcb, ...)`; the user reopens the board. Both refuse to run while the file is open in the editor, and both refuse a board saved by the KiCad 11 session.
+- **Interactive:** the user routes in Pcbnew's router (Step 2 below). `add_trace` / `add_via` / `add_copper_zone` are for targeted manual copper only (a specific stub, a thermal via array, a pour outline) — `register_net(net_name)` first to confirm the net exists. Never try to route a board segment by segment through them; `route_net` is the tool for that.
 
 ### Step 1: Routing Sequence
 

@@ -1,12 +1,18 @@
 """Guarded import of the vendored kicad-python (kipy) plus the enum tables the
-schematic backend needs.
+schematic and board backends need.
 
 ``backends/__init__.py`` has already put ``server/vendor`` first on sys.path.
 When kipy or one of its runtime deps (protobuf, pynng, zstandard, ...) is
 missing this module still imports: ``IMPORT_ERROR`` holds the reason and
-``require()`` turns it into a SchematicApiError that says what to install.
-Every other backend module reaches kipy through this one, so a broken install
-is reported once and clearly instead of as an ImportError inside a tool call.
+``require()`` turns it into a SchematicApiError (or the error class the
+caller passes, e.g. BoardApiError) that says what to install. Every other
+backend module reaches kipy through this one, so a broken install is
+reported once and clearly instead of as an ImportError inside a tool call.
+
+Importing this module also routes every headless ``kipy.KiCad(headless=True)``
+through ``backends.headless_server.GuardedKiCadServer`` (stdin detached, the
+child tied to this process on Windows), so a killed MCP host never leaves a
+``kicad-cli api-server`` behind.
 """
 from __future__ import annotations
 
@@ -15,23 +21,38 @@ from backends.errors import SchematicApiError
 IMPORT_ERROR: str | None = None
 try:
     from kipy import KiCad
+    from kipy.board import Board
+    from kipy.board_types import (ArcTrack, BoardArc, BoardCircle, BoardLayer, BoardPolygon,
+                                  BoardRectangle, BoardSegment, FootprintInstance, Net, Pad,
+                                  PadStackShape, PadStackType, PadType, Track, Via, Zone)
     from kipy.errors import ApiError, LibraryCommandError
     from kipy.errors import ConnectionError as KiCadConnectionError
     from kipy.geometry import Vector2
     from kipy.kicad import LibraryLoadStatus
+    from kipy.proto.common import ApiStatusCode
     from kipy.proto.common.types.base_types_pb2 import DocumentType, ElectricalPinType
     from kipy.proto.schematic import schematic_jobs_pb2
     from kipy.schematic import Schematic
+    from kipy.util import board_layer as board_layers
+    from kipy.util.units import from_mm, to_mm
     import kipy.common_types as ct
     import kipy.schematic_types as st
+    from backends import headless_server
+    headless_server.install()
 except Exception as exc:  # noqa: BLE001 - any failure means "no API backend"; the reason is kept
     IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
-# re-exported for the other backend modules (kb.DocumentType, kb.st, ...)
+# re-exported for the other backend modules (kb.DocumentType, kb.st, kb.Track, ...)
 __all__ = ["IMPORT_ERROR", "INSTALL_HINT", "KIPY_EXCEPTIONS", "ORIENT_TO_DEG", "DEG_TO_ORIENT",
            "PIN_TYPE_NAMES", "require", "vec", "label_shape", "KiCad", "ApiError",
-           "LibraryCommandError", "KiCadConnectionError", "Vector2", "LibraryLoadStatus",
-           "DocumentType", "ElectricalPinType", "schematic_jobs_pb2", "Schematic", "ct", "st"]
+           "ApiStatusCode", "LibraryCommandError", "KiCadConnectionError", "Vector2",
+           "LibraryLoadStatus",
+           "DocumentType", "ElectricalPinType", "schematic_jobs_pb2", "Schematic", "ct", "st",
+           # board API (server/backends/pcb_*.py)
+           "Board", "BoardLayer", "Track", "ArcTrack", "Via", "Pad", "Net", "Zone",
+           "FootprintInstance", "BoardSegment", "BoardRectangle", "BoardArc", "BoardCircle",
+           "BoardPolygon", "PadType", "PadStackType", "PadStackShape", "from_mm", "to_mm",
+           "board_layers"]
 
 INSTALL_HINT = ("install the runtime deps of the vendored kipy with "
                 "`pip install -r server/requirements.txt` (protobuf, pynng, jsonschema, "
@@ -39,14 +60,15 @@ INSTALL_HINT = ("install the runtime deps of the vendored kipy with "
                 "server/vendor/kipy")
 
 
-def require() -> None:
-    """Raise a SchematicApiError when kipy could not be imported."""
+def require(error: type[Exception] = SchematicApiError) -> None:
+    """Raise ``error`` (SchematicApiError by default; the board backend passes
+    BoardApiError) when kipy could not be imported."""
     if IMPORT_ERROR:
-        raise SchematicApiError(f"vendored kipy is not importable ({IMPORT_ERROR}); {INSTALL_HINT}")
+        raise error(f"vendored kipy is not importable ({IMPORT_ERROR}); {INSTALL_HINT}")
 
 
 # Exceptions a kipy call can raise; a backend method wraps these into
-# SchematicApiError with context about what it was doing.
+# SchematicApiError / BoardApiError with context about what it was doing.
 if IMPORT_ERROR is None:
     KIPY_EXCEPTIONS: tuple[type[BaseException], ...] = (
         ApiError, KiCadConnectionError, LibraryCommandError, TimeoutError, OSError, ValueError)
@@ -80,13 +102,13 @@ else:
     ORIENT_TO_DEG, DEG_TO_ORIENT, PIN_TYPE_NAMES = {}, {}, {}
 
 
-def vec(x_mm: float, y_mm: float):
+def vec(x_mm: float, y_mm: float) -> Vector2:
     """A kipy Vector2 from millimetres, rounded to the nearest nanometre
     (Vector2.from_xy_mm truncates, which can put a wire end 1 nm off a pin)."""
     return Vector2.from_xy(int(round(x_mm * 1_000_000)), int(round(y_mm * 1_000_000)))
 
 
-def label_shape(name: str):
+def label_shape(name: str) -> int:
     """SchematicLabelShape value for a short name ('passive', 'input', ...)."""
     key = f"SLSH_{name.upper()}"
     try:

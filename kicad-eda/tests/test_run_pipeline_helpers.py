@@ -160,7 +160,7 @@ def test_drc_runs_the_board_cli_and_records_it(tmp_path, monkeypatch):
             {"violations": [{"type": "clearance"}], "unconnected_items": [{}]}), encoding="utf-8")
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-    monkeypatch.setattr(tc, "board_cli", lambda: "S:/9.0/kicad-cli.exe")
+    monkeypatch.setattr(tc, "board_cli", lambda pcb="": "S:/9.0/kicad-cli.exe")
     monkeypatch.setattr(tc, "kicad_cli", lambda: "N:/10.99/kicad-cli.exe")
     monkeypatch.setattr(rp.subprocess, "run", fake_run)
     monkeypatch.chdir(tmp_path)
@@ -177,7 +177,7 @@ def test_render_runs_the_board_cli(tmp_path, monkeypatch):
         calls.append(list(args))
         return type("R", (), {"returncode": 1, "stdout": "", "stderr": "no"})()
 
-    monkeypatch.setattr(tc, "board_cli", lambda: "S:/9.0/kicad-cli.exe")
+    monkeypatch.setattr(tc, "board_cli", lambda pcb="": "S:/9.0/kicad-cli.exe")
     monkeypatch.setattr(rp.subprocess, "run", fake_run)
     assert rp._render(str(tmp_path / "b.kicad_pcb"), "final") == []
     assert [c[0] for c in calls] == ["S:/9.0/kicad-cli.exe"] * 2
@@ -185,7 +185,7 @@ def test_render_runs_the_board_cli(tmp_path, monkeypatch):
 
 
 def test_drc_and_render_are_loud_without_a_kicad_cli(monkeypatch):
-    monkeypatch.setattr(tc, "board_cli", lambda: None)
+    monkeypatch.setattr(tc, "board_cli", lambda pcb="": None)
     with pytest.raises(RuntimeError, match="kicad-cli not found"):
         rp._drc("b.kicad_pcb")
     with pytest.raises(RuntimeError, match="kicad-cli not found"):
