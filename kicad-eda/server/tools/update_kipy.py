@@ -20,7 +20,10 @@ checkout it is given (it works on a copy):
   6. restore the tracked kipy/proto/**/__init__.py (the re-export shims)
   7. write kipy/kicad_api_version.py = "unknown" (no submodule to describe;
      "unknown" disables kipy's version check instead of tripping it)
-  8. copy kipy/ to --dest (default server/vendor/kipy), LICENSE to
+  8. apply the local source fixes in KIPY_PATCHES (idempotent; a fix that no
+     longer applies because upstream changed the code is an error, never a
+     silent drop)
+  9. copy kipy/ to --dest (default server/vendor/kipy), LICENSE to
      kipy-LICENSE, and refresh the origin block in server/vendor/README.md
 
 Usage:
@@ -61,6 +64,30 @@ _REF_RE = re.compile(r"(?<![\w.])(common|board|schematic)\.((?:\w+\.)*\w+_pb2)\b
 
 class UpdateError(RuntimeError):
     """A recipe step failed; the message says which and why."""
+
+
+@dataclass(frozen=True)
+class SourcePatch:
+    """An exact-text fix to an upstream kipy file, re-applied on every refresh
+    so re-vendoring never silently drops it. ``old`` / ``new`` are written
+    with LF line endings and matched in the file's own line-ending style."""
+    path: str          # relative to the kipy package dir
+    old: str
+    new: str
+    why: str
+
+
+KIPY_PATCHES: tuple[SourcePatch, ...] = (
+    SourcePatch(
+        path="kicad.py",
+        old='if type == LibraryTableScope.LTS_BOTH:\n'
+            '            raise ValueError("LTS_BOTH is not valid for reload_library")',
+        new='if scope == LibraryTableScope.LTS_BOTH:\n'
+            '            raise ValueError("LTS_BOTH is not valid for reload_library")',
+        why="KiCad.reload_library compared `type` with LTS_BOTH instead of `scope`: "
+            "LT_DESIGN_BLOCK == LTS_BOTH == 3, so a design-block reload was refused "
+            "and scope=LTS_BOTH went to KiCad unvalidated"),
+)
 
 
 @dataclass(frozen=True)
@@ -243,7 +270,45 @@ def write_version_file(kipy_dir: Path, value: str = API_VERSION_VALUE) -> None:
 
 
 # ----------------------------------------------------------------------------
-# 8. install into server/vendor
+# 8. local source fixes
+# ----------------------------------------------------------------------------
+def apply_patches(kipy_dir: Path,
+                  patches: tuple[SourcePatch, ...] = KIPY_PATCHES) -> list[str]:
+    """Apply each patch to the kipy package in ``kipy_dir`` in place.
+
+    Idempotent: a file that already carries ``new`` (and not ``old``) is left
+    alone. Line endings are preserved. Returns one ``"<path>: patched"`` or
+    ``"<path>: already patched"`` line per patch. Raises UpdateError when the
+    file is missing or ``old`` does not occur exactly once: upstream changed
+    that code, so check whether it fixed the bug itself and update or drop
+    the patch instead of vendoring the regression."""
+    done: list[str] = []
+    for patch in patches:
+        path = kipy_dir / patch.path
+        if not path.is_file():
+            raise UpdateError(f"cannot apply the {patch.path} patch: {path} is missing")
+        with path.open(encoding="utf-8", newline="") as f:     # keep the file's line endings
+            text = f.read()
+        nl = "\r\n" if "\r\n" in text else "\n"
+        old, new = patch.old.replace("\n", nl), patch.new.replace("\n", nl)
+        n_old, n_new = text.count(old), text.count(new)
+        if n_old == 0 and n_new == 1:
+            done.append(f"{patch.path}: already patched")
+            continue
+        if n_old != 1:
+            raise UpdateError(
+                f"the {patch.path} patch no longer applies ({n_old} matches of the "
+                f"upstream text, {n_new} of the fixed text); upstream changed this code. "
+                f"Check whether it fixed the bug itself ({patch.why}) and update or "
+                f"drop the entry in KIPY_PATCHES")
+        with path.open("w", encoding="utf-8", newline="") as f:
+            f.write(text.replace(old, new))
+        done.append(f"{patch.path}: patched")
+    return done
+
+
+# ----------------------------------------------------------------------------
+# 9. install into server/vendor
 # ----------------------------------------------------------------------------
 def install_vendor(checkout: Path, dest: Path) -> None:
     kipy_src = checkout / "kipy"
@@ -295,6 +360,8 @@ def run(args: argparse.Namespace, work: Path) -> Origin:
     changed = rewrite_imports(checkout / "kipy" / "proto")
     _log(f"import rewrite touched {changed} generated files")
     write_version_file(checkout / "kipy")
+    for line in apply_patches(checkout / "kipy"):
+        _log(line)
     install_vendor(checkout, args.dest)
     origin = Origin(kicad_python_commit=checkout_commit(checkout),
                     kicad_python_version=checkout_version(checkout),

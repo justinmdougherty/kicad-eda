@@ -96,6 +96,230 @@ def test_route_hash_of_empty_design_is_well_defined():
     assert rp._route_hash({}) == rp._route_hash({"components": []})
 
 
+# --- the route-hash registry ------------------------------------------------------
+
+def test_route_hash_registry_lists_the_keys_that_move_copper():
+    design_keys = set(rp.ROUTE_HASH_DESIGN_KEYS)
+    assert {"planes", "stackup", "thermal.ep_vias_min", "copper_layers"} <= design_keys
+    assert {"edge_row", "overhang", "at"} <= set(rp.ROUTE_HASH_COMPONENT_KEYS)
+    # deliberately excluded: they never move copper (the G3/G4 gates re-run on a
+    # cached board anyway), so they must never appear in the registry
+    assert "height_zones" not in design_keys and "thermal" not in design_keys
+    assert not set(rp.ROUTE_HASH_EXCLUDED) & design_keys
+    assert {"height_zones", "thermal"} <= set(rp.ROUTE_HASH_EXCLUDED)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d.__setitem__("planes", {"In2.Cu": "VBAT"}),
+    lambda d: d.__setitem__("stackup", {"h": 0.2, "er": 4.2}),
+    lambda d: d["components"][3].__setitem__("edge_row", True),
+    lambda d: d["components"][3].__setitem__("overhang", 7.0),
+    lambda d: d.__setitem__("thermal", {"ep_vias_min": 6}),
+    lambda d: d["components"][3].__setitem__("at", [10.0, 12.0, 90]),
+    lambda d: d.__setitem__("copper_layers", 2),
+], ids=["planes", "stackup", "edge_row", "overhang", "thermal.ep_vias_min", "at",
+        "copper_layers"])
+def test_route_hash_changes_when_a_registry_key_changes(hat_design, mutate):
+    assert _hash_after(hat_design, mutate) != rp._route_hash(hat_design)
+
+
+def test_route_hash_sees_only_ep_vias_min_of_the_thermal_block(hat_design):
+    base = copy.deepcopy(hat_design)
+    base["thermal"] = {"t_ambient": 25, "tj_margin": 0.8, "ep_vias_min": 6}
+    h = rp._route_hash(base)
+    assert _hash_after(base, lambda d: d["thermal"].__setitem__("t_ambient", 85)) == h
+    assert _hash_after(base, lambda d: d["thermal"].__setitem__("tj_margin", 0.7)) == h
+    assert _hash_after(base, lambda d: d["thermal"].__setitem__("ep_vias_min", 9)) != h
+    assert _hash_after(base, lambda d: d.pop("thermal")) != h
+
+
+@pytest.mark.parametrize("key", rp.ROUTE_HASH_EXCLUDED)
+def test_route_hash_ignores_every_excluded_key(hat_design, key):
+    assert _hash_after(hat_design, lambda d: d.__setitem__(key, {"changed": key})) == \
+        rp._route_hash(hat_design)
+
+
+@pytest.mark.parametrize("thermal", [None, "junk", 3, []])
+def test_route_hash_tolerates_a_malformed_thermal_block(thermal):
+    assert rp._route_hash({"thermal": thermal}) == rp._route_hash({})
+
+
+def test_route_hash_moves_with_the_new_keys_on_real_examples(load_design):
+    node = load_design("esp32c3_env_node")
+    i = next(i for i, c in enumerate(node["components"]) if c["ref"] == "U1")
+    assert node["components"][i]["edge_row"] is True and node["components"][i]["overhang"] == 7.0
+    assert _hash_after(node, lambda d: d["components"][i].__setitem__("overhang", 5.0)) != \
+        rp._route_hash(node)
+    assert _hash_after(node, lambda d: d["components"][i].pop("edge_row")) != \
+        rp._route_hash(node)
+    coupon = load_design("rf_coupon_50r")
+    assert _hash_after(coupon, lambda d: d["stackup"].__setitem__("er", 3.5)) != \
+        rp._route_hash(coupon)
+
+
+# --- command line ------------------------------------------------------------------
+
+@pytest.mark.parametrize("argv, expected", [
+    (["n.json"], rp.CliArgs("n.json", None, None, "")),
+    (["n.json", "30", "40"], rp.CliArgs("n.json", 30.0, 40.0, "")),
+    (["n.json", "30", "40.5", "p.json"], rp.CliArgs("n.json", 30.0, 40.5, "p.json")),
+    (["n.json", "30", "40", "-"], rp.CliArgs("n.json", 30.0, 40.0, "")),
+    (["n.json", "30", "40", ""], rp.CliArgs("n.json", 30.0, 40.0, "")),
+    (["n.json", "p.json"], rp.CliArgs("n.json", None, None, "p.json")),
+    (["n.json", "-"], rp.CliArgs("n.json", None, None, "")),
+])
+def test_parse_cli_accepts(argv, expected):
+    assert rp.parse_cli(argv) == expected
+
+
+@pytest.mark.parametrize("argv, message", [
+    ([], "missing <netlist.json>"),
+    (["n.json", "30"], "give both <board_w> and <board_h>, or neither"),
+    (["n.json", "30", "p.json"], "give both <board_w> and <board_h>, or neither"),
+    (["n.json", "0", "40"], "board_w must be a positive number of mm, got '0'"),
+    (["n.json", "30", "-5"], "board_h must be a positive number of mm, got '-5'"),
+    (["n.json", "nan", "40"], "board_w must be a positive number of mm, got 'nan'"),
+    (["n.json", "30", "40", "p.json", "extra"], "unexpected argument(s): extra"),
+    (["n.json", "p.json", "extra"], "unexpected argument(s): extra"),
+])
+def test_parse_cli_rejects(argv, message):
+    with pytest.raises(rp.UsageError) as err:
+        rp.parse_cli(argv)
+    assert str(err.value) == message
+
+
+AUTO = {"components": [{"ref": "R1", "footprint": "R:R"}, {"ref": "R2", "footprint": "R:R"}]}
+FIXED = {"components": [{"ref": "R1", "x": 1, "y": 2}, {"ref": "R2", "at": [5, 5, 0]}]}
+
+
+def test_board_dims_prefers_the_command_line():
+    assert rp.board_dims({**FIXED, "board": {"w": 9, "h": 9}}, 30.0, 40.0) == \
+        (30.0, 40.0, "command line")
+
+
+def test_board_dims_falls_back_to_the_board_block():
+    assert rp.board_dims({**AUTO, "board": {"w": 65, "h": 56.5}}, None, None) == \
+        (65.0, 56.5, "netlist board block")
+
+
+def test_board_dims_auto_sized_board_gets_the_builder_default():
+    w, h, source = rp.board_dims(AUTO, None, None)
+    assert (w, h) == rp.AUTO_BOARD_DIMS == (50.0, 25.0)
+    assert "auto" in source
+
+
+def test_board_dims_full_placement_without_a_size_is_a_clear_error():
+    with pytest.raises(rp.UsageError, match=r'every component has a fixed position.*"board"'):
+        rp.board_dims(FIXED, None, None)
+
+
+def test_board_dims_counts_placement_file_refs_as_fixed():
+    assert rp.board_dims(AUTO, None, None, frozenset({"R1"}))[:2] == rp.AUTO_BOARD_DIMS
+    with pytest.raises(rp.UsageError, match="fixed position"):
+        rp.board_dims(AUTO, None, None, frozenset({"R1", "R2"}))
+
+
+def test_board_dims_outline_only_board_block_is_left_to_the_builder():
+    dims = rp.board_dims({**FIXED, "board": {"outline": {"loop": [[0, 0], [9, 0], [9, 9]]}}},
+                         None, None)
+    assert dims[:2] == rp.AUTO_BOARD_DIMS
+
+
+@pytest.mark.parametrize("board", [{"w": "wide", "h": 10}, {"w": 10}, {"w": -1, "h": 5}])
+def test_board_dims_rejects_a_malformed_board_block(board):
+    with pytest.raises(rp.UsageError, match="board block"):
+        rp.board_dims({**AUTO, "board": board}, None, None)
+
+
+@pytest.fixture
+def fake_run(monkeypatch):
+    calls = []
+
+    def run(netlist, w, h, placement=""):
+        calls.append((netlist, w, h, placement))
+        return {"PASS": len(calls) == 1, "gates": [], "gate_summary": "[PASS] G1"}
+
+    monkeypatch.setattr(rp, "run", run)
+    return calls
+
+
+def _netlist(tmp_path, design: dict) -> str:
+    path = tmp_path / "netlist.json"
+    path.write_text(json.dumps(design), encoding="utf-8")
+    return str(path)
+
+
+def test_main_without_dims_uses_the_board_block(tmp_path, fake_run, capsys):
+    netlist = _netlist(tmp_path, {**FIXED, "board": {"w": 65, "h": 56.5}})
+    assert rp.main([netlist]) == 0
+    assert fake_run == [(netlist, 65.0, 56.5, "")]
+    out = capsys.readouterr()
+    assert json.loads(out.out)["PASS"] is True
+    assert "board 65.0 x 56.5 mm (netlist board block)" in out.err
+    assert out.err.rstrip().endswith("[PASS] G1")
+
+
+def test_main_without_dims_on_an_auto_board_uses_the_default(tmp_path, fake_run):
+    netlist = _netlist(tmp_path, AUTO)
+    assert rp.main([netlist]) == 0
+    assert fake_run == [(netlist, 50.0, 25.0, "")]
+
+
+def test_main_explicit_dims_and_placement_pass_through(tmp_path, fake_run):
+    assert rp.main([str(tmp_path / "unread.json"), "30", "30", "place.json"]) == 0
+    assert fake_run == [(str(tmp_path / "unread.json"), 30.0, 30.0, "place.json")]
+
+
+def test_main_placement_file_that_fixes_every_part_needs_a_size(tmp_path, fake_run, capsys):
+    netlist = _netlist(tmp_path, AUTO)
+    place = tmp_path / "place.json"
+    place.write_text(json.dumps({"R1": [1, 1, 0], "R2": [5, 1, 0]}), encoding="utf-8")
+    assert rp.main([netlist, str(place)]) == 2
+    assert fake_run == []
+    assert "every component has a fixed position" in capsys.readouterr().err
+
+
+def test_main_full_placement_without_size_is_an_error_not_an_indexerror(tmp_path, fake_run,
+                                                                       capsys):
+    netlist = _netlist(tmp_path, FIXED)
+    assert rp.main([netlist]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("run_pipeline: error: every component has a fixed position")
+    assert rp.USAGE in err and fake_run == []
+
+
+@pytest.mark.parametrize("argv, message", [
+    ([], "missing <netlist.json>"),
+    (["n.json", "30"], "give both <board_w> and <board_h>"),
+])
+def test_main_usage_errors_exit_2(argv, message, fake_run, capsys):
+    assert rp.main(argv) == 2
+    assert message in capsys.readouterr().err and fake_run == []
+
+
+def test_main_unreadable_netlist_is_a_usage_error(tmp_path, fake_run, capsys):
+    assert rp.main([str(tmp_path / "missing.json")]) == 2
+    assert "cannot read the netlist" in capsys.readouterr().err
+
+
+def test_main_unreadable_placement_file_is_a_usage_error(tmp_path, fake_run, capsys):
+    netlist = _netlist(tmp_path, AUTO)
+    (tmp_path / "place.json").write_text("[1, 2]", encoding="utf-8")
+    assert rp.main([netlist, str(tmp_path / "place.json")]) == 2
+    assert "placement file" in capsys.readouterr().err
+
+
+def test_main_help_exits_0(fake_run, capsys):
+    assert rp.main(["--help"]) == 0
+    assert rp.USAGE in capsys.readouterr().out and fake_run == []
+
+
+def test_main_exit_code_follows_the_verdict(tmp_path, fake_run):
+    netlist = _netlist(tmp_path, AUTO)
+    assert rp.main([netlist]) == 0          # the fake passes its first run
+    assert rp.main([netlist]) == 1          # and fails every later one
+
+
 # --- _sourcing -------------------------------------------------------------------
 
 def test_sourcing_examples_carry_no_part_numbers(hat_design):

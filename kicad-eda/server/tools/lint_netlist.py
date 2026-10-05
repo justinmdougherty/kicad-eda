@@ -10,7 +10,9 @@ Checks (all pure data — no KiCad needed):
   E5  duplicate component ref
   W1  a net name reused with different casing (likely a typo split)
   W2  a power_in pin (per symbol) left unconnected — would trip ERC
-       (only when a sidecar/symbol lookup is available; otherwise skipped)
+       (only when a sidecar/symbol lookup is available; otherwise skipped).
+       Symbols resolve per component: an unresolvable lib_id skips W2 for
+       its own parts only and is named in one "W2 skipped" warning.
 
 Exit code 0 if no errors (warnings allowed), 1 otherwise.
 
@@ -74,24 +76,49 @@ def lint(design: dict, symbols_dir: str = "") -> dict:
 
     # W2 undriven/unconnected power_in pins (best-effort; needs symbol access)
     if symbols_dir:
-        try:
-            sys.path.insert(0, str(Path(__file__).parent))
-            import sch_build as sb  # noqa
-            netted = set(pad_to_nets) | no_connect
-            cache: dict = {}
-            for c in comps:
-                lib, _, name = c["lib_id"].partition(":")
-                flat = sb.flatten(cache, symbols_dir, lib, name)
-                et = sb.pin_etypes(flat)
-                for num, etype in et.items():
-                    if etype == "power_in" and (c["ref"], str(num)) not in netted:
-                        warnings.append(
-                            f"W2 {c['ref']}.{num} is a power_in pin but not connected")
-        except Exception as e:
-            warnings.append(f"W2 skipped (symbol lookup failed: {e})")
+        warnings += _w2_power_in(comps, set(pad_to_nets) | no_connect, symbols_dir)
 
     return {"ok": not errors, "errors": errors, "warnings": warnings,
             "components": len(comps), "nets": len(nets)}
+
+
+def _w2_power_in(comps: list, netted: set, symbols_dir: str) -> list[str]:
+    """W2 warnings: power_in pins that are neither netted nor no_connect.
+
+    Each component's symbol resolves on its own, so one unresolvable lib_id
+    skips W2 for that lib_id's parts only, never for the rest of the design.
+    The unresolvable lib_ids are reported together in ONE trailing warning,
+    ``W2 skipped (symbol lookup failed: <lib_id> [<refs>]: <reason>; ...)``,
+    each lib_id once, in first-seen order."""
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import sch_build as sb  # noqa
+    except ImportError as e:
+        return [f"W2 skipped (symbol lookup failed: {e})"]
+    warnings: list[str] = []
+    unresolved: dict[str, list[str]] = {}       # lib_id -> refs
+    reasons: dict[str, str] = {}                # lib_id -> first failure
+    cache: dict = {}
+    for c in comps:
+        lib_id = str(c.get("lib_id", ""))
+        lib, _, name = lib_id.partition(":")
+        try:
+            if not lib or not name:
+                raise sb.SymbolLibError("lib_id is not 'Library:Symbol'")
+            etypes = sb.pin_etypes(sb.flatten(cache, symbols_dir, lib, name))
+        except Exception as e:  # noqa: BLE001 - best-effort W2: name the lib_id, never crash lint
+            unresolved.setdefault(lib_id, []).append(str(c["ref"]))
+            reasons.setdefault(lib_id, str(e) if isinstance(e, sb.SymbolLibError)
+                               else f"{type(e).__name__}: {e}")
+            continue
+        for num, etype in etypes.items():
+            if etype == "power_in" and (c["ref"], str(num)) not in netted:
+                warnings.append(f"W2 {c['ref']}.{num} is a power_in pin but not connected")
+    if unresolved:
+        detail = "; ".join(f"{lib_id} [{', '.join(refs)}]: {reasons[lib_id]}"
+                           for lib_id, refs in unresolved.items())
+        warnings.append(f"W2 skipped (symbol lookup failed: {detail})")
+    return warnings
 
 
 def main() -> int:

@@ -237,11 +237,48 @@ def test_functional_place_width_limit_widens_the_anchor_field():
     assert w_wide > w_narrow and h_wide < h_narrow
 
 
-def test_functional_place_pack_debug_env_raises_name_error(monkeypatch):
-    # BUG: the PACK_DEBUG diagnostic path writes to sys.stderr but place_engine
-    # never imports sys, so setting PACK_DEBUG=1 crashes functional_place with
-    # NameError instead of printing cluster sizes. Documented, not fixed here.
-    monkeypatch.setenv("PACK_DEBUG", "1")
+def test_functional_place_pack_debug_env_writes_cluster_sizes(monkeypatch, capsys):
+    # PACK_DEBUG=1 is a diagnostic only: it prints one line per cluster to
+    # stderr and must not change the placement (it used to raise NameError,
+    # place_engine never imported sys)
     design, extents, pincount = _mcu_design()
-    with pytest.raises(NameError, match="sys"):
-        pe.functional_place(design, extents, pincount)
+    monkeypatch.delenv("PACK_DEBUG", raising=False)
+    quiet = pe.functional_place(design, extents, pincount)
+    monkeypatch.setenv("PACK_DEBUG", "1")
+    assert pe.functional_place(design, extents, pincount) == quiet
+    err = capsys.readouterr().err.splitlines()
+    assert [line.split(":")[0] for line in err] == ["cluster U1", "cluster J1"]
+    assert err[0].startswith("cluster U1: ") and "(5 sats)" in err[0]
+
+
+def _passives_design(n: int) -> tuple[dict, dict, dict]:
+    """n two-pin parts and no anchor IC or connector — an all-passive auto
+    field (e.g. the back side of a mixed board whose ICs are fixed)."""
+    refs = [f"R{i}" for i in range(1, n + 1)]
+    design = {"components": [{"ref": r} for r in refs],
+              "nets": {"A": [[r, "1"] for r in refs], "B": [[r, "2"] for r in refs]}}
+    extents = {r: (1.6 + 0.4 * (i % 3), 0.8 + 0.2 * (i % 2), 0, 0) for i, r in enumerate(refs)}
+    return design, extents, {r: 2 for r in refs}
+
+
+@pytest.mark.parametrize("n", [1, 2, 9])
+def test_functional_place_without_anchor_or_connector_places_every_part(n):
+    # used to raise IndexError: satellites fell back to connectors[0]
+    design, extents, pincount = _passives_design(n)
+    pos, rots, w, h = pe.functional_place(design, extents, pincount)
+    refs = {c["ref"] for c in design["components"]}
+    assert set(pos) == refs and rots == {}
+    sizes = {r: (extents[r][0], extents[r][1]) for r in refs}
+    _assert_no_overlap(pos, sizes)
+    boxes = _boxes(pos, sizes)
+    assert min(b[0] for b in boxes.values()) == pytest.approx(0.0, abs=1e-3)
+    assert min(b[1] for b in boxes.values()) == pytest.approx(0.0, abs=1e-3)
+    assert w == pytest.approx(max(b[2] for b in boxes.values()), abs=0.01)
+    assert h == pytest.approx(max(b[3] for b in boxes.values()), abs=0.01)
+
+
+def test_functional_place_all_passive_field_honours_width_limit():
+    design, extents, pincount = _passives_design(12)
+    _, _, w, h = pe.functional_place(design, extents, pincount, width_limit=8.0)
+    _, _, w_free, h_free = pe.functional_place(design, extents, pincount)
+    assert w <= 8.0 and h > h_free

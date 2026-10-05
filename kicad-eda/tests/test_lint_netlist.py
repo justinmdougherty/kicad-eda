@@ -186,6 +186,54 @@ def test_w2_unknown_symbol_in_library_is_reported(symbols_dir):
     assert "Missing" in w[0]
 
 
+def test_w2_one_unresolvable_symbol_does_not_skip_the_other_components(symbols_dir):
+    # the unresolvable part comes FIRST: W2 used to abort its whole loop on it,
+    # so U1's open power_in pin was never reported
+    d = _design()
+    d["components"].insert(0, {"ref": "X1", "lib_id": "TestLib:Missing", "value": "?"})
+    d["nets"]["GND"] = [["R1", "2"], ["U1", "4"]]         # U1.2 (power_in GND) dropped
+    d["nets"].pop("SIG")
+    rep = lint_netlist.lint(d, str(symbols_dir))
+    assert rep["ok"] is True                              # still warning-grade
+    assert rep["warnings"] == [
+        "W2 U1.2 is a power_in pin but not connected",
+        "W2 skipped (symbol lookup failed: TestLib:Missing [X1]: "
+        "symbol TestLib:Missing not found in TestLib.kicad_sym)"]
+
+
+def test_w2_names_each_unresolvable_lib_id_once_with_its_refs(symbols_dir):
+    d = _design()
+    d["components"] += [{"ref": "X1", "lib_id": "TestLib:Missing"},
+                        {"ref": "X2", "lib_id": "NoLib:Part"},
+                        {"ref": "X3", "lib_id": "TestLib:Missing"},
+                        {"ref": "X4", "lib_id": "NoColon"}]
+    w = lint_netlist.lint(d, str(symbols_dir))["warnings"]
+    assert len(w) == 1                                    # U1/R1 fully connected: no W2
+    assert w[0].startswith("W2 skipped (symbol lookup failed: ")
+    detail = w[0][len("W2 skipped (symbol lookup failed: "):-1].split("; ")
+    assert [item.split(": ")[0] for item in detail] == [
+        "TestLib:Missing [X1, X3]", "NoLib:Part [X2]", "NoColon [X4]"]
+    assert detail[1].endswith("NoLib.kicad_sym")           # the library file is named
+    assert detail[2] == "NoColon [X4]: lib_id is not 'Library:Symbol'"
+
+
+def test_w2_malformed_symbol_is_reported_not_raised(symbols_dir):
+    # a pin with an empty (number) breaks pin_etypes; W2 stays best-effort
+    (symbols_dir / "BadLib.kicad_sym").write_text(
+        '(kicad_symbol_lib (version 20231120) (generator test)\n'
+        '  (symbol "Bad" (symbol "Bad_1_1"\n'
+        '    (pin power_in line (at 0 0 0) (length 2.54) (name "V") (number)))))\n',
+        encoding="utf-8")
+    d = _design()
+    d["components"].insert(0, {"ref": "B1", "lib_id": "BadLib:Bad"})
+    d["no_connect"] = [["U1", "1"]]
+    d["nets"]["VCC"] = [["R1", "1"], ["U1", "3"]]
+    d["nets"].pop("SIG")
+    w = lint_netlist.lint(d, str(symbols_dir))["warnings"]
+    assert w == ["W2 skipped (symbol lookup failed: BadLib:Bad [B1]: "
+                 "IndexError: list index out of range)"]
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def test_main_exit_code_and_json_output(tmp_path, monkeypatch, capsys):

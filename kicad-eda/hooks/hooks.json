@@ -12,7 +12,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__kicad-generator__(add_trace|add_via|add_copper_zone|add_footprint_to_pcb|add_footprints_batch|move_footprint|remove_footprint|validate_placement|register_net|get_pcb_summary|get_footprint_pads)",
+        "matcher": "^mcp__(plugin_kicad-eda_)?kicad-generator__(add_trace|add_via|add_copper_zone|add_footprint_to_pcb|add_footprints_batch|move_footprint|remove_footprint|validate_placement|register_net|get_pcb_summary|get_footprint_pads)$",
         "hooks": [
           {
             "type": "command",
@@ -23,7 +23,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__kicad-generator__(save_schematic|close_schematic|add_components_batch|wire_by_ref|wire_pins|label_pin|power_pin|add_power_port|no_connect_pin|add_junction|build_schematic_from_netlist)",
+        "matcher": "^mcp__(plugin_kicad-eda_)?kicad-generator__(save_schematic|close_schematic|add_components_batch|wire_by_ref|wire_pins|label_pin|power_pin|add_power_port|no_connect_pin|add_junction|build_schematic_from_netlist)$",
         "hooks": [
           {
             "type": "command",

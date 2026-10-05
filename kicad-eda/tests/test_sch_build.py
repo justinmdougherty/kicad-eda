@@ -221,7 +221,7 @@ def test_real_library_output_passes_erc(lm358_build: Build, tmp_path: Path):
     report = tmp_path / "lm358_erc.json"
     proc = subprocess.run([str(KICAD.cli), "sch", "erc", str(lm358_build.path),
                            "--format", "json", "--severity-error", "-o", str(report)],
-                          capture_output=True, text=True, timeout=180)
+                          capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     erc = json.loads(report.read_text(encoding="utf-8"))
     violations = [v for sheet in erc["sheets"] for v in sheet["violations"]]
@@ -278,6 +278,106 @@ def test_missing_symbol_library_dir_is_a_json_error(tmp_path: Path):
     assert build.result["ok"] is False
     assert build.result["error"].startswith("SymbolLibError: symbol library not found")
     assert not out.exists()
+
+
+# --- S-expression string escaping (synthetic library) ------------------------
+
+BS = "\\"
+# every user-supplied string the builder writes: the project name, a reference,
+# a value, a footprint and a net name (also the PWR_FLAG label, VCC is undriven)
+HOSTILE = {"name": f'proj "q" {BS}', "ref": f'R"{BS}1', "value": f'1/4" W {BS}x',
+           "footprint": f'F:R "0805" {BS}', "net": f'V"CC{BS}'}
+NEWLINE_VALUE = "line1\nline2\ttab\rcr"
+
+
+def _hostile_design(value: str) -> dict:
+    """The synthetic design with every user string replaced by one carrying a
+    double quote, a backslash and (via ``value``) control characters."""
+    design = _synthetic_design()
+    ref = HOSTILE["ref"]
+    design["name"] = HOSTILE["name"]
+    design["components"][1].update(ref=ref, value=value, footprint=HOSTILE["footprint"])
+    design["nets"] = {HOSTILE["net"] if net == "VCC" else net:
+                      [[ref if r == "R1" else r, p] for r, p in conns]
+                      for net, conns in design["nets"].items()}
+    return design
+
+
+def _kicad_atom(s: str) -> str:
+    """A quoted atom as KiCad writes one: backslash and double quote escaped,
+    control characters as \\n \\r \\t (a raw newline ends KiCad's lexer line
+    and the file fails to load)."""
+    for raw, esc in ((BS, BS + BS), ('"', BS + '"'), ("\n", BS + "n"), ("\r", BS + "r"),
+                     ("\t", BS + "t")):
+        s = s.replace(raw, esc)
+    return f'"{s}"'
+
+
+def _sexp_view(text: str) -> dict:
+    """Parse a written schematic with sexpdata (an unescaped quote makes this
+    raise or mis-split atoms) and return the strings the builder emitted."""
+    import sexpdata
+    from symlib import first, is_, kids
+    tree = sexpdata.loads(text)
+    placed = [n for n in tree if is_(n, "symbol")]
+    props = {}
+    for node in placed:
+        fields = {p[1]: p[2] for p in kids(node, "property")}
+        props.setdefault(fields["Reference"], fields)
+    projects = {first(first(n, "instances"), "project")[1] for n in placed}
+    labels = [n[1] for n in tree if is_(n, "label")]
+    return {"props": props, "projects": projects, "labels": labels}
+
+
+@pytest.mark.parametrize("value", [HOSTILE["value"], NEWLINE_VALUE], ids=["quote", "control"])
+def test_user_strings_are_escaped_and_round_trip(tmp_path: Path, value: str):
+    design = _hostile_design(value)
+    out = tmp_path / "hostile.kicad_sch"
+    build = run_sch_build(_write_netlist(tmp_path / "hostile.json", design), out, FIXTURE_SYMBOLS)
+    assert build.proc.returncode == 0, build.proc.stderr
+    assert build.result["ok"] is True
+    assert f'\t\t(property "Value" {_kicad_atom(value)} (at ' in build.text
+    assert f'\t(label {_kicad_atom(HOSTILE["net"])} (at ' in build.text
+    view = _sexp_view(build.text)
+    r1 = view["props"][HOSTILE["ref"]]
+    assert r1["Value"] == value
+    assert r1["Footprint"] == HOSTILE["footprint"]
+    assert view["projects"] == {HOSTILE["name"]}
+    # two pin labels on the renamed net (U1.8, R1.1) plus its PWR_FLAG label
+    assert view["labels"].count(HOSTILE["net"]) == 3
+
+
+def test_plain_strings_are_written_unchanged(tmp_path: Path):
+    """Escaping must not alter ordinary strings (no quoting differences)."""
+    build = run_sch_build(_write_netlist(tmp_path / "s.json", _synthetic_design()),
+                          tmp_path / "s.kicad_sch", FIXTURE_SYMBOLS)
+    assert '\t\t(lib_id "TestLib:PosFileR")' in build.text
+    assert '\t\t(property "Value" "10k" (at ' in build.text
+    assert '\t\t(property "Footprint" "F:R" (at ' in build.text
+    assert '(instances (project "synthetic" (path "/' in build.text
+    assert '\t(label "VCC" (at ' in build.text
+
+
+@requires_kicad_cli
+@pytest.mark.parametrize("value", [HOSTILE["value"], NEWLINE_VALUE], ids=["quote", "control"])
+def test_escaped_strings_load_in_kicad(tmp_path: Path, value: str):
+    """kicad-cli parses the escaped file and reads every string back intact."""
+    import xml.etree.ElementTree as ET
+    out = tmp_path / "hostile.kicad_sch"
+    build = run_sch_build(_write_netlist(tmp_path / "hostile.json", _hostile_design(value)),
+                          out, FIXTURE_SYMBOLS)
+    assert build.result and build.result["ok"] is True
+    xml_out = tmp_path / "hostile.xml"
+    proc = subprocess.run([str(KICAD.cli), "sch", "export", "netlist", "--format", "kicadxml",
+                           "-o", str(xml_out), str(out)],
+                          capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    comps = {c.get("ref"): c for c in ET.parse(xml_out).getroot().iter("comp")}
+    r1 = comps[HOSTILE["ref"]]
+    assert r1.findtext("value") == value
+    assert r1.findtext("footprint") == HOSTILE["footprint"]
+    nets = {n.get("name") for n in ET.parse(xml_out).getroot().iter("net")}
+    assert any(HOSTILE["net"] in name for name in nets), nets
 
 
 def test_usage_exit_without_arguments():

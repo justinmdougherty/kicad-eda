@@ -528,7 +528,7 @@ class KiCad:
 
         .. versionadded:: 0.x.y (KiCad 11)
         """
-        if type == LibraryTableScope.LTS_BOTH:
+        if scope == LibraryTableScope.LTS_BOTH:
             raise ValueError("LTS_BOTH is not valid for reload_library")
 
         command = library_commands_pb2.ReloadLibrary()

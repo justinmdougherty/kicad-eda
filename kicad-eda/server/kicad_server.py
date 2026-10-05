@@ -3,7 +3,9 @@
 
 Exposes the tool surface the `pcb-design` / `netlist-pipeline` skills call by
 name. This module is the entry point, the schematic SESSION REGISTRY and the
-status tools; the other tool families live beside it and are registered here.
+status tools; the other tool families live beside it. Every tool is a plain
+function in its module's TOOLS tuple, registered from TOOL_MODULES (the end of
+this file) by tool_registry.py.
 
   SCHEMATIC tools (this module) run on one of two backends through ONE
       dispatch path, chosen per session at create/load ("auto" = api when
@@ -38,7 +40,8 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, Callable
 
 SERVER_DIR = Path(__file__).resolve().parent
 if str(SERVER_DIR) not in sys.path:
@@ -50,8 +53,12 @@ env.use_vendored_kipy()                     # server/vendor FIRST, before any `i
 
 import board_pipeline_tools                 # noqa: E402
 import board_route_tools                    # noqa: E402
+import import_tools                         # noqa: E402
 import kicad_ipc as ipc                     # noqa: E402
+import library_tools                        # noqa: E402
+import mechanical_tools                     # noqa: E402
 import pcb_ipc_tools                        # noqa: E402
+import review_tools                         # noqa: E402
 import sch_file_model as sfm                # noqa: E402
 import toolchain as tc                      # noqa: E402
 from board_pipeline_tools import (          # noqa: E402,F401  (re-exported for the pipeline)
@@ -60,6 +67,7 @@ from board_pipeline_tools import (          # noqa: E402,F401  (re-exported for 
 from mcp.server.fastmcp import FastMCP     # noqa: E402
 from pcb_ipc_tools import create_pcb        # noqa: E402,F401
 from session_release import Release, close_error_fields  # noqa: E402
+from tool_registry import register_tool_modules  # noqa: E402
 
 mcp = FastMCP("kicad-generator")
 
@@ -282,9 +290,8 @@ def _backend_of(sch: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# SCHEMATIC TOOLS
+# SCHEMATIC TOOLS (plain functions; served through TOOLS at the end of the file)
 # ----------------------------------------------------------------------------
-@mcp.tool()
 def create_schematic(path: str, paper: str = "A4", backend: str = "auto") -> dict:
     """Start a new, empty schematic for the given .kicad_sch path. backend
     "auto" uses KiCad 11's schematic API when available (KiCad owns the
@@ -322,7 +329,6 @@ def create_schematic(path: str, paper: str = "A4", backend: str = "auto") -> dic
     return res
 
 
-@mcp.tool()
 def load_schematic(path: str, backend: str = "auto") -> dict:
     """Open an existing .kicad_sch for editing. With the API backend KiCad
     reads the file (a real round-trip: list_symbols shows its contents) —
@@ -368,7 +374,6 @@ def load_schematic(path: str, backend: str = "auto") -> dict:
             **notes}
 
 
-@mcp.tool()
 def save_schematic(sch: str, symbols_dir: str = "") -> dict:
     """Write the schematic to disk. API backend: KiCad saves it (KiCad 11
     format). File backend: KiCad 9/10 format with library symbols embedded
@@ -386,7 +391,6 @@ def save_schematic(sch: str, symbols_dir: str = "") -> dict:
     return {**res, "path": sch}
 
 
-@mcp.tool()
 def close_schematic(sch: str, save: bool = False) -> dict:
     """Close a schematic session (stops a headless KiCad api-server; releases
     the file model). Unsaved edits are DISCARDED unless save is true; the
@@ -405,7 +409,6 @@ def close_schematic(sch: str, save: bool = False) -> dict:
     return res
 
 
-@mcp.tool()
 def add_component(sch: str, ref: str, lib_id: str, value: str,
                   x: float, y: float, rot: int = 0, footprint: str = "",
                   unit: int = 1) -> dict:
@@ -416,7 +419,6 @@ def add_component(sch: str, ref: str, lib_id: str, value: str,
                      value=value, footprint=footprint)
 
 
-@mcp.tool()
 def add_components_batch(sch: str, components: list[dict]) -> dict:
     """Place many components in one call. Each dict: ref, lib_id, value, x, y,
     [rot], [footprint], [unit]. Prefer this over repeated add_component calls.
@@ -437,13 +439,11 @@ def add_components_batch(sch: str, components: list[dict]) -> dict:
     return {"ok": True, "backend": sess.backend, "placed": placed, "count": len(placed)}
 
 
-@mcp.tool()
 def add_wire(sch: str, x1: float, y1: float, x2: float, y2: float) -> dict:
     """Draw a wire between two explicit points (mm)."""
     return _dispatch(sch, "add_wire", x1, y1, x2, y2)
 
 
-@mcp.tool()
 def add_label(sch: str, net: str, x: float, y: float, rot: int = 0) -> dict:
     """Place a net label at an explicit point (mm). `rot` applies to the file
     backend only (the API places labels unrotated)."""
@@ -454,13 +454,11 @@ def add_label(sch: str, net: str, x: float, y: float, rot: int = 0) -> dict:
     return res
 
 
-@mcp.tool()
 def add_power_port(sch: str, net: str, x: float, y: float) -> dict:
     """Place a power/global-label port (e.g. +3V3, GND) at an explicit point (mm)."""
     return _dispatch(sch, "add_global_label", net, x, y)
 
 
-@mcp.tool()
 def wire_by_ref(sch: str, ref_a: str, pin_a: str, ref_b: str, pin_b: str) -> dict:
     """Connect two component pins by reference: straight when aligned, else an
     L (horizontal then vertical). Pin coordinates come from KiCad (API) or the
@@ -468,38 +466,32 @@ def wire_by_ref(sch: str, ref_a: str, pin_a: str, ref_b: str, pin_b: str) -> dic
     return _dispatch(sch, "wire_pins", ref_a, pin_a, ref_b, pin_b)
 
 
-@mcp.tool()
 def wire_pins(sch: str, ref_a: str, pin_a: str, ref_b: str, pin_b: str) -> dict:
     """Same as wire_by_ref (connect two pins by reference and pin number/name)."""
     return _dispatch(sch, "wire_pins", ref_a, pin_a, ref_b, pin_b)
 
 
-@mcp.tool()
 def label_pin(sch: str, ref: str, pin: str, net_name: str) -> dict:
     """Place a net label on a component pin (by pin number or name)."""
     return _dispatch(sch, "label_pin", ref, pin, net_name)
 
 
-@mcp.tool()
 def power_pin(sch: str, ref: str, pin: str, net_name: str) -> dict:
     """Place a power port on a component power pin: the power:<net> symbol when
     that library symbol exists (API), else a global label."""
     return _dispatch(sch, "power_pin", ref, pin, net_name)
 
 
-@mcp.tool()
 def no_connect_pin(sch: str, ref: str, pin: str) -> dict:
     """Put a no-connect flag on an intentionally unused pin (ERC then accepts it)."""
     return _dispatch(sch, "no_connect", ref, pin)
 
 
-@mcp.tool()
 def add_junction(sch: str, x: float, y: float) -> dict:
     """Place a wire junction at an explicit point (mm)."""
     return _dispatch(sch, "add_junction", x, y)
 
 
-@mcp.tool()
 def list_symbols(sch: str) -> dict:
     """List every placed symbol: [{ref, lib_id, value, unit, at: [x, y, rot]}]."""
     sess = _session(sch)
@@ -518,7 +510,6 @@ def _netlist_response(sess: Session) -> dict:
     return {**res, "warnings": list(warnings)} if warnings else res
 
 
-@mcp.tool()
 def list_nets(sch: str) -> dict:
     """Net names in the schematic (API: KiCad's own netlist; file: read off the
     model's labels, wires and pin coordinates)."""
@@ -529,14 +520,12 @@ def list_nets(sch: str) -> dict:
     return {**res, "nets": names, "count": len(names)}
 
 
-@mcp.tool()
 def schematic_netlist(sch: str) -> dict:
     """Connectivity {net: [[ref, pin], ...]} — the authority is KiCad's netlist
     (API backend); the file backend derives it from its own geometry."""
     return _netlist_response(_session(sch))
 
 
-@mcp.tool()
 def run_erc(sch: str, errors_only: bool = False) -> dict:
     """Run KiCad's Electrical Rules Check on the SAVED file with the newest
     kicad-cli and return the parsed JSON report plus a violation count: errors
@@ -562,7 +551,6 @@ def run_erc(sch: str, errors_only: bool = False) -> dict:
     return out
 
 
-@mcp.tool()
 def render_sch(sch: str, out_png: str = "") -> dict:
     """Render the schematic to SVG for visual verification (into out_png's
     directory, default beside the file). API sessions render their live
@@ -634,7 +622,6 @@ def _build_via_sch_build(netlist: str, out: str, symbols_dir: str, sidecars_dir:
     return res
 
 
-@mcp.tool()
 def build_schematic_from_netlist(netlist: str, out_sch: str = "",
                                  symbols_dir: str = "", sidecars_dir: str = "",
                                  run_erc: bool = True, backend: str = "auto") -> dict:
@@ -664,7 +651,6 @@ def build_schematic_from_netlist(netlist: str, out_sch: str = "",
     return res
 
 
-@mcp.tool()
 def build_pin_sidecars(symbols: str, out_dir: str = "", symbols_dir: str = "") -> dict:
     """Build pin-coordinate sidecars (pin name/number -> schematic-space offset) for
     a comma-separated list of `Lib:Symbol` ids, used by the file-backend wiring
@@ -687,7 +673,6 @@ def build_pin_sidecars(symbols: str, out_dir: str = "", symbols_dir: str = "") -
             "stdout": r.stdout[-800:], "stderr": r.stderr[-800:]}
 
 
-@mcp.tool()
 def design_report(netlist: str, symbols_dir: str = "", out_md: str = "") -> dict:
     """Audit a netlist for design intent + assembly (DFA): part-count reduction
     (repeated passives -> arrays), decoupling coverage (every IC power rail has a
@@ -729,7 +714,6 @@ def _backend_status() -> dict:
             "api_kicad_version": _api_kicad_version()}
 
 
-@mcp.tool()
 def test_kicad_connection() -> dict:
     """Probe the running KiCad GUI over IPC (MANDATORY first PCB step): version,
     every open document ({type: pcb|schematic|project, path}) and the
@@ -753,7 +737,6 @@ def test_kicad_connection() -> dict:
     return res
 
 
-@mcp.tool()
 def server_status() -> dict:
     """Report what this server can do right now: every installed KiCad, the
     kicad-cli / bundled Python (verified to import pcbnew; kicad_python_error
@@ -781,10 +764,24 @@ def server_status() -> dict:
 
 
 # ----------------------------------------------------------------------------
-# Tool registration for the modules beside this one
+# Tool registration (tool_registry.py): every MCP tool is a plain function in
+# exactly one TOOLS tuple of a module in TOOL_MODULES, this module's first; a
+# feature appends to its module's TOOLS and only a NEW module is added here.
+# This order is the order clients list the tools in.
 # ----------------------------------------------------------------------------
-for _fn in pcb_ipc_tools.TOOLS + board_pipeline_tools.TOOLS + board_route_tools.TOOLS:
-    mcp.tool()(_fn)
+TOOLS: tuple[Callable[..., Any], ...] = (
+    create_schematic, load_schematic, save_schematic, close_schematic, add_component,
+    add_components_batch, add_wire, add_label, add_power_port, wire_by_ref, wire_pins,
+    label_pin, power_pin, no_connect_pin, add_junction, list_symbols, list_nets,
+    schematic_netlist, run_erc, render_sch, build_schematic_from_netlist,
+    build_pin_sidecars, design_report, test_kicad_connection, server_status)
+
+TOOL_MODULES: tuple[ModuleType, ...] = (
+    sys.modules[__name__],                  # this module, also when run as __main__
+    pcb_ipc_tools, board_pipeline_tools, board_route_tools,
+    library_tools, import_tools, review_tools, mechanical_tools)
+
+register_tool_modules(mcp, TOOL_MODULES)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Export a .kicad_pcb to Specctra .dsn (Freerouting input). KiCad bundled python."""
 import sys
+import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
 board = pcbnew.LoadBoard(sys.argv[1])

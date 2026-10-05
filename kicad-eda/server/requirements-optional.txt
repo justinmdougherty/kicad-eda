@@ -1,0 +1,12 @@
+# Optional kicad-generator dependencies: features that work without them say
+# so with an actionable error. NOT installed by CI's unit job or the
+# Dockerfile (server/requirements.txt), so the image and CI stay lean; the
+# tests that need a package here skip when it is absent.
+#
+# Install into the server venv:
+#   <venv-python> -m pip install -r server/requirements-optional.txt
+#
+# PDF / image schematics -> PNG pages and tiles for the vision path
+# (server/tools/rasterize.py, ROADMAP_DECISIONS D4). AGPL-3.0 (or commercial)
+# licensed; it is imported lazily and only by rasterize.py.
+pymupdf==1.28.2

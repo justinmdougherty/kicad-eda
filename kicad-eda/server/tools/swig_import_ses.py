@@ -21,6 +21,7 @@ import json
 import os
 import sys
 
+import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
 GND_NET = "GND"

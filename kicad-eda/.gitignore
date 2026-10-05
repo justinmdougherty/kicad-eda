@@ -24,6 +24,13 @@ examples/**/*.png
 examples/**/*.csv
 ~*.lck
 .venv*/
+# committed KiCad project fixtures (tests/test_kicad_import.py)
+!tests/fixtures/kicad/**/*.kicad_sch
+!tests/fixtures/kicad/**/*.kicad_pcb
+!tests/fixtures/kicad/**/*.kicad_pro
 
 # vendored kipy (server/vendor/kipy) ships source + generated *_pb2 only
 server/vendor/**/__pycache__/
+
+# coverage artefacts
+.coverage

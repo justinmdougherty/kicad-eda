@@ -31,6 +31,7 @@ import math
 import os
 import sys
 
+import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
 C0 = 299_792_458.0  # m/s

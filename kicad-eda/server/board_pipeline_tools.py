@@ -93,7 +93,9 @@ def build_board_from_netlist(netlist: str, board_w: float, board_h: float,
     plane on In1.Cu + the first power rail on In2.Cu (filled). Runs under KiCad's
     bundled Python (KiCad 9/10) with THAT install's footprint libraries.
     pack_scale (>1) loosens auto-placement spacing to give a deterministic
-    router more room on a re-route."""
+    router more room on a re-route. A board-API session (open_board) that
+    still holds out_pcb is closed first (released_boards), or the build is
+    refused while it has unsaved changes (blocking_board)."""
     kpy = tc.kicad_python()
     if not kpy:
         return {"ok": False, "reason": "KiCad bundled Python (with pcbnew) not found"}
@@ -107,6 +109,9 @@ def build_board_from_netlist(netlist: str, board_w: float, board_h: float,
     guard = ipc.write_guard(out)
     if guard:
         return guard
+    held = _release_board_session(out)
+    if held.get("ok") is False:
+        return held
     args = [kpy, str(script), netlist, out, fps, str(board_w), str(board_h)]
     if placement:
         args.append(placement)
@@ -119,7 +124,16 @@ def build_board_from_netlist(netlist: str, board_w: float, board_h: float,
         res["stderr"] = r.stderr[-1200:]
     if res["ok"]:
         res.update(_apply_netclasses(netlist, out, res.get("zones", [])))
-    return res
+    return {**res, **held}
+
+
+def _release_board_session(pcb: str) -> dict:
+    """Before this module rewrites `pcb`: a board-API session that still holds
+    it would keep the old board in memory and could save it over the new
+    file. board_route_tools.release_for_rewrite closes an idle one (its
+    released_boards fields go into the response) and refuses a dirty one."""
+    import board_route_tools
+    return board_route_tools.release_for_rewrite(pcb)
 
 
 def _apply_netclasses(netlist: str, out_pcb: str, zones: list[str]) -> dict:
@@ -162,8 +176,10 @@ def _freerouting_args(java: str, jar: str, w_dsn: str, w_ses: str,
                       max_passes: int, route_timeout: int) -> list[str] | dict:
     """The Freerouting command line, or an {ok: False} dict when the platform
     cannot run this jar (1.x needs a display: xvfb-run on a headless Linux)."""
+    # -dct 0: skip the "Autorouter is about to start" countdown dialog (1.9
+    # and 2.x both take it) — no window may wait on a click in a hands-off run.
     args = [java, "-Xmx4g", "-jar", jar, "-de", w_dsn, "-do", w_ses,
-            "-mp", str(max_passes)]
+            "-mp", str(max_passes), "-dct", "0"]
     is_v2 = "freerouting-2" in Path(jar).name
     # Freerouting 1.x initializes AWT/Swing even in CLI mode — on a
     # display-less Linux box (Docker, CI) it dies with HeadlessException
@@ -181,7 +197,7 @@ def _freerouting_args(java: str, jar: str, w_dsn: str, w_ses: str,
         budget = max(60, route_timeout - 60)
         hh, rem = divmod(budget, 3600)
         mm_, ss = divmod(rem, 60)
-        args += ["--gui.enabled=false", "-dct", "0",
+        args += ["--gui.enabled=false",
                  f"--router.job_timeout={hh:02d}:{mm_:02d}:{ss:02d}",
                  "--feature_flags.multi_threading=true"]
     return args
@@ -210,16 +226,45 @@ def _route(java: str, jar: str, dsn: str, ses: str, max_passes: int,
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _autoroute_preflight(pcb: str, jar: str) -> tuple[str, str, str] | dict:
+def _unreadable(pcb: str, from_snapshot: bool) -> dict | None:
+    """The refusal for a board this pcbnew cannot read (one saved by the KiCad
+    11 API session), else None. from_snapshot with a pcbnew-readable X.k9
+    snapshot beside it: None (autoroute_board restores and routes that).
+    Without from_snapshot the refusal names the fallback when it exists."""
+    refusal = tc.swig_readable(pcb)
+    if not refusal:
+        return None
+    snapshot = tc.existing_snapshot(pcb)
+    restorable = snapshot is not None and not tc.is_pre_k11(pcb)   # a KiCad 11 board + snapshot
+    if from_snapshot and restorable:
+        unusable = tc.swig_readable(snapshot)
+        return None if not unusable else {"ok": False, "pre_k11_snapshot": snapshot,
+                                          "reason": f"the snapshot is unreadable too: {unusable}"}
+    if from_snapshot:
+        why = (f"no pre-KiCad-11 snapshot {Path(tc.pre_k11_snapshot_path(pcb)).name} exists"
+               if snapshot is None else f"{Path(pcb).name} is not a KiCad 11 board")
+        return {"ok": False, "reason": f"{refusal}; {why}, so there is nothing to fall back to "
+                                       "(rebuild with build_board_from_netlist)"}
+    if restorable:
+        return {"ok": False, "pre_k11_snapshot": snapshot,
+                "reason": f"{refusal}; or fall back to Freerouting on its pre-KiCad-11 snapshot: "
+                          "autoroute_board(pcb, from_snapshot=true) (the KiCad 11 copy moves to "
+                          f"{Path(tc.agent_copy_path(pcb)).name})"}
+    return {"ok": False, "reason": refusal}
+
+
+def _autoroute_preflight(pcb: str, jar: str,
+                         from_snapshot: bool = False) -> tuple[str, str, str] | dict:
     """(kicad_python, java, freerouting_jar) for autoroute_board, or the refusal
     dict: no pcbnew Python, a board it cannot read (one saved by the KiCad 11
-    API session: route it with the board API tools instead), no Java, no jar."""
+    API session: route it with the board API tools, or pass from_snapshot to
+    route its pre-KiCad-11 snapshot), no Java, no jar."""
     kpy = tc.kicad_python()
     if not kpy:
         return {"ok": False, "reason": "KiCad bundled Python not found"}
-    refusal = tc.swig_readable(pcb)
+    refusal = _unreadable(pcb, from_snapshot)
     if refusal:
-        return {"ok": False, "reason": refusal}
+        return refusal
     java = tc.find_java()
     if not java:
         return {"ok": False, "reason": "java not found (Freerouting needs a JRE/JDK)"}
@@ -230,21 +275,58 @@ def _autoroute_preflight(pcb: str, jar: str) -> tuple[str, str, str] | dict:
 
 
 def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
-                    route_timeout: int = 300) -> dict:
+                    route_timeout: int = 300, from_snapshot: bool = False) -> dict:
     """Autoroute a board with Freerouting: export Specctra DSN, route, import the
     SES session back, and refill zones. Signal layers route on F.Cu/B.Cu while
     GND/power return to the inner planes. The router is killed after
     route_timeout seconds so a pathological board can never hang the pipeline.
     Returns the resulting track count and unconnected count. A board newer
     than the pcbnew install can read (one saved by the KiCad 11 API session)
-    is refused with {ok: False, reason}: route it with the board API tools."""
-    pre = _autoroute_preflight(pcb, jar)
+    is refused with {ok: False, reason}: route it with the board API tools.
+    from_snapshot=true is the fallback when agent routing stalls (route_check
+    stalled): the KiCad 11 copy moves to X.agent.kicad_pcb (+ .kicad_pro /
+    .kicad_prl), the pre-KiCad-11 snapshot X.k9.* is restored as X.kicad_pcb
+    and routed here; the response adds fallback_from_snapshot,
+    pre_k11_snapshot and agent_copy (a KiCad 9/10 board is routed as it is:
+    fallback_from_snapshot false). A board-API session still holding the
+    file is closed first (released_boards); one with unsaved changes refuses."""
+    pre = _autoroute_preflight(pcb, jar, from_snapshot)
     if isinstance(pre, dict):
         return pre
     kpy, java, fj = pre
     guard = ipc.write_guard(pcb)
     if guard:
         return guard
+    held = _release_board_session(pcb)
+    if held.get("ok") is False:
+        return held
+    fallback = _fallback_from_snapshot(pcb) if from_snapshot else {}
+    if fallback.get("ok") is False:
+        return {**fallback, **held}
+    return {**_autoroute(pcb, kpy, java, fj, max_passes, route_timeout), **held, **fallback}
+
+
+def _fallback_from_snapshot(pcb: str) -> dict:
+    """autoroute_board(from_snapshot=True)'s file step: restore the pre-KiCad-11
+    snapshot over a KiCad 11 board (toolchain.restore_snapshot); a KiCad 9/10
+    board stays as it is; a failed restore is {ok: False, step: "restore"}."""
+    if tc.is_pre_k11(pcb):
+        return {"fallback_from_snapshot": False,
+                "fallback_note": f"{Path(pcb).name} is already a KiCad 9/10 board: routed as it "
+                                 "is, no snapshot restored"}
+    try:
+        restored = tc.restore_snapshot(pcb)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "step": "restore", "pcb": pcb,
+                "reason": f"restoring the pre-KiCad-11 snapshot failed: {exc}"}
+    return {"fallback_from_snapshot": True, "pre_k11_snapshot": restored["snapshot"],
+            "agent_copy": restored["agent_copy"], "restored": restored["restored"],
+            "moved": restored["moved"]}
+
+
+def _autoroute(pcb: str, kpy: str, java: str, fj: str, max_passes: int,
+               route_timeout: int) -> dict:
+    """DSN export -> Freerouting -> SES import + refill -> DRC unconnected count."""
     base = str(Path(pcb).with_suffix(""))
     dsn, ses = base + ".dsn", base + ".ses"
     d = tc.run([kpy, str(tc.TOOLS_DIR / "swig_export_dsn.py"), pcb, dsn], timeout=120)

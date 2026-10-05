@@ -50,10 +50,35 @@ The single source of truth. Pad-level, hand-authored or generated:
   "name": "my_board",                  // file/project stem
   "title": "Human title",
   "class": 2,                          // IPC producibility class (1/2/3)
+  "mode": "napkin",                    // hands-off run: decide + record, never
+                                       //   stop to ask (see "assumptions")
+  "copper_layers": 4,                  // 2 | 4 | 6 (default 4)
 
-  // BOARD — omit entirely for auto-sized boards. For a FIXED outline:
+  // PROJECT LIBRARIES — nickname -> path relative to this file (${KIPRJMOD}
+  // = its directory; absolute allowed). Looked up before the project
+  // sym-lib-table / fp-lib-table, then the stock libraries; the same nickname
+  // in a project table with another URI is a lint error. Authored parts
+  // default to libs/<name>_parts.kicad_sym + libs/<name>_parts.pretty.
+  "libraries": {
+    "symbols":    {"SPS_parts": "libs/SPS_parts.kicad_sym"},
+    "footprints": {"SPS_parts": "libs/SPS_parts.pretty"}
+  },
+
+  // BOARD — omit entirely for auto-sized boards. Frame: mm, Y down, origin =
+  // outline bbox top-left. For a FIXED outline:
   "board": {
-    "w": 65.0, "h": 56.5,              // fixed outline, mm
+    "w": 65.0, "h": 56.5,              // fixed rectangle, mm
+    "corner_radius": 3.0,              // optional: round its corners
+    // ...or any shape (w/h then optional) — exactly ONE of:
+    //   "outline": {"loop": [[0,0],[60,0],[60,37,0.4142],[57,40],[0,40]]},
+    //   "outline": {"dxf": "mech/outline.dxf", "layer": "OUTLINE", "units": "mm"},
+    // loop vertex = [x, y] or [x, y, bulge] (DXF bulge = tan(theta/4) of the
+    // arc to the next vertex); a DXF (Fusion: Y up) is normalised into this
+    // frame; units mm|cm|in|mil, layer/units only with "dxf".
+    "cutouts": [{"loop": [[20,10],[30,10],[30,20],[20,20]]},
+                {"circle": [45.0, 20.0, 1.6]}],   // [cx, cy, r]
+    "datum": [32.5, 28.25],            // source (Fusion) origin in this frame ->
+                                       //   KiCad aux/drill origin (STEP, pos)
     "auto_x": 8.5, "auto_y": 21.0,     // free-field rectangle where the
     "auto_w": 23.0, "auto_h": 25.0,    //   auto-placer may put TOP parts
     "auto_b": {"x":30,"y":26,"w":25,"h":22}  // ditto for BOTTOM-side parts
@@ -75,12 +100,30 @@ The single source of truth. Pad-level, hand-authored or generated:
     {"ref":"U4", "...": "...", "side":"B"},
     // a J* part that is NOT an edge connector (jumper, Kelvin header):
     {"ref":"J4", "...": "...", "interior":true},
+    // module on the top edge, antenna 4 mm past Edge.Cuts:
+    {"ref":"U2", "...": "...", "edge_row":true, "overhang":4.0},
     // assembly sourcing (carried into BOM.csv):
-    {"ref":"C1", "...": "...", "lcsc":"C15849", "mpn":"CL21B104KBCNNNC"}
+    {"ref":"C1", "...": "...", "lcsc":"C15849", "mpn":"CL21B104KBCNNNC"},
+    // G2 thermal / G3 height inputs (thermal keys: §4 table):
+    {"ref":"Q1", "...": "...", "rds_mohm":4.5, "height":1.1,
+     "thermal":{"p_diss":0.4, "theta_ja":60, "tj_max":150, "i_max":3.0}},
+    // fixed by footprint ORIGIN + final rotation (as KiCad shows it; for
+    // side "B" the post-flip one) — Fusion coordinates, keep-mode rebuilds.
+    // A part has "at" OR "x"/"y"/"rot", never both:
+    {"ref":"U5", "...": "...", "at":[30.0, 20.0, 90]},
+    // board-only part (hole, logo, fiducial): on the board, not in the
+    // schematic — "lib_id" may be omitted:
+    {"ref":"H5", "footprint":"MountingHole:MountingHole_3.2mm_M3",
+     "board_only":true, "at":[3.5, 3.5, 0]}
   ],
 
   "nets":      {"GND": [["U1","13"],["C1","2"], "..."], "...": []},
   "no_connect": [["U1","7"], "..."],
+  "power_flags": ["AMP_IN"],           // extra PWR_FLAG nets (ERC)
+  "planes": {"In1.Cu":"GND", "In2.Cu":"+3V3"},  // default: In1 GND, In2 1st rail
+  "stackup": {"h":0.20, "er":4.2},     // outer dielectric for impedance math
+  "require_sourcing": true,            // G5: missing lcsc/mpn = blocker
+  "thermal": {"t_ambient":50, "tj_margin":0.8, "ep_vias_min":4},  // board-level
 
   // Design intent → IPC-2221/2141A net classes (track width, clearance,
   // via size) and the G4 ampacity checks:
@@ -125,8 +168,37 @@ The single source of truth. Pad-level, hand-authored or generated:
   "height_zones": [
     {"name":"clearance to Pi", "side":"B", "x":0, "y":0, "w":65, "h":56.5,
      "max_height":4.0, "exempt":["J5"]}
+  ],
+
+  // IMPORTED DESIGN (written by the converters): provenance + rebuild mode.
+  // kind: kicad|eagle|altium|easyeda|vision; "keep" = original placement via
+  // "at", "reflow" = re-place (new form factor).
+  "source": {"kind":"kicad", "path":"orig/board.kicad_pcb",
+             "sha256":"<64 hex>", "tool":"kicad-cli 10.99..."},
+  "rebuild": "keep",
+
+  // ASSUMPTIONS — every requirement-level guess of a napkin run, listed first
+  // in <stem>_review.md (low confidence first); "override" (optional) names
+  // what to change to overrule it:
+  "assumptions": [
+    {"id":"A1", "topic":"input supply", "value":"5 V USB-C",
+     "rationale":"concept says 'USB powered'", "confidence":"med",  // high|med|low
+     "override":"net_specs.VBUS.voltage"}
   ]
 }
+```
+
+**Schema.** `server/tools/netlist_schema.py` is the machine-checked form of
+this block (JSON Schema 2020-12). Every key above is typed. Unknown keys pass at
+the top level and on components. `libraries`, `board.outline` and a cutout
+reject them, so a typo cannot silently fall back to a rectangle. Required:
+`components` (each with `ref`, `footprint`, and `lib_id` unless `board_only`);
+`source` needs `kind` + `path`; an assumption needs `id`, `topic`, `value`,
+`rationale`, `confidence`. Check a file in a second; every error carries its
+JSON path (`$.components[3].at: ... (component U5)`):
+
+```powershell
+<venv>\python server\tools\netlist_schema.py path\to\netlist.json   # --schema prints it
 ```
 
 Hard-won authoring rules:

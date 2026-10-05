@@ -10,3 +10,7 @@ pynng>=0.9,<0.10
 jsonschema>=4.23,<5
 zstandard>=0.25,<0.26
 typing_extensions>=4.13.2
+# Board-outline DXF read/write (server/tools/dxf_io.py, Fusion 360 round trip).
+# Venv only: KiCad's bundled Python does not have it, so SWIG scripts get the
+# outline as normalised JSON loops, never as DXF (ROADMAP_DECISIONS D2).
+ezdxf==1.4.4

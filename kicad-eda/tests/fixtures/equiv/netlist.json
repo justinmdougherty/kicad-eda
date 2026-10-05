@@ -1,0 +1,19 @@
+{
+  "name": "equiv",
+  "title": "net_equivalence fixture: the board_k*.sexpr circuit as a netlist.json",
+  "components": [
+    {"ref": "R1", "lib_id": "Device:R", "value": "10k", "footprint": "Resistor_SMD:R_0603_1608Metric"},
+    {"ref": "R2", "lib_id": "Device:R", "value": "4k7", "footprint": "Resistor_SMD:R_0603_1608Metric"},
+    {"ref": "C1", "lib_id": "Device:C", "value": "100n", "footprint": "Capacitor_SMD:C_0603_1608Metric", "side": "B"},
+    {"ref": "U1", "lib_id": "equiv_parts:LDO_EP", "value": "LDO (3V3)", "footprint": "Package_DFN_QFN:DFN-6-1EP_2x2mm_P0.65mm"},
+    {"ref": "J1", "lib_id": "Connector_Generic:Conn_01x02", "value": "Conn_01x02", "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"},
+    {"ref": "H1", "board_only": true, "value": "MountingHole", "footprint": "MountingHole:MountingHole_3.2mm_M3_Pad"}
+  ],
+  "nets": {
+    "VCC": [["R1", 1], ["C1", "1"]],
+    "EN": [["R1", "2"], ["R2", "1"], ["U1", "1"]],
+    "GND": [["R2", "2"], ["C1", "2"], ["U1", "EP"], ["J1", "2"], ["H1", "1"]],
+    "A_B": [["U1", "4"], ["J1", "1"]]
+  },
+  "no_connect": [["U1", "2"], ["U1", "3"]]
+}

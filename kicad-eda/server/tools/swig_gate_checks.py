@@ -6,7 +6,8 @@ Two modes, both emit JSON {"issues": [...]} on stdout:
   placement <pcb> [netlist.json]
       Pre-route placement-review checks (the G3 gate):
       - every connector's mating mouth faces OFF the board (not into the
-        interior) and sits at the edge it faces (<= 3 mm)
+        interior) and sits at the edge it faces (<= 3 mm); a J* part the
+        netlist flags "interior": true (jumper, Kelvin header) is exempt
       - if the netlist requests an antenna_keepout, a no-fill rule area exists
   routed <pcb> [netlist.json]
       Post-route layout-review checks (part of the G4 gate):
@@ -19,6 +20,7 @@ rules; these check the *design intent* a DRC can't see.
 import json
 import sys
 
+import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
 
@@ -48,6 +50,20 @@ def _world_mouth(fp):
     return ((0.0, 1.0 if dy > 0 else -1.0), bb)
 
 
+def interior_refs(design: dict) -> set:
+    """Refs the netlist flags ``"interior": true``: J* parts that do NOT mate
+    through the board edge (a config jumper, a Kelvin header, a pin-socket
+    wall). place_engine already packs them as ordinary parts; the edge rule
+    must not report them either. Pure (no pcbnew)."""
+    return {c["ref"] for c in design.get("components", []) if c.get("interior")}
+
+
+def is_edge_connector(ref: str, interior: set) -> bool:
+    """True for a part the connector-at-edge rule applies to: a J* reference
+    not flagged interior. Pure (no pcbnew)."""
+    return ref.startswith("J") and ref not in interior
+
+
 def check_placement(board, design, routed=False):
     """routed=True re-validates a cached ROUTED board: plane integrity is
     skipped — it is a PRE-route check (its premise is "the router will trust
@@ -62,9 +78,10 @@ def check_placement(board, design, routed=False):
     bx1, by1 = to(bb.GetRight()), to(bb.GetBottom())
     bcx, bcy = (bx0 + bx1) / 2, (by0 + by1) / 2
 
+    interior = interior_refs(design)
     for fp in board.GetFootprints():
         ref = fp.GetReference()
-        if not ref.startswith("J"):
+        if not is_edge_connector(ref, interior):
             continue
         m = _world_mouth(fp)
         if m is None:

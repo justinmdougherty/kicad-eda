@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<export version="E">
+  <design>
+    <source>equiv.kicad_sch</source>
+    <date>2026-10-04T18:29:24</date>
+    <tool>Eeschema 10.99.0-4025-gf7ca620278</tool>
+    <sheet number="1" name="/" tstamps="/">
+      <title_block>
+        <title>net_equivalence fixture</title>
+        <source>equiv.kicad_sch</source>
+      </title_block>
+    </sheet>
+  </design>
+  <components>
+    <comp ref="C1">
+      <value>100n</value>
+      <footprint>Capacitor_SMD:C_0603_1608Metric</footprint>
+      <libsource lib="Device" part="C" description="Unpolarized capacitor"/>
+      <property name="Sheetname" value="equiv"/>
+      <property name="Sheetfile" value="equiv.kicad_sch"/>
+      <property name="dnp"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>0a1d0003-0000-4000-8000-0000000000a3</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="C9">
+      <value>10u</value>
+      <footprint>Capacitor_SMD:C_0805_2012Metric</footprint>
+      <libsource lib="Device" part="C" description="Unpolarized capacitor"/>
+      <property name="Sheetname" value="equiv"/>
+      <property name="Sheetfile" value="equiv.kicad_sch"/>
+      <property name="exclude_from_board"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>0a1d0009-0000-4000-8000-0000000000a9</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="J1">
+      <value>Conn_01x02</value>
+      <footprint>Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical</footprint>
+      <libsource lib="Connector_Generic" part="Conn_01x02" description="Generic connector"/>
+      <property name="Sheetname" value="equiv"/>
+      <property name="Sheetfile" value="equiv.kicad_sch"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>0a1d0005-0000-4000-8000-0000000000a5</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R1">
+      <value>10k</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <libsource lib="Device" part="R" description="Resistor"/>
+      <property name="Sheetname" value="equiv"/>
+      <property name="Sheetfile" value="equiv.kicad_sch"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>0a1d0001-0000-4000-8000-0000000000a1</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="R2">
+      <value>4k7</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <libsource lib="Device" part="R" description="Resistor"/>
+      <property name="Sheetname" value="equiv"/>
+      <property name="Sheetfile" value="equiv.kicad_sch"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>0a1d0002-0000-4000-8000-0000000000a2</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+    <comp ref="U1">
+      <value>LDO (3V3)</value>
+      <footprint>Package_DFN_QFN:DFN-6-1EP_2x2mm_P0.65mm</footprint>
+      <libsource lib="equiv_parts" part="LDO_EP" description="LDO with enable"/>
+      <property name="Sheetname" value="equiv"/>
+      <property name="Sheetfile" value="equiv.kicad_sch"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>0a1d0004-0000-4000-8000-0000000000a4</tstamps>
+      <units>
+        <unit name="A">
+          <pins>
+            <pin num="1"/>
+            <pin num="2"/>
+            <pin num="3"/>
+            <pin num="4"/>
+            <pin num="EP"/>
+          </pins>
+        </unit>
+      </units>
+    </comp>
+  </components>
+  <libraries>
+    <library logical="equiv_parts">
+      <uri>${KIPRJMOD}/libs/equiv_parts.kicad_sym</uri>
+    </library>
+  </libraries>
+  <nets>
+    <net code="1" name="/A/B" class="Default">
+      <node ref="J1" pin="1" pinfunction="Pin_1" pintype="passive"/>
+      <node ref="U1" pin="4" pinfunction="OUT" pintype="power_out"/>
+    </net>
+    <net code="2" name="GND" class="Default">
+      <node ref="C1" pin="2" pintype="passive"/>
+      <node ref="C9" pin="2" pintype="passive"/>
+      <node ref="J1" pin="2" pinfunction="Pin_2" pintype="passive"/>
+      <node ref="R2" pin="2" pintype="passive"/>
+      <node ref="U1" pin="EP" pinfunction="GND" pintype="power_in"/>
+    </net>
+    <net code="3" name="Net-(R1-Pad2)" class="Default">
+      <node ref="R1" pin="2" pintype="passive"/>
+      <node ref="R2" pin="1" pintype="passive"/>
+      <node ref="U1" pin="1" pinfunction="EN" pintype="input"/>
+    </net>
+    <net code="4" name="VCC" class="Default">
+      <node ref="C1" pin="1" pintype="passive"/>
+      <node ref="C9" pin="1" pintype="passive"/>
+      <node ref="R1" pin="1" pintype="passive"/>
+    </net>
+    <net code="5" name="unconnected-(U1-NC-Pad2)" class="Default">
+      <node ref="U1" pin="2" pinfunction="NC" pintype="no_connect+no_connect"/>
+    </net>
+    <net code="6" name="unconnected-(U1-Pad3)" class="Default">
+      <node ref="U1" pin="3" pintype="input"/>
+    </net>
+  </nets>
+</export>

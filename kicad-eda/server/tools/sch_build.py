@@ -38,7 +38,7 @@ from symlib import (SYM_ONLY_TAGS, S, SymbolLibError, dumps, embed, first,  # no
 # public re-exports (lint_netlist / design_report / older callers import these)
 __all__ = ["S", "SYM_ONLY_TAGS", "SymbolLibError", "dumps", "embed", "first",
            "flatten", "is_", "kids", "load_lib", "pin_etypes", "pin_numbers",
-           "pin_offsets", "unit_pins", "uid", "load_sidecars", "main"]
+           "pin_offsets", "unit_pins", "uid", "q", "load_sidecars", "main"]
 
 PWR_FLAG_LIB_ID = "power:PWR_FLAG"
 USAGE_EXIT = 2
@@ -46,6 +46,20 @@ USAGE_EXIT = 2
 
 def uid() -> str:
     return str(uuidlib.uuid4())
+
+
+def q(value: object) -> str:
+    """``value`` as a quoted KiCad S-expression string atom.
+
+    Backslash and double quote are escaped, and so are control characters
+    (``\\n``, ``\\r``, ``\\t``, ...): KiCad's lexer decodes those escapes, but a
+    RAW newline inside a quoted atom makes the whole schematic fail to load.
+    This is the same quoting the embedded lib_symbols block gets (sexpdata),
+    so every string in the file is written one way. Every netlist- or
+    library-supplied string (lib_id, reference, value, footprint, pin number,
+    project name, net name) goes through here; a bare f-string would let a
+    value such as ``1/4"`` end the atom early and corrupt the file."""
+    return dumps(str(value))
 
 
 def load_sidecars(sidecars_dir: str, lib_ids: list) -> dict:
@@ -157,23 +171,23 @@ def build(netlist_path: str, out_path: str, symbols_dir: str,
         fp = c.get("footprint", "")
         L += [
             '\t(symbol',
-            f'\t\t(lib_id "{c["lib_id"]}")',
+            f'\t\t(lib_id {q(c["lib_id"])})',
             f'\t\t(at {x} {y} 0)',
             f'\t\t(unit {u})',
             '\t\t(exclude_from_sim no)', '\t\t(in_bom yes)', '\t\t(on_board yes)', '\t\t(dnp no)',
             f'\t\t(uuid "{uid()}")',
-            f'\t\t(property "Reference" "{c["ref"]}" (at {x} {y - 7.62} 0)'
+            f'\t\t(property "Reference" {q(c["ref"])} (at {x} {y - 7.62} 0)'
             ' (effects (font (size 1.27 1.27))))',
-            f'\t\t(property "Value" "{c.get("value","")}" (at {x} {y + 7.62} 0)'
+            f'\t\t(property "Value" {q(c.get("value", ""))} (at {x} {y + 7.62} 0)'
             ' (effects (font (size 1.27 1.27))))',
-            f'\t\t(property "Footprint" "{fp}" (at {x} {y} 0)'
+            f'\t\t(property "Footprint" {q(fp)} (at {x} {y} 0)'
             ' (effects (font (size 1.27 1.27)) (hide yes)))',
         ]
         for num in units_of[c["lib_id"]].get(u, []):
-            L.append(f'\t\t(pin "{num}" (uuid "{uid()}"))')
+            L.append(f'\t\t(pin {q(num)} (uuid "{uid()}"))')
         L += [
-            f'\t\t(instances (project "{project}" (path "/{root}"'
-            f' (reference "{c["ref"]}") (unit {u}))))',
+            f'\t\t(instances (project {q(project)} (path "/{root}"'
+            f' (reference {q(c["ref"])}) (unit {u}))))',
             '\t)',
         ]
 
@@ -213,7 +227,7 @@ def build(netlist_path: str, out_path: str, symbols_dir: str,
             xy = pin_xy(ref, pad)
             if xy is None:
                 continue
-            L.append(f'\t(label "{net}" (at {xy[0]} {xy[1]} 0)'
+            L.append(f'\t(label {q(net)} (at {xy[0]} {xy[1]} 0)'
                      ' (effects (font (size 1.27 1.27)) (justify left bottom))'
                      f' (uuid "{uid()}"))')
 
@@ -249,9 +263,9 @@ def build(netlist_path: str, out_path: str, symbols_dir: str,
             f'\t\t(property "Reference" "{ref}" (at {fx} {fy-2.54} 0) (effects (font (size 1.27 1.27)) (hide yes)))',
             f'\t\t(property "Value" "PWR_FLAG" (at {fx} {fy+2.54} 0) (effects (font (size 1.27 1.27))))',
             f'\t\t(pin "1" (uuid "{uid()}"))',
-            f'\t\t(instances (project "{project}" (path "/{root}" (reference "{ref}") (unit 1))))',
+            f'\t\t(instances (project {q(project)} (path "/{root}" (reference "{ref}") (unit 1))))',
             '\t)',
-            f'\t(label "{net}" (at {fx} {fy} 0) (effects (font (size 1.27 1.27))) (uuid "{uid()}"))',
+            f'\t(label {q(net)} (at {fx} {fy} 0) (effects (font (size 1.27 1.27))) (uuid "{uid()}"))',
         ]
         fy += 15.24
 

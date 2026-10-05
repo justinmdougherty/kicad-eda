@@ -111,10 +111,15 @@ def create_pcb(pcb: str, sch: str = "", overwrite: bool = False) -> dict:
         return {"ok": False, "reason": f"KiCad bundled Python (pcbnew) not found: "
                                        f"{tc.kicad_python_error()}"}
     Path(target).parent.mkdir(parents=True, exist_ok=True)
-    code = ("import sys, pcbnew\n"
+    # -c code has no script dir on sys.path: argv[2] (server/tools) goes there
+    # so kicad_quiet runs before pcbnew (no modal wx dialogs, D0)
+    code = ("import sys\n"
+            "sys.path.insert(0, sys.argv[2])\n"
+            "import kicad_quiet\n"
+            "import pcbnew\n"
             "board = pcbnew.CreateEmptyBoard()\n"
             "pcbnew.SaveBoard(sys.argv[1], board)\n")
-    r = tc.run([kpy, "-c", code, target], timeout=120)
+    r = tc.run([kpy, "-c", code, target, str(tc.TOOLS_DIR)], timeout=120)
     if r.returncode != 0 or not Path(target).is_file():
         return {"ok": False, "created": False, "pcb": target,
                 "reason": "pcbnew failed to create the board", "stderr": r.stderr[-1200:]}

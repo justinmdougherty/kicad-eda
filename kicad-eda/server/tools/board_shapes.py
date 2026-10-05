@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Board-level shapes for the headless builder: outline, copper planes,
 keep-out rule areas."""
+import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
 

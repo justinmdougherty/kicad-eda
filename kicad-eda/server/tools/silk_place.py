@@ -16,6 +16,7 @@ The runnable form prints the summary dict as JSON on its last stdout line:
 import json
 import sys
 
+import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
 MARGIN = 0.8          # keep silk this far inside Edge.Cuts (fab clips at edge)

@@ -4,7 +4,9 @@ shelf packing (FFDH + backfill), functional clustering (support passives
 at the IC they serve), connector edge handling, and mixed fixed+auto
 fields. Pure placement math; the orchestrator applies the results."""
 import os
+import sys
 
+import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
 
@@ -130,6 +132,12 @@ def functional_place(design, extents, pincount, mouth=None, margin=1.5,
     anchors = [r for r in refs if is_anchor(r)]
     connectors = [r for r in refs if is_conn(r)]
     satellites = [r for r in refs if r not in anchors and r not in connectors]
+    if not anchors and not connectors:
+        # nothing to cluster around (an all-passive auto field, e.g. the back
+        # side of a mixed board whose ICs are fixed): every part is its own
+        # block in the shelf-packed field instead of a satellite of a head
+        # that does not exist
+        anchors, satellites = satellites, []
     aset, cset = set(anchors), set(connectors)
 
     # satellites may cluster at an anchor OR at a multi-pin edge-row head (a

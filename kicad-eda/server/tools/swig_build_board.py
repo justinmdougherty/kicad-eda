@@ -16,6 +16,7 @@ import os
 import sys
 import traceback
 
+import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
 

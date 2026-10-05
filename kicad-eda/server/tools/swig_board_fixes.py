@@ -24,6 +24,7 @@ import math
 import re
 import sys
 
+import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
 import ipc_rules

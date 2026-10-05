@@ -384,3 +384,255 @@ def drc_counts(pcb: str) -> dict:
             "unconnected": len(d.get("unconnected_items", [])),
             "types": dict(Counter(v.get("type", "unknown") for v in violations)),
             **base}
+
+
+def _drc_item(item: dict) -> dict:
+    pos = item.get("pos") or {}
+    return {"description": item.get("description"), "x": pos.get("x"), "y": pos.get("y")}
+
+
+def _drc_entry(entry: dict) -> dict:
+    return {"type": entry.get("type"), "severity": entry.get("severity"),
+            "description": entry.get("description"),
+            "items": [_drc_item(i) for i in entry.get("items", [])]}
+
+
+def drc_check(pcb: str, max_items: int) -> dict:
+    """drc_counts(pcb) for a repair loop, plus the report's first max_items
+    violations and unconnected items as [{type, severity, description,
+    items: [{description, x, y}]}]: {ok: errors == 0 and unconnected == 0,
+    errors, unconnected, types, violations, unconnected_items, kicad_cli,
+    report[, kicad_cli_note]}. {ok: False, reason, kicad_cli, report} (no
+    counts) when DRC wrote no readable report. Raises RuntimeError when no
+    KiCad is installed."""
+    counts = drc_counts(pcb)
+    base = {key: counts[key] for key in ("kicad_cli", "report", "kicad_cli_note") if counts.get(key)}
+    if "error" in counts:
+        return {**base, "ok": False, "reason": counts["error"]}
+    try:
+        report = json.loads(Path(counts["report"]).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {**base, "ok": False, "reason": f"DRC report {counts['report']} unreadable: {exc}"}
+    violations = [_drc_entry(v) for v in report.get("violations", [])]
+    unconnected = [_drc_entry(v) for v in report.get("unconnected_items", [])]
+    return {**base, "ok": counts["errors"] == 0 and counts["unconnected"] == 0,
+            "errors": counts["errors"], "unconnected": counts["unconnected"],
+            "types": counts["types"], "violations": violations[:max_items],
+            "unconnected_items": unconnected[:max_items]}
+
+
+# ----------------------------------------------------------------------------
+# Pre-KiCad-11 snapshot (ROADMAP D5)
+# ----------------------------------------------------------------------------
+# The first save through a KiCad >= 10.99 session (headless api-server or a
+# KiCad 11 GUI) rewrites X.kicad_pcb (format 20260901), X.kicad_pro and
+# X.kicad_prl in KiCad 11 form; KiCad 9/10 pcbnew (Freerouting, the SWIG gates,
+# EMC stitching) cannot load that board any more. Right before it, the pre-11
+# set is copied to X.k9.* in the same directory (project library tables with
+# ${KIPRJMOD} stay valid). Board and project travel together: restored without
+# its project, the board loses its net classes and Freerouting lays power copper
+# at the default width while DRC still passes (spike T09). KiCad 11 never
+# writes .kicad_dru; the ~X.kicad_pro.lck lock it leaves behind is never copied.
+K11_SESSION = (10, 99)                  # the KiCad 11 nightly and every release after it
+K10_LAST_FORMAT = 20260206              # KiCad 10.0's board format: the newest pre-11 file
+SNAPSHOT_TAG = ".k9"
+AGENT_TAG = ".agent"
+BOARD_EXT = ".kicad_pcb"
+PROJECT_EXT = ".kicad_pro"
+LOCAL_EXT = ".kicad_prl"                # per-user UI state
+RULES_EXT = ".kicad_dru"                # custom DRC rules
+SNAPSHOT_EXTRAS = (PROJECT_EXT, LOCAL_EXT, RULES_EXT)   # copied beside the board when present
+K11_REWRITES = (BOARD_EXT, PROJECT_EXT, LOCAL_EXT)      # what a KiCad 11 save rewrites
+STALL_ROUNDS = 3                       # D5: route_check rounds without a new best = a stall
+STALL_NOTE = (f"{STALL_ROUNDS} route_check rounds without fewer errors + unconnected: stop "
+              "agent routing and fall back (ROADMAP D5): autoroute_board(pcb, "
+              "from_snapshot=true) routes the pre-KiCad-11 snapshot with Freerouting; if that "
+              "fails, re-place at a higher pack_scale; then stop with a report")
+
+
+def route_progress(history: tuple[int, ...]) -> dict:
+    """The D5 stall verdict over a board's route_check scores (errors +
+    unconnected per round, oldest first): {"progress": {rounds, score, best,
+    rounds_without_improvement}, "stalled": bool[, "stall_note"]}. A round
+    improves when its score is below every earlier one; stalled = STALL_ROUNDS
+    rounds without improvement while the board is not clean yet."""
+    if not history:
+        raise ValueError("route_progress needs at least one round")
+    best, since = history[0], 0
+    for score in history[1:]:
+        best, since = (score, 0) if score < best else (best, since + 1)
+    stalled = since >= STALL_ROUNDS and history[-1] > 0
+    return {"progress": {"rounds": len(history), "score": history[-1], "best": best,
+                         "rounds_without_improvement": since},
+            "stalled": stalled, **({"stall_note": STALL_NOTE} if stalled else {})}
+
+
+def _sibling(pcb: str, tag: str, ext: str) -> Path:
+    """X<tag><ext> beside X.kicad_pcb (tag "" = the canonical project file)."""
+    return Path(str(Path(pcb).with_suffix("")) + tag + ext)
+
+
+def pre_k11_snapshot_path(pcb: str) -> str:
+    """X.k9.kicad_pcb beside X.kicad_pcb: where the pre-KiCad-11 snapshot of
+    `pcb` lives, whether or not it exists yet."""
+    return str(_sibling(pcb, SNAPSHOT_TAG, BOARD_EXT))
+
+
+def agent_copy_path(pcb: str) -> str:
+    """X.agent.kicad_pcb: where restore_snapshot moves the KiCad 11 copy."""
+    return str(_sibling(pcb, AGENT_TAG, BOARD_EXT))
+
+
+def existing_snapshot(pcb: str) -> str | None:
+    """X.k9.kicad_pcb when the snapshot exists, else None."""
+    path = pre_k11_snapshot_path(pcb)
+    return path if Path(path).is_file() else None
+
+
+def snapshot_field(pcb: str) -> dict:
+    """{"pre_k11_snapshot": X.k9.kicad_pcb} while the snapshot exists, else
+    {}: the key the board tools add to their responses."""
+    found = existing_snapshot(pcb)
+    return {"pre_k11_snapshot": found} if found else {}
+
+
+def is_k11_session(kicad_version: str) -> bool:
+    """True for a KiCad session (`kicad-cli version` / GUI version string)
+    whose saves write the KiCad 11 board format: 10.99 nightlies and later."""
+    return env.parse_version(kicad_version or "")[:2] >= K11_SESSION
+
+
+def is_pre_k11(pcb: str) -> bool:
+    """True when the board file on disk was written by a KiCad older than
+    10.99 (its generator_version; without one, a format up to KiCad 10.0's),
+    i.e. KiCad 9/10 pcbnew can load it. False for a KiCad 11 file and for a
+    missing, unparsable or non-board file (nothing to protect)."""
+    if not _read_head(pcb).lstrip().startswith("(kicad_pcb"):
+        return False
+    info = board_file_info(pcb)
+    writer = _writer_version(info)
+    if writer is not None:
+        return writer[:2] < K11_SESSION
+    fmt = info["format_version"]
+    return fmt is not None and fmt <= K10_LAST_FORMAT
+
+
+def snapshot_current(pcb: str) -> bool:
+    """True when X.k9.* already holds what is on disk: the snapshot board and
+    project exist exactly when X.kicad_pcb / X.kicad_pro do and are at least
+    as new (take_snapshot copies with the source mtimes). A K9 re-placement
+    or a project rewrite after the snapshot makes it stale."""
+    for ext in (BOARD_EXT, PROJECT_EXT):
+        src, snap = _sibling(pcb, "", ext), _sibling(pcb, SNAPSHOT_TAG, ext)
+        if src.is_file() != snap.is_file() or (ext == BOARD_EXT and not src.is_file()):
+            return False
+        if src.is_file() and snap.stat().st_mtime_ns < src.stat().st_mtime_ns:
+            return False
+    return True
+
+
+def take_snapshot(pcb: str) -> dict:
+    """Copy X.kicad_pcb + X.kicad_pro (+ .kicad_prl / .kicad_dru when present)
+    to X.k9.* in the same directory, keeping their mtimes. A snapshot file
+    whose source is gone is removed, so the set is always one snapshot, and
+    the board is copied last: X.k9.kicad_pcb exists only beside a complete
+    set. Returns {"snapshot": X.k9.kicad_pcb, "files": [every file written]}.
+    Raises ValueError when `pcb` is missing or not a pre-KiCad-11 board, and
+    OSError when a copy fails."""
+    if not Path(pcb).is_file():
+        raise ValueError(f"{pcb} not found; nothing to snapshot")
+    if not is_pre_k11(pcb):
+        raise ValueError(f"{Path(pcb).name} is not a pre-KiCad-11 board "
+                         f"({board_file_info(pcb)}); there is no KiCad 9/10 copy to keep")
+    snap = _sibling(pcb, SNAPSHOT_TAG, BOARD_EXT)
+    snap.unlink(missing_ok=True)                 # incomplete until the board copy lands
+    written: list[str] = []
+    for ext in SNAPSHOT_EXTRAS:
+        src, dst = _sibling(pcb, "", ext), _sibling(pcb, SNAPSHOT_TAG, ext)
+        if src.is_file():
+            shutil.copy2(src, dst)
+            written.append(str(dst))
+        else:
+            dst.unlink(missing_ok=True)
+    shutil.copy2(pcb, snap)
+    return {"snapshot": str(snap), "files": [str(snap), *written]}
+
+
+def snapshot_before_k11_write(pcb: str, kicad_version: str) -> str | None:
+    """The D5 rule, run right before a KiCad session may write `pcb`: when the
+    session is KiCad >= 10.99, the file on disk is pre-11 and no current
+    snapshot exists, take_snapshot(pcb) and return X.k9.kicad_pcb; else None.
+    A failed copy raises RuntimeError saying why: the caller must not save."""
+    if not is_k11_session(kicad_version) or not is_pre_k11(pcb) or snapshot_current(pcb):
+        return None
+    try:
+        return take_snapshot(pcb)["snapshot"]
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"the pre-KiCad-11 snapshot of {pcb} failed ({exc}): a KiCad 11 save "
+                           "would leave no KiCad 9/10 copy for Freerouting; fix the disk or "
+                           "permissions and retry") from exc
+
+
+def _check_restorable(pcb: str) -> Path:
+    """The snapshot board restore_snapshot would bring back, or ValueError."""
+    snap = _sibling(pcb, SNAPSHOT_TAG, BOARD_EXT)
+    if not snap.is_file():
+        raise ValueError(f"no pre-KiCad-11 snapshot {snap.name} beside {Path(pcb).name}: it is "
+                         "taken before the first KiCad 11 save, so this board was never saved "
+                         "by the board API from a KiCad 9/10 file (rebuild it with "
+                         "build_board_from_netlist)")
+    if not is_pre_k11(str(snap)):
+        raise ValueError(f"{snap.name} is not a pre-KiCad-11 board ({board_file_info(str(snap))}); "
+                         "it cannot be routed with Freerouting")
+    if is_pre_k11(pcb):
+        raise ValueError(f"{Path(pcb).name} is already a KiCad 9/10 board; nothing to restore "
+                         "(route it as it is)")
+    if not Path(pcb).is_file():
+        raise ValueError(f"{pcb} not found; the snapshot {snap} is left as it is")
+    return snap
+
+
+def _swap_in_snapshot(pcb: str, moved: list[tuple[Path, Path]], restored: list[Path]) -> None:
+    """Move the KiCad 11 files to X.agent.* and copy the snapshot back,
+    recording each step in `moved` / `restored` for the caller's rollback."""
+    for ext in K11_REWRITES:
+        src = _sibling(pcb, "", ext)
+        if src.is_file():
+            dst = _sibling(pcb, AGENT_TAG, ext)
+            os.replace(src, dst)
+            moved.append((src, dst))
+    for ext in K11_REWRITES:
+        snap = _sibling(pcb, SNAPSHOT_TAG, ext)
+        if snap.is_file():
+            dst = _sibling(pcb, "", ext)
+            shutil.copy2(snap, dst)
+            restored.append(dst)
+
+
+def restore_snapshot(pcb: str) -> dict:
+    """The D5 Freerouting fallback's file step on a board KiCad 11 has saved:
+    X.kicad_pcb / .kicad_pro / .kicad_prl move to X.agent.* (the agent's
+    KiCad 11 copy, reopenable with its classes), X.kicad_dru is copied to
+    X.agent.kicad_dru (KiCad 11 never writes it, the canonical one stays),
+    and X.k9.{kicad_pcb, kicad_pro, kicad_prl} are copied back to X.* (the
+    snapshot stays). Release every KiCad session on `pcb` first. Returns
+    {"pcb", "snapshot", "agent_copy", "moved": [...], "restored": [...]}.
+    Raises ValueError when there is no usable snapshot or `pcb` is not a
+    KiCad 11 file, and OSError when a file operation fails (the moves done
+    so far are undone first)."""
+    snap = _check_restorable(pcb)
+    moved: list[tuple[Path, Path]] = []
+    restored: list[Path] = []
+    try:
+        _swap_in_snapshot(pcb, moved, restored)
+        rules = _sibling(pcb, "", RULES_EXT)
+        if rules.is_file():
+            shutil.copy2(rules, _sibling(pcb, AGENT_TAG, RULES_EXT))
+    except OSError:
+        for path in restored:
+            path.unlink(missing_ok=True)
+        for src, dst in reversed(moved):
+            os.replace(dst, src)
+        raise
+    return {"pcb": pcb, "snapshot": str(snap), "agent_copy": agent_copy_path(pcb),
+            "moved": [str(dst) for _src, dst in moved], "restored": [str(p) for p in restored]}
