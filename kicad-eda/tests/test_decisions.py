@@ -1,14 +1,18 @@
 """decisions — the D5 runtime decision log (<stem>.decisions.jsonl) and the
 netlist "assumptions" block validator.
 
-Pure unit tier: stdlib + tmp_path only, no KiCad.
+Pure unit tier: stdlib + tmp_path only, no KiCad (the multi-process test
+spawns plain Python writers).
 """
 from __future__ import annotations
 
 import ast
 import json
+import os
 import re
+import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -239,6 +243,192 @@ def test_append_after_a_torn_last_line_starts_a_new_line(tmp_path):
     result = dec.load_decisions(log)
     assert list(result.entries) == [good, new]
     assert len(result.errors) == 1 and ":2:" in result.errors[0]
+
+
+# --- the writer lock (<log>.lock) -----------------------------------------------
+BROKE = "decisions: broke a stale lock"                     # the stderr note
+
+
+def _age(path: Path, seconds: float) -> None:
+    then = time.time() - seconds
+    os.utime(path, (then, then))
+
+
+def test_lock_path_sits_beside_the_log():
+    assert dec.lock_path("work/n.json") == Path("work/n.decisions.jsonl.lock")
+    assert dec.lock_path("work/n.decisions.jsonl") == Path("work/n.decisions.jsonl.lock")
+
+
+def test_lock_constants_match_the_contract():
+    assert dec.LOCK_RETRY_S == 0.01
+    assert dec.LOCK_TIMEOUT_S == 10.0
+    assert dec.LOCK_STALE_S == 60.0
+
+
+def test_append_releases_its_lock(tmp_path):
+    stem = tmp_path / "n.json"
+    dec.append_decision(stem, **_fields())
+    dec.append_decision(stem, **_fields(stage="G4"))
+    assert not dec.lock_path(stem).exists()
+    assert len(dec.read_decisions(stem)) == 2
+
+
+def test_a_held_lock_times_out_with_decision_error_and_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(dec, "LOCK_TIMEOUT_S", 0.3)
+    stem = tmp_path / "n.json"
+    first = dec.append_decision(stem, **_fields())
+    before = dec.decisions_path(stem).read_bytes()
+    lock = dec.lock_path(stem)
+    lock.write_text("4242\n", encoding="ascii")             # another writer holds it
+    start = time.monotonic()
+    with pytest.raises(dec.DecisionError, match="lock") as e:
+        dec.append_decision(stem, **_fields(stage="G4"))
+    assert time.monotonic() - start >= 0.3
+    assert str(lock) in str(e.value) and "nothing written" in str(e.value)
+    assert dec.decisions_path(stem).read_bytes() == before   # nothing written
+    assert lock.exists()                                     # a live lock is never taken over
+    assert dec.read_decisions(stem) == [first]
+
+
+def test_a_held_lock_with_no_log_yet_creates_no_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(dec, "LOCK_TIMEOUT_S", 0.05)
+    stem = tmp_path / "n.json"
+    dec.lock_path(stem).write_text("1\n", encoding="ascii")
+    with pytest.raises(dec.DecisionError):
+        dec.append_decision(stem, **_fields())
+    assert not dec.decisions_path(stem).exists()
+
+
+def test_a_stale_lock_is_broken_and_noted_on_stderr(tmp_path, capsys):
+    stem = tmp_path / "n.json"
+    lock = dec.lock_path(stem)
+    lock.write_text("4242\n", encoding="ascii")             # a writer that crashed
+    _age(lock, dec.LOCK_STALE_S + 30)
+    entry = dec.append_decision(stem, **_fields())
+    assert dec.read_decisions(stem) == [entry]
+    assert not lock.exists()
+    err = capsys.readouterr().err
+    assert BROKE in err and str(lock) in err
+
+
+def test_a_lock_younger_than_the_stale_age_is_not_broken(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(dec, "LOCK_TIMEOUT_S", 0.1)
+    stem = tmp_path / "n.json"
+    lock = dec.lock_path(stem)
+    lock.write_text("1\n", encoding="ascii")
+    _age(lock, dec.LOCK_STALE_S - 10)
+    with pytest.raises(dec.DecisionError):
+        dec.append_decision(stem, **_fields())
+    assert lock.exists() and BROKE not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("removable, note", [
+    (True, BROKE),                                           # reappears stale
+    (False, "decisions: could not remove a stale lock"),     # will not go away
+])
+def test_a_stale_lock_is_broken_only_once_per_append(tmp_path, monkeypatch, capsys,
+                                                     removable, note):
+    """A stale lock that will not go away (or reappears stale) is broken
+    once; after that the writer waits for the timeout like any held lock."""
+    monkeypatch.setattr(dec, "LOCK_TIMEOUT_S", 0.2)
+    removed = []
+    monkeypatch.setattr(dec, "_remove_lock", lambda path: removed.append(path) or removable)
+    stem = tmp_path / "n.json"
+    lock = dec.lock_path(stem)
+    lock.write_text("1\n", encoding="ascii")
+    _age(lock, dec.LOCK_STALE_S + 30)
+    with pytest.raises(dec.DecisionError):
+        dec.append_decision(stem, **_fields())
+    assert removed == [lock]
+    assert capsys.readouterr().err.count(note) == 1
+    assert not dec.decisions_path(stem).exists()
+
+
+def test_a_lock_that_cannot_be_released_is_noted_and_the_entry_kept(tmp_path, monkeypatch,
+                                                                     capsys):
+    """The entry is already written: a release failure (Windows sharing) is
+    noted on stderr, never raised; the next writer breaks the stale lock."""
+    monkeypatch.setattr(dec, "LOCK_RELEASE_S", 0.05)
+    monkeypatch.setattr(dec, "_remove_lock", lambda path: False)
+    stem = tmp_path / "n.json"
+    entry = dec.append_decision(stem, **_fields())
+    assert dec.read_decisions(stem) == [entry]
+    assert dec.lock_path(stem).exists()
+    assert "decisions: could not remove the lock" in capsys.readouterr().err
+
+
+def test_the_lock_is_taken_before_the_newline_check(tmp_path, monkeypatch):
+    """The torn-tail check and the write run under the lock (a second writer
+    could otherwise append between them)."""
+    stem = tmp_path / "n.json"
+    seen = []
+    real = dec._ends_without_newline
+
+    def spy(path):
+        seen.append(dec.lock_path(stem).exists())
+        return real(path)
+
+    monkeypatch.setattr(dec, "_ends_without_newline", spy)
+    dec.append_decision(stem, **_fields())
+    assert seen == [True]
+
+
+_WRITER = r'''
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import decisions as dec
+stem, index, count = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+work = Path(sys.argv[5])
+(work / f"ready-{index}").touch()
+deadline = time.monotonic() + 60
+while not (work / "go").exists():
+    if time.monotonic() > deadline:
+        sys.exit("no go signal")
+    time.sleep(0.002)
+errors = 0
+for i in range(count):
+    try:
+        dec.append_decision(stem, stage="routing", question=f"q {index}/{i}?",
+                            decision=f"d {index}/{i}", rationale="contention test",
+                            confidence="high", source=f"writer-{index}")
+    except Exception as e:
+        errors += 1
+        print(f"{type(e).__name__}: {e}", file=sys.stderr)
+print(errors)
+'''
+WRITERS, APPENDS = 4, 200
+
+
+def test_concurrent_writers_lose_no_entries(tmp_path):
+    """F5a review round 3: 4 processes x 300 appends on Windows lost ~225
+    entries silently ('a' mode is seek-then-write). With the lock: 4 x 200
+    -> 800 valid entries, 0 errors."""
+    stem, work = tmp_path / "n.json", tmp_path / "sync"
+    work.mkdir()
+    procs = [subprocess.Popen([sys.executable, "-c", _WRITER, str(TOOLS), str(stem), str(i),
+                               str(APPENDS), str(work)],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, encoding="utf-8", errors="replace")
+             for i in range(WRITERS)]
+    try:
+        deadline = time.monotonic() + 60
+        while len(list(work.glob("ready-*"))) < WRITERS and time.monotonic() < deadline:
+            time.sleep(0.01)
+        (work / "go").touch()                               # all start together
+        outs = [p.communicate(timeout=180) for p in procs]
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+    for p, (out, err) in zip(procs, outs, strict=True):
+        assert p.returncode == 0, err[-2000:]
+        assert out.strip() == "0", err[-2000:]
+    log = dec.load_decisions(stem)
+    assert log.errors == ()
+    assert len(log.entries) == WRITERS * APPENDS
+    assert len({(e["source"], e["question"]) for e in log.entries}) == WRITERS * APPENDS
+    assert not dec.lock_path(stem).exists()
 
 
 # --- read / load --------------------------------------------------------------

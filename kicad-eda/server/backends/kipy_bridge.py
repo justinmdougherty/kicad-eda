@@ -31,6 +31,7 @@ try:
     from kipy.kicad import LibraryLoadStatus
     from kipy.proto.common import ApiStatusCode
     from kipy.proto.common.types.base_types_pb2 import DocumentType, ElectricalPinType
+    from kipy.proto.common.types.library_types_pb2 import LibraryTableScope, LibraryType
     from kipy.proto.schematic import schematic_jobs_pb2
     from kipy.schematic import Schematic
     from kipy.util import board_layer as board_layers
@@ -47,6 +48,10 @@ __all__ = ["IMPORT_ERROR", "INSTALL_HINT", "KIPY_EXCEPTIONS", "ORIENT_TO_DEG", "
            "PIN_TYPE_NAMES", "require", "vec", "label_shape", "KiCad", "ApiError",
            "ApiStatusCode", "LibraryCommandError", "KiCadConnectionError", "Vector2",
            "LibraryLoadStatus",
+           # library tables (sch_session, pcb_session): enums + plain-int constants
+           "LibraryType", "LibraryTableScope", "LT_SYMBOL", "LT_FOOTPRINT", "LTS_GLOBAL",
+           "LTS_PROJECT", "LTS_BOTH", "LLS_INVALID", "LLS_LOADING", "LLS_LOADED", "LLS_ERROR",
+           "library_status_name",
            "DocumentType", "ElectricalPinType", "schematic_jobs_pb2", "Schematic", "ct", "st",
            # board API (server/backends/pcb_*.py)
            "Board", "BoardLayer", "Track", "ArcTrack", "Via", "Pad", "Net", "Zone",
@@ -100,6 +105,32 @@ if IMPORT_ERROR is None:
     PIN_TYPE_NAMES = _pin_type_table()
 else:
     ORIENT_TO_DEG, DEG_TO_ORIENT, PIN_TYPE_NAMES = {}, {}, {}
+
+
+# Library tables (library_types.proto, "Since: 11.0"). Without kipy the names
+# fall back to the proto's wire values, so module-level defaults such as
+# ``kinds=(kb.LT_FOOTPRINT,)`` still import; every call goes through require().
+if IMPORT_ERROR is None:
+    LT_SYMBOL, LT_FOOTPRINT = LibraryType.LT_SYMBOL, LibraryType.LT_FOOTPRINT
+    LTS_GLOBAL, LTS_PROJECT, LTS_BOTH = (LibraryTableScope.LTS_GLOBAL,
+                                         LibraryTableScope.LTS_PROJECT,
+                                         LibraryTableScope.LTS_BOTH)
+    LLS_INVALID, LLS_LOADING, LLS_LOADED, LLS_ERROR = (
+        LibraryLoadStatus.LLS_INVALID, LibraryLoadStatus.LLS_LOADING,
+        LibraryLoadStatus.LLS_LOADED, LibraryLoadStatus.LLS_ERROR)
+else:
+    LT_SYMBOL, LT_FOOTPRINT = 1, 2
+    LTS_GLOBAL, LTS_PROJECT, LTS_BOTH = 1, 2, 3
+    LLS_INVALID, LLS_LOADING, LLS_LOADED, LLS_ERROR = 1, 2, 3, 4
+
+_LLS_NAMES = {LLS_INVALID: "LLS_INVALID", LLS_LOADING: "LLS_LOADING",
+              LLS_LOADED: "LLS_LOADED", LLS_ERROR: "LLS_ERROR"}
+
+
+def library_status_name(status: int) -> str:
+    """'LLS_ERROR' for a LibraryLoadStatus value ('status 7' for one this
+    table does not know, e.g. from a newer KiCad)."""
+    return _LLS_NAMES.get(status, f"status {status}")
 
 
 def vec(x_mm: float, y_mm: float) -> Vector2:

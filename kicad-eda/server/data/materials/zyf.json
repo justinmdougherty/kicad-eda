@@ -1,0 +1,35 @@
+{
+  "schema": "kicad-eda/materials@1",
+  "retrieved": "2026-10-04",
+  "note": "ZYF PTFE laminates as listed on JLCPCB's high-frequency PCB page (2-layer RF builds only). JLC states no measurement frequency; 10 GHz is assumed (the RO4350B figure on the same page is at 10 GHz). No manufacturer data sheet was read.",
+  "materials": {
+    "zyf.zyf255da": {
+      "vendor": "ZYF (via JLCPCB)", "product": "ZYF255DA", "family": "ptfe", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": true, "process": "ptfe",
+      "dk": [{"value": 2.55, "freq_hz": 1e10, "basis": "typical", "freq_assumed": true, "note": "frequency not stated by JLCPCB; 10 GHz assumed", "source": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}],
+      "df": [{"value": 0.0018, "freq_hz": 1e10, "basis": "typical", "freq_assumed": true, "note": "frequency not stated by JLCPCB; 10 GHz assumed", "source": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}],
+      "sources": [{"title": "JLCPCB high-frequency PCB (fetched 2026-10-04)", "url": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}]
+    },
+    "zyf.zyf265d": {
+      "vendor": "ZYF (via JLCPCB)", "product": "ZYF265D", "family": "ptfe", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": true, "process": "ptfe",
+      "dk": [{"value": 2.65, "freq_hz": 1e10, "basis": "typical", "freq_assumed": true, "note": "frequency not stated by JLCPCB; 10 GHz assumed", "source": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}],
+      "df": [{"value": 0.0019, "freq_hz": 1e10, "basis": "typical", "freq_assumed": true, "note": "frequency not stated by JLCPCB; 10 GHz assumed", "source": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}],
+      "sources": [{"title": "JLCPCB high-frequency PCB (fetched 2026-10-04)", "url": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}]
+    },
+    "zyf.zyf300ca-c": {
+      "vendor": "ZYF (via JLCPCB)", "product": "ZYF300CA-C", "family": "ptfe-ceramic", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": true, "process": "ptfe",
+      "dk": [{"value": 2.94, "freq_hz": 1e10, "basis": "typical", "freq_assumed": true, "note": "frequency not stated by JLCPCB; 10 GHz assumed", "source": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}],
+      "df": [{"value": 0.0016, "freq_hz": 1e10, "basis": "typical", "freq_assumed": true, "note": "frequency not stated by JLCPCB; 10 GHz assumed", "source": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}],
+      "sources": [{"title": "JLCPCB high-frequency PCB (fetched 2026-10-04)", "url": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}]
+    },
+    "zyf.zyf300ca-p": {
+      "vendor": "ZYF (via JLCPCB)", "product": "ZYF300CA-P", "family": "ptfe-ceramic", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": true, "process": "ptfe",
+      "dk": [{"value": 3.0, "freq_hz": 1e10, "basis": "typical", "freq_assumed": true, "note": "frequency not stated by JLCPCB; 10 GHz assumed", "source": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}],
+      "df": [{"value": 0.0018, "freq_hz": 1e10, "basis": "typical", "freq_assumed": true, "note": "frequency not stated by JLCPCB; 10 GHz assumed", "source": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}],
+      "sources": [{"title": "JLCPCB high-frequency PCB (fetched 2026-10-04)", "url": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}]
+    }
+  }
+}

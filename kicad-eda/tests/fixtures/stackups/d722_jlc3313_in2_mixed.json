@@ -1,0 +1,25 @@
+{
+  "description": "ADR D7.2.2 example: JLC preset JLC04161H-3313, In2 a mixed +3V3 layer; In1 keeps the default plane and gets GND by default (a G1 decision draft); the 50 ohm net makes the core Dk conflict (4.43 vs jlcpcb.com 4.6) an ST-W8",
+  "design": {
+    "name": "d722_jlc3313_in2_mixed",
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]], "RF": [["J1", "3"]]},
+    "net_specs": {"RF": {"impedance": 50}},
+    "stackup": {"preset": "jlcpcb:JLC04161H-3313", "roles": {"In2.Cu": {"role": "mixed", "net": "+3V3"}},
+                "impedance_control": {"required": true}, "rationale": "4L: USB + 50 ohm feeds"}
+  },
+  "expect": {
+    "source": "preset",
+    "fab": "jlcpcb",
+    "copper_layers": 4,
+    "kicad_copper_count": 4,
+    "thickness": 1.6252,
+    "gbrjob_rows": 9,
+    "roles": [["F.Cu", "signal", null], ["In1.Cu", "plane", "GND"], ["In2.Cu", "mixed", "+3V3"],
+              ["B.Cu", "signal", null]],
+    "mask_source": "fab",
+    "issues": ["ST-W8"],
+    "drafts": 1
+  }
+}

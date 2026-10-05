@@ -8,17 +8,19 @@ with their nets), the copper layer count, the aux (drill/place) origin and the
 Edge.Cuts primitives of the board AND of every footprint (USB slots,
 mouse-bites), the latter moved into the board's sheet frame.
 
-The pad numbering and net resolution are net_equivalence's own helpers, so a
-pad key here is exactly the key ``net_equivalence.pcb_pad_nets`` produces:
-the converted netlist and the source board compare one to one.
+The pad numbering and net resolution are sexpr_read's helpers, the ones
+``net_equivalence.pcb_pad_nets`` uses, so a pad key here is exactly the key
+pcb_pad_nets produces: the converted netlist and the source board compare one
+to one. KiCad 4/5 bare tokens keep their text as KiCad reads them (pad
+``01``, reference ``007``: sexpr_read.quote_bare_keys).
 
 Coordinates stay in KiCad's sheet frame (mm, Y down). Footprint children are
 stored footprint-local and unrotated (a B-side footprint's children are
 stored already mirrored), so ``to_sheet`` is a rotation by the footprint's
 orientation plus a translation, whatever the side.
 
-Only ``sexpdata`` (through net_equivalence) is needed, lazily. Extracting
-the board's footprints as a library is kicad_import_fplib.py.
+Only ``sexpdata`` (through sexpr_read) is needed, lazily. Extracting the
+board's footprints as a library is kicad_import_fplib.py.
 """
 from __future__ import annotations
 
@@ -36,6 +38,7 @@ if _HERE not in sys.path:
 
 import net_equivalence as ne  # noqa: E402
 import outline  # noqa: E402
+import sexpr_read as sr  # noqa: E402
 
 FOOTPRINT_HEADS = frozenset({"footprint", "module"})
 EDGE_LAYER = "Edge.Cuts"
@@ -103,18 +106,18 @@ class BoardDesign:
 def _top_items(text: str) -> list[tuple[str, str]]:
     """(head, source) of every direct child of ``(kicad_pcb ...)`` whose head
     the importer reads; zone fills, tracks and the rest are skipped unparsed."""
-    if ne._head_of(text) != "kicad_pcb":
+    if sr.head_of(text) != "kicad_pcb":
         raise ValueError("not a KiCad board (expected '(kicad_pcb ...')")
-    start = len(text) - len(text.lstrip(ne._LEADING))
+    start = len(text) - len(text.lstrip(sr.LEADING))
     depth, opened, head = 0, 0, ""
     out: list[tuple[str, str]] = []
-    for m in ne._TOKEN.finditer(text, start):
+    for m in sr.TOKEN_RE.finditer(text, start):
         tok = m.group()
         if tok == "(":
             depth += 1
             if depth == 2:
                 opened = m.start()
-                found = ne._HEAD.match(text, opened)
+                found = sr.HEAD_RE.match(text, opened)
                 head = found.group(1) if found else ""
         elif tok == ")":
             if depth == 0:
@@ -134,7 +137,7 @@ def _top_items(text: str) -> list[tuple[str, str]]:
 def _num(x: Any, where: str) -> float:
     if isinstance(x, bool) or not isinstance(x, (int, float)):
         try:
-            return float(ne._atom(x))
+            return float(sr.atom(x))
         except (TypeError, ValueError) as e:
             raise ValueError(f"{where}: {x!r} is not a number") from e
     return float(x)
@@ -154,20 +157,20 @@ def _norm_deg(rot: float) -> float:
 def _placement(node: list, where: str) -> tuple[float, float, float, list[str]]:
     """(x, y, rot, notes) of a footprint: ``(at x y [rot])`` (KiCad <= 10) or
     ``(transform (translate x y) (rotate r) (scale sx sy))`` (KiCad 11)."""
-    at = ne._child(node, "at")
+    at = sr.child(node, "at")
     if at is not None:
         x, y = _xy(at, f"{where} at")
         return x, y, _num(at[3], where) if len(at) > 3 else 0.0, []
-    tf = ne._child(node, "transform")
+    tf = sr.child(node, "transform")
     if tf is None:
         raise ValueError(f"{where}: no (at ...) or (transform ...) placement")
-    x, y = _xy(ne._child(tf, "translate"), f"{where} translate")
-    rotate = ne._child(tf, "rotate")
+    x, y = _xy(sr.child(tf, "translate"), f"{where} translate")
+    rotate = sr.child(tf, "rotate")
     rot = _num(rotate[1], where) if rotate is not None and len(rotate) > 1 else 0.0
     notes = []
-    scale = ne._child(tf, "scale")
+    scale = sr.child(tf, "scale")
     if scale is not None and any(abs(_num(v, where) - 1.0) > 1e-9 for v in scale[1:]):
-        notes.append(f"{where}: transform scale {[ne._atom(v) for v in scale[1:]]} ignored")
+        notes.append(f"{where}: transform scale {[sr.atom(v) for v in scale[1:]]} ignored")
     return x, y, rot, notes
 
 
@@ -176,17 +179,17 @@ def _text_field(node: list, name: str) -> str:
     ``(fp_text name v)``."""
     legacy = ""
     for child in node[1:]:
-        tag = ne._tag(child)
-        if tag == "property" and len(child) >= 3 and ne._atom(child[1]) in (name, name.lower()):
-            return ne._atom(child[2])
-        if tag == "fp_text" and len(child) >= 3 and ne._atom(child[1]) == name.lower():
-            legacy = ne._atom(child[2])
+        tag = sr.tag(child)
+        if tag == "property" and len(child) >= 3 and sr.atom(child[1]) in (name, name.lower()):
+            return sr.atom(child[2])
+        if tag == "fp_text" and len(child) >= 3 and sr.atom(child[1]) == name.lower():
+            legacy = sr.atom(child[2])
     return legacy
 
 
 def _layer(node: list) -> str:
-    layer = ne._child(node, "layer")
-    return ne._atom(layer[1]) if layer is not None and len(layer) > 1 else ""
+    layer = sr.child(node, "layer")
+    return sr.atom(layer[1]) if layer is not None and len(layer) > 1 else ""
 
 
 # ----------------------------------------------------------------------------
@@ -223,16 +226,16 @@ def _bezier(pts: list[tuple[float, float]], n: int) -> list[tuple[float, float]]
 
 def _poly_prims(node: list, src: str, tf: Transform | None, where: str) -> list[dict]:
     """A closed polygon (``pts`` of ``xy`` points and KiCad 9 ``arc`` runs)."""
-    pts = ne._child(node, "pts")
+    pts = sr.child(node, "pts")
     if pts is None:
         raise ValueError(f"{where}: polygon without pts")
     items: list[tuple[str, tuple]] = []
     for item in pts[1:]:
-        tag = ne._tag(item)
+        tag = sr.tag(item)
         if tag == "xy":
             items.append(("xy", (to_sheet(_xy(item, where), tf),)))
         elif tag == "arc":
-            s, m, e = (to_sheet(_xy(ne._child(item, k), where), tf)
+            s, m, e = (to_sheet(_xy(sr.child(item, k), where), tf)
                        for k in ("start", "mid", "end"))
             items.append(("arc", (s, m, e)))
     out: list[dict] = []
@@ -260,13 +263,13 @@ def shape_prims(node: list, src: str, tf: Transform | None,
     """Edge.Cuts primitives of one drawing (sheet frame): lines, 3-point arcs
     and circles, the shapes outline.from_kicad_primitives chains. Rectangles
     and polygons become lines (+ arcs); a Bezier curve is chorded (noted)."""
-    kind = _SHAPES[ne._tag(node)]
-    where = f"{src} {ne._tag(node)}"
-    pt = lambda key: to_sheet(_xy(ne._child(node, key), where), tf)    # noqa: E731
+    kind = _SHAPES[sr.tag(node)]
+    where = f"{src} {sr.tag(node)}"
+    pt = lambda key: to_sheet(_xy(sr.child(node, key), where), tf)    # noqa: E731
     if kind == "line":
         return [_prim("line", src, start=pt("start"), end=pt("end"))]
     if kind == "arc":
-        if ne._child(node, "mid") is None:
+        if sr.child(node, "mid") is None:
             notes.append(f"{where}: a KiCad 5 arc (center + angle) is not supported; "
                          "open and re-save the board in KiCad 6+")
             return []
@@ -275,13 +278,13 @@ def shape_prims(node: list, src: str, tf: Transform | None,
         c, e = pt("center"), pt("end")
         return [_prim("circle", src, center=c, radius=math.dist(c, e))]
     if kind == "rect":
-        (x0, y0), (x1, y1) = (_xy(ne._child(node, k), where) for k in ("start", "end"))
+        (x0, y0), (x1, y1) = (_xy(sr.child(node, k), where) for k in ("start", "end"))
         corners = [to_sheet(p, tf) for p in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
         return [_prim("line", src, start=corners[i], end=corners[(i + 1) % 4]) for i in range(4)]
     if kind == "poly":
         return _poly_prims(node, src, tf, where)
-    pts = ne._child(node, "pts")
-    ctrl = [to_sheet(_xy(p, where), tf) for p in (pts or [])[1:] if ne._tag(p) == "xy"]
+    pts = sr.child(node, "pts")
+    ctrl = [to_sheet(_xy(p, where), tf) for p in (pts or [])[1:] if sr.tag(p) == "xy"]
     if len(ctrl) != 4:
         notes.append(f"{where}: a Bezier curve needs 4 control points, has {len(ctrl)}")
         return []
@@ -294,7 +297,7 @@ def _edge_prims(nodes: Iterable[list], src: str, tf: Transform | None,
                 notes: list[str]) -> list[dict]:
     out: list[dict] = []
     for node in nodes:
-        if ne._tag(node) in _SHAPES and _layer(node) == EDGE_LAYER:
+        if sr.tag(node) in _SHAPES and _layer(node) == EDGE_LAYER:
             out += shape_prims(node, src, tf, notes)
     return out
 
@@ -306,7 +309,7 @@ def _attrs(node: list) -> frozenset[str]:
     """``(attr smd board_only dnp ...)`` tokens; KiCad 5 ``(attr virtual)``
     means "not in schematic" too."""
     out: set[str] = set()
-    for attr in ne._children(node, "attr"):
+    for attr in sr.children(node, "attr"):
         out |= {str(t) for t in attr[1:] if not isinstance(t, list)}
     if "virtual" in out:
         out.add("board_only")
@@ -315,19 +318,19 @@ def _attrs(node: list) -> frozenset[str]:
 
 def _footprint(index: int, src: str, table: Mapping[int, str],
                notes: list[str]) -> BoardFootprint:
-    node = ne._sexp(src)
-    lib_id = ne._atom(node[1]) if len(node) > 1 and not isinstance(node[1], list) else ""
+    node = sr.parse(sr.quote_bare_keys(src))            # KiCad 4/5 (pad 01 ...) stays "01"
+    lib_id = sr.atom(node[1]) if len(node) > 1 and not isinstance(node[1], list) else ""
     ref = _text_field(node, "Reference")
     where = f"footprint {ref or '(no reference)'} ({lib_id})"
     x, y, rot, more = _placement(node, where)
     notes += more
     layer = _layer(node)
     pads: list[BoardPad] = []
-    for pad in ne._children(node, "pad"):
-        number = ne._pad_number(pad)
+    for pad in sr.children(node, "pad"):
+        number = sr.pad_number(pad)
         if number:
-            pads.append(BoardPad(number, ne._pad_net(pad, table, f"{where} pad {number}")))
-    uuid = ne._value(node, "uuid") or ne._value(node, "tstamp")
+            pads.append(BoardPad(number, sr.pad_net(pad, table, f"{where} pad {number}")))
+    uuid = sr.value(node, "uuid") or sr.value(node, "tstamp")
     edges = _edge_prims(node[1:], ref or lib_id, (x, y, rot), notes)
     return BoardFootprint(index=index, ref=ref, lib_id=lib_id, x=x, y=y, rot=_norm_deg(rot),
                           side="B" if layer.startswith("B.") else "F",
@@ -336,18 +339,18 @@ def _footprint(index: int, src: str, table: Mapping[int, str],
 
 
 def _copper_layers(src: str) -> tuple[str, ...]:
-    node = ne._sexp(src)
+    node = sr.parse(src)
     out = []
     for entry in node[1:]:
         if isinstance(entry, list) and len(entry) >= 3:
-            name, kind = ne._atom(entry[1]), ne._atom(entry[2])
+            name, kind = sr.atom(entry[1]), sr.atom(entry[2])
             if name.endswith(".Cu") and kind in _COPPER_TYPES:
                 out.append(name)
     return tuple(out)
 
 
 def _aux_origin(src: str) -> tuple[float, float] | None:
-    node = ne._child(ne._sexp(src), "aux_axis_origin")
+    node = sr.child(sr.parse(src), "aux_axis_origin")
     if node is None:
         return None
     x, y = _xy(node, "setup aux_axis_origin")
@@ -360,9 +363,9 @@ _GENERATOR_VERSION = re.compile(r'\(\s*generator_version\s+"?([^\s")]+)"?\s*\)')
 def read_board(text: str) -> BoardDesign:
     """Parse a .kicad_pcb (as text) into a BoardDesign. Fails loudly
     (ValueError) on a file that is not a board or is malformed."""
-    text = ne._restore_teardrop_parens(text)
+    text = sr.restore_teardrop_parens(text)
     items = _top_items(text)
-    table = ne._net_table(src for head, src in items if head == "net")
+    table = sr.net_table(src for head, src in items if head == "net")
     notes: list[str] = []
     footprints: list[BoardFootprint] = []
     edges: list[dict] = []
@@ -376,7 +379,7 @@ def read_board(text: str) -> BoardDesign:
         elif head == "setup":
             aux = _aux_origin(src)
         elif head in _SHAPES:
-            edges += _edge_prims([ne._sexp(src)], "board", None, notes)
+            edges += _edge_prims([sr.parse(src)], "board", None, notes)
     gen = _GENERATOR_VERSION.search(text, 0, 4096)
     return BoardDesign(format_version=ne.pcb_format_version(text),
                        generator_version=gen.group(1) if gen else None,

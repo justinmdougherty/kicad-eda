@@ -13,9 +13,12 @@ imports on top of this.
     ``pcb import``, ``sch import``, ``fp upgrade`` and ``sym upgrade``, plus
     the options and format hints the help lists. The exit code proves nothing
     (KiCad 9 prints ``fp upgrade`` help with rc 1), so the usage line decides.
-    Cached per kicad-cli path; a probe that timed out or could not start is
-    not cached. Verified: KiCad 9.0.4 has only the upgrades, 10.0.5 adds
-    ``pcb import`` (no ``--layer-map``), the 10.99 nightly has all five.
+    The CLI-derived fields are cached per kicad-cli path (a probe that timed
+    out or could not start is not cached); the install's version and pcbnew
+    Python are attached per call, because kicad_env settles a transient
+    ``import pcbnew`` probe later. Verified: KiCad 9.0.4 has only the
+    upgrades, 10.0.5 adds ``pcb import`` (no ``--layer-map``), the 10.99
+    nightly has all five.
   * ``scan_console``: the ``Error:`` lines (and crash / refusal lines) of an
     importer's stdout+stderr. rc=0 and the importer's own JSON report are not
     proof of success (D0): the Altium SchDoc importer prints 51 ``Error:``
@@ -30,7 +33,7 @@ import os
 import re
 import subprocess
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
@@ -63,9 +66,11 @@ class ForeignFormatError(ValueError):
 class ForeignFile:
     """One classified input. ``pcb_format`` / ``sch_format`` are kicad-cli
     ``--format`` hints ("" = not that role); ``swig_plugin`` names the
-    PCB_IO_MGR type of the KiCad 9 fallback ("" = none, always for Eagle);
-    ``gui_only`` says why (part of) it needs the KiCad GUI; ``documents`` lists
-    what an Altium project references."""
+    PCB_IO_MGR type of the SWIG LoadBoard fallback ("" = none) and
+    ``swig_min_major`` the oldest pcbnew major that runs it (0 = any; Eagle
+    needs 10: ``LoadBoard(EAGLE)`` returns None on KiCad 9); ``gui_only``
+    says why (part of) it needs the KiCad GUI; ``documents`` lists what an
+    Altium project references."""
     path: Path
     kind: str
     role: str
@@ -73,6 +78,7 @@ class ForeignFile:
     pcb_format: str = ""
     sch_format: str = ""
     swig_plugin: str = ""
+    swig_min_major: int = 0
     library_kinds: tuple[str, ...] = ()
     gui_only: str = ""
     documents: tuple[str, ...] = ()
@@ -157,8 +163,10 @@ _SIMPLE: dict[str, dict] = {
     ".elibz2": dict(kind=EASYEDA, role=LIBRARY, label="EasyEDA Pro library",
                     library_kinds=(FOOTPRINT,)),
 }
+EAGLE_SWIG_MIN_MAJOR = 10      # pcbnew 9.0.4 LoadBoard(EAGLE) returns None (D4)
 _SNIFFED: dict[str, Callable[[Path], ForeignFile]] = {
-    ".brd": lambda p: _eagle(p, BOARD, "Eagle board", pcb_format="eagle"),
+    ".brd": lambda p: _eagle(p, BOARD, "Eagle board", pcb_format="eagle", swig_plugin="EAGLE",
+                             swig_min_major=EAGLE_SWIG_MIN_MAJOR),
     ".sch": lambda p: _eagle(p, SCHEMATIC, "Eagle schematic", sch_format="eagle"),
     ".lbr": lambda p: _eagle(p, LIBRARY, "Eagle library", library_kinds=(FOOTPRINT, SYMBOL)),
     ".lib": _legacy_lib,
@@ -250,7 +258,7 @@ class ImportCapabilities:
                 "python": str(self.python) if self.python else None}
 
 
-_CAPS: dict[str, ImportCapabilities] = {}
+_CAPS: dict[str, ImportCapabilities] = {}     # settled CLI probes; identity fields per call
 
 
 def clear_cache() -> None:
@@ -278,12 +286,8 @@ def _formats(text: str) -> tuple[str, ...]:
     return tuple(f.strip() for f in m.group(1).split(",") if f.strip()) if m else ()
 
 
-def capabilities(install: env.KiCadInstall) -> ImportCapabilities:
-    """Probe one install (five `--help` runs). Cached per kicad-cli path,
-    except when a probe timed out or could not start (probe_errors)."""
-    key = os.path.normcase(os.path.abspath(str(install.kicad_cli)))
-    if key in _CAPS:
-        return _CAPS[key]
+def _probe_cli(install: env.KiCadInstall) -> ImportCapabilities:
+    """Five `kicad-cli <cmd> --help` runs -> the CLI-derived fields."""
     found: dict[str, bool] = {}
     texts: dict[str, str] = {}
     errors: list[str] = []
@@ -295,15 +299,26 @@ def capabilities(install: env.KiCadInstall) -> ImportCapabilities:
         found[name] = r.returncode != env.TRANSIENT_RC and help_supports(texts[name], words)
     pcb = texts["pcb_import"] if found["pcb_import"] else ""
     sch = texts["sch_import"] if found["sch_import"] else ""
-    caps = ImportCapabilities(
+    return ImportCapabilities(
         version=install.version, version_tuple=install.version_tuple,
-        kicad_cli=install.kicad_cli, python=install.python, **found,
+        kicad_cli=install.kicad_cli, **found,
         pcb_report_json="--report-format" in pcb, sch_report_json="--report-format" in sch,
         layer_map="--layer-map" in pcb, pcb_formats=_formats(pcb), sch_formats=_formats(sch),
         probe_errors=tuple(errors))
-    if not errors:
-        _CAPS[key] = caps
-    return caps
+
+
+def capabilities(install: env.KiCadInstall) -> ImportCapabilities:
+    """What `install` can import. The CLI probe (five `--help` runs) is cached
+    per kicad-cli path unless a probe timed out or could not start
+    (probe_errors); the version, kicad-cli path and pcbnew Python always come
+    from `install` itself, so a Python that kicad_env found after an
+    unsettled first probe is used at once."""
+    key = os.path.normcase(os.path.abspath(str(install.kicad_cli)))
+    cli = _CAPS.get(key) or _probe_cli(install)
+    if not cli.probe_errors:
+        _CAPS[key] = cli
+    return replace(cli, version=install.version, version_tuple=install.version_tuple,
+                   kicad_cli=install.kicad_cli, python=install.python)
 
 
 def discover_capabilities(installs: Iterable[env.KiCadInstall] | None = None

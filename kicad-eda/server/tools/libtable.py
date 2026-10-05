@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """KiCad library tables and the project-library resolver (ROADMAP_DECISIONS D1).
 
-Stdlib-only: the venv and KiCad's bundled Python (SWIG scripts) import it.
+Stdlib-only and Python 3.11-safe: the venv and KiCad's bundled Python (SWIG
+scripts) import it.
 
-1. Tables: ``sym-lib-table`` / ``fp-lib-table`` in both row syntaxes KiCad
-   ships, the quoted ``(lib (name "X") (type "KiCad") ...)`` and KiCad 9's old
-   unquoted ``(lib (name X)(type Kicad)(uri ${KICAD9_...}/X.pretty)...)``. A
-   rewrite keeps every row and item it does not own byte-for-byte, in place.
+1. Tables: the S-expression layer (both row syntaxes KiCad ships; a rewrite
+   keeps every row and item it does not own byte-for-byte, in place) lives in
+   libtable_sexp and is re-exported here: ``libtable.read_table``, ``LibRow``,
+   ``LibTable``, ``LibTableError``... keep working.
 2. Resolution, D1 order: netlist ``libraries`` block > project table >
    stock (``<symbols>/<nick>.kicad_sym``, ``<footprints>/<nick>.pretty`` of
    the chosen install, which ``${KICAD<n>_*_DIR}`` for any n >= 6 aliases).
+   ``LibraryResolver.for_directory`` reads a directory that has no netlist
+   (a schematic's, an import's) the way KiCad does.
 3. ``LibraryResolver.materialize`` merges the project libraries into the
    tables next to generated outputs (read by the KiCad 11 api-server and by
    ``kicad-cli sch erc`` beside a ``.kicad_pro``) as ``(descr "kicad-eda
    managed")`` rows, which a rerun replaces.
+4. ``library_generator`` tells the libraries this plugin authored
+   (``(generator "kicad-eda")``) from stock and hand-made ones.
 """
 from __future__ import annotations
 
@@ -21,8 +26,15 @@ import json
 import os
 import re
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+
+from libtable_sexp import (  # noqa: F401  (the table layer, re-exported for consumers)
+    IMPORT_CACHE_OPTION, MANAGED_DESCR, TABLE_VERSION, LibRow, LibTable, LibTableError,
+    format_table, header_value, is_import_cache, parse_options, parse_table, read_table,
+    write_table)
+from libtable_sexp import PathArg as _PathArg
 
 SYMBOL, FOOTPRINT = "symbol", "footprint"
 KINDS = (SYMBOL, FOOTPRINT)
@@ -33,243 +45,24 @@ TABLE_FILES = {SYMBOL: "sym-lib-table", FOOTPRINT: "fp-lib-table"}
 TABLE_TAGS = {SYMBOL: "sym_lib_table", FOOTPRINT: "fp_lib_table"}
 MAP_KEYS = {SYMBOL: "symbols", FOOTPRINT: "footprints"}   # netlist block + library_map
 LIB_SUFFIX = {SYMBOL: ".kicad_sym", FOOTPRINT: ".pretty"}
-TABLE_VERSION = 7                     # what KiCad 7..11 write
 MAP_VERSION = 1
-MANAGED_DESCR = "kicad-eda managed"   # marks the rows materialize() owns
-IMPORT_CACHE_OPTION = "kicad_import_cache"   # rows `kicad-cli ... import` writes
 MIN_VERSIONED_VAR = 6                 # KICAD6_SYMBOL_DIR was the first numbered name
 BLOCK_ORIGIN = "netlist libraries block"
 # Libraries the builders use without a component naming them (design_nicknames):
 POWER_LIBRARY = "power"               # power:PWR_FLAG (sch_build, sch_api), power:<net>
 DEFAULT_MOUNTING_HOLE_FOOTPRINT = "MountingHole:MountingHole_3.2mm_M3"   # swig_build_board
+KICAD_EDA_GENERATOR = "kicad-eda"     # the (generator ...) fp_author / sym_author write
+HEADER_BYTES = 8192                   # a library file's header fits; whole libs are not read
 
 _NICKNAME_RE = re.compile(r"^[^:\x00-\x1f]+$")   # same rule as netlist_schema
-_TABLE_TAG_RE = re.compile(r"^[a-z_]+_lib_table$")
 _VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$\(([A-Za-z_][A-Za-z0-9_]*)\)")
 _STOCK_VAR_RE = re.compile(r"KICAD(\d+)_(SYMBOL|FOOTPRINT|3DMODEL)_DIR")
 _LEGACY_STOCK_VARS = {"KICAD_SYMBOL_DIR": "SYMBOL", "KISYSMOD": "FOOTPRINT",
                       "KISYS3DMOD": "3DMODEL"}
-_ESCAPES = {'"': '"', "\\": "\\", "n": "\n", "t": "\t", "r": "\r",
-            "a": "\a", "b": "\b", "f": "\f", "v": "\v"}
-_ESCAPE_RE = re.compile(r"\\(.)", re.S)
-# space | ( | ) | "quoted" (escapes allowed) | bare atom | a quote never closed
-_TOKEN_RE = re.compile(r'(\s+)|(\()|(\))|("(?:[^"\\]|\\.)*")|([^\s()"]+)|(")', re.S)
-_ROW_FIELDS = ("name", "type", "uri", "options", "descr")
-_ROW_FLAGS = ("disabled", "hidden")
-_PathArg = str | os.PathLike          # what the path parameters accept
-
-
-class LibTableError(ValueError):
-    """A library table, a libraries block or a materialize request is invalid."""
 
 
 class LibraryNotFoundError(LibTableError, LookupError):
     """A nickname resolves nowhere (or only to a disabled row)."""
-
-
-# --- S-expression reader (just enough for library tables, with positions) ---
-@dataclass
-class _Atom:
-    value: str
-    pos: int
-
-
-@dataclass
-class _List:
-    items: list
-    start: int
-    end: int = -1
-
-
-def _syntax(source: str, text: str, pos: int, problem: str) -> LibTableError:
-    line, col = text.count("\n", 0, pos) + 1, pos - text.rfind("\n", 0, pos)
-    return LibTableError(f"{source}: line {line}, col {col}: {problem}")
-
-
-def _unquote(token: str) -> str:
-    """A quoted token's value. Unknown backslash pairs stay as written, so an
-    unescaped Windows path survives."""
-    return _ESCAPE_RE.sub(lambda m: _ESCAPES.get(m.group(1), m.group(0)), token[1:-1])
-
-
-def _read_sexp(text: str, source: str) -> _List:
-    """Parse exactly one top-level list."""
-    stack: list[_List] = []
-    root: _List | None = None
-    for m in _TOKEN_RE.finditer(text):
-        space, opening, closing, quoted, bare, _lone_quote = m.groups()
-        pos = m.start()
-        if space:
-            continue
-        if closing:
-            if not stack:
-                raise _syntax(source, text, pos, "unbalanced ')'")
-            stack.pop().end = m.end()
-        elif root is not None and not stack:
-            raise _syntax(source, text, pos, "unexpected text after the table")
-        elif opening:
-            node = _List([], pos)
-            if stack:
-                stack[-1].items.append(node)
-            else:
-                root = node
-            stack.append(node)
-        elif not stack:
-            raise _syntax(source, text, pos, "expected '(' to start the table")
-        elif quoted is None and bare is None:
-            raise _syntax(source, text, pos, "unterminated string")
-        else:
-            stack[-1].items.append(_Atom(bare if quoted is None else _unquote(quoted), pos))
-    if stack:
-        raise _syntax(source, text, stack[-1].start, "unclosed '(' (missing ')')")
-    if root is None:
-        raise LibTableError(f"{source}: empty file (expected a library table)")
-    return root
-
-
-def _quote(s: str) -> str:
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
-
-
-# --- tables ------------------------------------------------------------------
-def _option_map(options: str) -> dict[str, str]:
-    """KiCad row options ``key=value|flag`` -> {"key": "value", "flag": ""}."""
-    out: dict[str, str] = {}
-    for part in options.split("|"):
-        if part.strip():
-            key, _, value = part.partition("=")
-            out[key.strip()] = value.strip()
-    return out
-
-
-def _is_import_cache(options: str) -> bool:
-    value = _option_map(options).get(IMPORT_CACHE_OPTION)
-    return value is not None and value.lower() not in ("0", "false", "no")
-
-
-@dataclass(frozen=True)
-class LibRow:
-    """One ``(lib ...)`` row. ``raw`` is the exact source text of a parsed row
-    (unknown tokens included); it is not part of equality."""
-    name: str
-    uri: str
-    type: str = "KiCad"
-    options: str = ""
-    descr: str = ""
-    disabled: bool = False
-    hidden: bool = False
-    raw: str | None = field(default=None, compare=False, repr=False)
-
-    @property
-    def is_kicad(self) -> bool:
-        """KiCad-format library (KiCad 9 tables still spell one row "Kicad")."""
-        return self.type.lower() == "kicad"
-
-    @property
-    def managed(self) -> bool:
-        return self.descr == MANAGED_DESCR
-
-    @property
-    def option_map(self) -> dict[str, str]:
-        return _option_map(self.options)
-
-    @property
-    def import_cache(self) -> bool:
-        return _is_import_cache(self.options)
-
-    def to_sexp(self) -> str:
-        """The row in the KiCad 10/11 layout (``raw`` is ignored)."""
-        parts = [f"({tag} {_quote(value)})" for tag, value in (
-            ("name", self.name), ("type", self.type), ("uri", self.uri),
-            ("options", self.options), ("descr", self.descr))]
-        parts += [f"({flag})" for flag in _ROW_FLAGS if getattr(self, flag)]
-        return "(lib " + " ".join(parts) + ")"
-
-    def text(self) -> str:
-        """What a written table carries for this row: the source text if parsed."""
-        return self.raw if self.raw is not None else self.to_sexp()
-
-
-@dataclass(frozen=True)
-class LibTable:
-    """A parsed table. ``version`` is None for tables written without one
-    (KiCad 9's global tables). ``extra`` keeps unknown top-level items
-    verbatim as ``(rows_before, text)``, so a rewrite puts each one back."""
-    tag: str
-    rows: tuple[LibRow, ...] = ()
-    version: int | None = TABLE_VERSION
-    extra: tuple[tuple[int, str], ...] = ()
-
-
-def _parse_row(node: _List, text: str, source: str) -> LibRow:
-    fields: dict[str, str] = {}
-    flags: dict[str, bool] = {}
-    for item in node.items[1:]:
-        pos = item.pos if isinstance(item, _Atom) else item.start
-        if not (isinstance(item, _List) and item.items and isinstance(item.items[0], _Atom)):
-            raise _syntax(source, text, pos, "malformed lib row: every entry is (token value)")
-        tag, args = item.items[0].value, item.items[1:]
-        if tag in _ROW_FIELDS:
-            if tag in fields:
-                raise _syntax(source, text, pos, f"duplicate ({tag} ...) in a lib row")
-            if len(args) != 1 or not isinstance(args[0], _Atom):
-                raise _syntax(source, text, pos, f"malformed ({tag} ...): expected one value")
-            fields[tag] = args[0].value
-        elif tag in _ROW_FLAGS:    # KiCad writes bare (disabled) / (hidden)
-            if args:
-                raise _syntax(source, text, pos, f"malformed ({tag}): takes no value")
-            flags[tag] = True
-        # any other token survives through LibRow.raw
-    name = fields.get("name")
-    if name is None:
-        raise _syntax(source, text, node.start, "malformed lib row: no (name ...)")
-    for required in ("type", "uri"):
-        if required not in fields:
-            raise _syntax(source, text, node.start, f"lib row {name!r} has no ({required} ...)")
-    return LibRow(name=name, uri=fields["uri"], type=fields["type"],
-                  options=fields.get("options", ""), descr=fields.get("descr", ""),
-                  disabled=flags.get("disabled", False), hidden=flags.get("hidden", False),
-                  raw=text[node.start:node.end])
-
-
-def parse_table(text: str, source: str = "<library table>") -> LibTable:
-    """Parse a sym-lib-table / fp-lib-table (either row syntax). Raises
-    LibTableError naming ``source`` and the line/column of the problem."""
-    root = _read_sexp(text, source)
-    head = root.items[0] if root.items else None
-    if not (isinstance(head, _Atom) and _TABLE_TAG_RE.match(head.value)):
-        found = head.value if isinstance(head, _Atom) else "?"
-        raise _syntax(source, text, root.start,
-                      f"not a library table: starts with ({found} ...), expected "
-                      f"(sym_lib_table ...) or (fp_lib_table ...)")
-    rows: list[LibRow] = []
-    extra: list[tuple[int, str]] = []
-    version: int | None = None
-    for item in root.items[1:]:
-        if isinstance(item, _Atom):
-            raise _syntax(source, text, item.pos, f"malformed table: unexpected {item.value!r}")
-        tag = item.items[0].value if item.items and isinstance(item.items[0], _Atom) else None
-        if tag == "lib":
-            rows.append(_parse_row(item, text, source))
-        elif tag == "version":
-            value = item.items[1].value if len(item.items) == 2 and isinstance(
-                item.items[1], _Atom) else ""
-            if not value.isdigit():
-                raise _syntax(source, text, item.start, f"bad (version ...) value {value!r}")
-            version = int(value)
-        else:
-            extra.append((len(rows), text[item.start:item.end]))
-    return LibTable(head.value, tuple(rows), version, tuple(extra))
-
-
-def read_table(path: _PathArg) -> LibTable:
-    """Parse a table file; errors name the file."""
-    p = Path(path)
-    try:
-        text = p.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeDecodeError) as e:
-        raise LibTableError(f"cannot read library table {p}: {e}") from e
-    return parse_table(text, source=str(p))
 
 
 def _read_kind(path: Path, kind: str) -> LibTable:
@@ -277,29 +70,6 @@ def _read_kind(path: Path, kind: str) -> LibTable:
     if table.tag != TABLE_TAGS[kind]:
         raise LibTableError(f"{path}: expected ({TABLE_TAGS[kind]} ...), found ({table.tag} ...)")
     return table
-
-
-def format_table(table: LibTable) -> str:
-    """Table text: KiCad 10/11 layout for new rows; parsed rows and unknown
-    items verbatim, each item after as many rows as it followed."""
-    n = len(table.rows)
-    body = sorted([(min(at, n), 0, i, text) for i, (at, text) in enumerate(table.extra)]
-                  + [(i, 1, i, row.text()) for i, row in enumerate(table.rows)])
-    head = [f"({table.tag}"] + ([f"\t(version {table.version})"]
-                                if table.version is not None else [])
-    return "\n".join(head + [f"\t{item[3]}" for item in body] + [")"]) + "\n"
-
-
-def write_table(path: _PathArg, table: LibTable) -> None:
-    """Write atomically (temp file + replace), so KiCad never reads half a table."""
-    p = Path(path)
-    tmp = p.with_name(p.name + ".kicad-eda.tmp")
-    tmp.write_text(format_table(table), encoding="utf-8", newline="\n")
-    try:
-        os.replace(tmp, p)
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        raise
 
 
 # --- variable expansion --------------------------------------------------------
@@ -361,11 +131,35 @@ def _relative_intent(uri: str) -> bool:
     return u.startswith(("${KIPRJMOD}", "$(KIPRJMOD)")) or ("$" not in u and not os.path.isabs(u))
 
 
+def _location_independent(uri: str) -> bool:
+    """A URI naming the same file whichever table holds it: an absolute path
+    or an install / user variable; never relative or ``${KIPRJMOD}``-based."""
+    return not _relative_intent(uri) and "KIPRJMOD" not in uri
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """The same library location: equal normalised paths, or equal real paths
+    (symlinks and junctions resolved)."""
+    if _same_path(a, b):
+        return True
+    try:
+        return _same_path(Path(os.path.realpath(a)), Path(os.path.realpath(b)))
+    except (OSError, ValueError):      # unresolvable: not provably the same file
+        return False
+
+
+def _check_nicknames(arg: str, value: object) -> None:
+    """Refuse a bare str / bytes where an iterable of nicknames is expected:
+    iterating 'Device' would ask for the libraries 'D', 'e', 'v', ..."""
+    if isinstance(value, (str, bytes)):
+        raise TypeError(f"{arg}= takes an iterable of library nicknames, not a bare "
+                        f"{type(value).__name__}: {value!r} would be read one character at "
+                        f"a time; pass [{value!r}]")
+
+
 def _validate_block(block: object) -> dict[str, dict[str, str]]:
     """The netlist ``libraries`` block as {kind: {nick: path}}; fails fast."""
     out: dict[str, dict[str, str]] = {kind: {} for kind in KINDS}
-    if block is None:
-        return out
     if not isinstance(block, Mapping):
         raise LibTableError(f"the netlist 'libraries' block must be an object with 'symbols' / "
                             f"'footprints', got {type(block).__name__}")
@@ -415,7 +209,7 @@ class ResolvedLib:
 
     @property
     def import_cache(self) -> bool:
-        return _is_import_cache(self.options)
+        return is_import_cache(self.options)
 
 
 def write_minimal_kicad_pro(path: _PathArg) -> bool:
@@ -433,6 +227,9 @@ def write_minimal_kicad_pro(path: _PathArg) -> bool:
     return True
 
 
+_DIR_ONLY: Mapping = MappingProxyType({})   # for_directory's marker: no netlist, no block
+
+
 class LibraryResolver:
     """Nickname -> library path in the D1 order (netlist block > project table >
     stock). ``netlist_dir`` anchors the block (relative paths, ``${KIPRJMOD}``);
@@ -442,23 +239,29 @@ class LibraryResolver:
     ``design_libraries`` is the netlist's ``libraries`` block, ``{}`` for a
     netlist without one (for_netlist / for_design pass that): project rows
     tagged ``kicad-eda managed`` are then a block's derived copies and are
-    ignored (the next materialize replaces or removes them). ``None`` means
-    no netlist (``dir_only``, e.g. a schematic directory): every row counts,
-    as KiCad reads the tables. A disabled project row hides the nickname, as
-    in KiCad. A malformed block or project table raises LibTableError here."""
+    ignored (the next materialize replaces or removes them). ``None`` is a
+    TypeError: a directory without a netlist (a schematic's, an import's) is
+    read by ``for_directory`` (``dir_only``), where every row counts, as KiCad
+    reads the tables. A disabled project row hides the nickname, as in
+    KiCad. A malformed block or project table raises LibTableError here."""
 
     write_minimal_kicad_pro = staticmethod(write_minimal_kicad_pro)
 
-    def __init__(self, netlist_dir: _PathArg, design_libraries: Mapping | None,
+    def __init__(self, netlist_dir: _PathArg, design_libraries: Mapping,
                  stock_symbols_dir: _PathArg | None, stock_footprints_dir: _PathArg | None,
                  project_dir: _PathArg | None = None, *,
                  env: Mapping[str, str] | None = None) -> None:
+        if design_libraries is None:
+            raise TypeError("LibraryResolver(design_libraries=None): pass the netlist's "
+                            "'libraries' block ({} when it has none), or use "
+                            "LibraryResolver.for_directory(dir, stock_symbols_dir, "
+                            "stock_footprints_dir) for a directory without a netlist")
         self.netlist_dir = _abs(netlist_dir)
         self.project_dir = _abs(project_dir) if project_dir is not None else self.netlist_dir
         self.stock_dirs: dict[str, Path | None] = {
             SYMBOL: _abs(stock_symbols_dir) if stock_symbols_dir is not None else None,
             FOOTPRINT: _abs(stock_footprints_dir) if stock_footprints_dir is not None else None}
-        self.dir_only = design_libraries is None
+        self.dir_only = design_libraries is _DIR_ONLY
         self._env = dict(os.environ if env is None else env)
         block = _validate_block(design_libraries)
         self._load_errors: list[str] = []
@@ -466,6 +269,15 @@ class LibraryResolver:
         self._block = {kind: self._block_decls(kind, block[kind]) for kind in KINDS}
         self._project = {kind: self._project_decls(kind) for kind in KINDS}
         self._conflicts = [msg for kind in KINDS for msg in self._find_conflicts(kind)]
+
+    @classmethod
+    def for_directory(cls, directory: _PathArg, stock_symbols_dir: _PathArg | None,
+                      stock_footprints_dir: _PathArg | None, *,
+                      env: Mapping[str, str] | None = None) -> "LibraryResolver":
+        """A resolver for a directory without a netlist (a schematic's, an
+        import's): its project tables exactly as KiCad reads them, ``kicad-eda
+        managed`` rows included (``dir_only``), then the stock libraries."""
+        return cls(directory, _DIR_ONLY, stock_symbols_dir, stock_footprints_dir, env=env)
 
     @classmethod
     def for_design(cls, netlist_dir: _PathArg, design: Mapping,
@@ -635,7 +447,10 @@ class LibraryResolver:
         """Every library problem as a message: duplicate project nicknames,
         block-vs-project conflicts (another URI or a disabled row: D1 lint
         error), undefined variables, missing or wrong-kind files (not for
-        disabled rows), and each ``symbols`` / ``footprints`` nickname unresolved."""
+        disabled rows), and each ``symbols`` / ``footprints`` nickname unresolved
+        (an iterable of nicknames; a bare str is a TypeError)."""
+        _check_nicknames("symbols", symbols)
+        _check_nicknames("footprints", footprints)
         out = list(self._load_errors) + list(self._conflicts)
         for kind in KINDS:
             for decl in self._decls(kind):
@@ -684,10 +499,17 @@ class LibraryResolver:
 
     def _check_clash(self, path: Path, decl: ResolvedLib, clash: LibRow, out_dir: Path) -> None:
         """``clash``, an unmanaged row of the output table, holds ``decl``'s
-        nickname: fine only for the same library, enabled or disabled alike."""
+        nickname: fine only for the same library, enabled or disabled alike.
+        Equal URI text proves that only for a location-independent URI; a
+        relative / ``${KIPRJMOD}`` one resolves against each table's own
+        directory, so there the resolved (real) paths decide."""
         clash_path, _ = self._locate(clash.uri, out_dir)
-        if not (_same_path(clash_path, decl.path) or clash.uri == decl.uri):
-            problem = f"pointing to {clash_path}; rename one of them"
+        same_text = clash.uri == decl.uri
+        if not ((same_text and _location_independent(decl.uri))
+                or _same_file(clash_path, decl.path)):
+            hint = (" (the same URI text, but resolved against this table's directory)"
+                    if same_text else "")
+            problem = f"pointing to {clash_path}{hint}; rename one of them"
         elif clash.disabled and not decl.disabled:
             problem = ("for that library, but disabled there, so KiCad would not load it; "
                        "enable or remove that row")
@@ -741,7 +563,10 @@ class LibraryResolver:
         LibTableError (as for a block-vs-project conflict). Old managed rows
         are replaced, new ones go last: a rerun writes nothing, and without
         project libraries no file is created (stale managed rows are cleared).
-        Both tables are checked before either is written. Returns a report."""
+        Both tables are checked before either is written. Returns a report.
+        A bare str for ``symbols`` / ``footprints`` is a TypeError."""
+        _check_nicknames("symbols", symbols)
+        _check_nicknames("footprints", footprints)
         out = _abs(out_dir)
         if not out.is_dir():
             raise LibTableError(f"cannot materialize library tables: output directory {out} "
@@ -772,6 +597,35 @@ def lookup(library_map: Mapping, kind: str, nick: str) -> str | None:
         return None
     path = os.path.join(root, nick + LIB_SUFFIX[kind])
     return path if (os.path.isfile(path) if kind == SYMBOL else os.path.isdir(path)) else None
+
+
+def _file_generator(path: Path) -> str | None:
+    """The ``(generator ...)`` in one .kicad_sym / .kicad_mod header."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(HEADER_BYTES)
+    except OSError as e:
+        raise LibTableError(f"cannot read library file {path}: {e}") from e
+    return header_value(head.decode("utf-8", errors="replace"), "generator")
+
+
+def library_generator(path: _PathArg) -> str | None:
+    """KICAD_EDA_GENERATOR (``"kicad-eda"``) when this plugin authored the
+    library: a .kicad_sym, or a single .kicad_mod, whose header carries
+    ``(generator "kicad-eda")``, or a .pretty in which every .kicad_mod does.
+    None for another generator or none, an empty or mixed .pretty, any other
+    kind of path or a missing one. An unreadable file raises LibTableError."""
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if suffix == LIB_SUFFIX[FOOTPRINT] and p.is_dir():
+        files = sorted(f for f in p.glob("*.kicad_mod") if f.is_file())
+    elif suffix in (LIB_SUFFIX[SYMBOL], ".kicad_mod") and p.is_file():
+        files = [p]
+    else:
+        return None
+    if files and all(_file_generator(f) == KICAD_EDA_GENERATOR for f in files):
+        return KICAD_EDA_GENERATOR
+    return None
 
 
 def design_nicknames(design: Mapping) -> dict[str, list[str]]:

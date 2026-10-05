@@ -9,6 +9,7 @@
         api.add_tracks("OUT_A", [{"layer": "F.Cu", "start": [10, 10], "end": [14, 10],
                                   "width": 0.25}])
         api.add_vias("OUT_A", [{"x": 14, "y": 10, "diameter": 0.6, "drill": 0.3}])
+        api.place_footprint("P_parts:Quectel_LG290P", "U9", 20, 15)   # project fp-lib-table
         api.refill_zones(); api.save()
 
 Modes: ``headless`` launches a private KiCad 11 ``kicad-cli api-server`` with
@@ -66,6 +67,7 @@ _COPPER_ENTRY_RE = re.compile(r'\(\s*\d+\s+"((?:F|B|In\d+)\.Cu)"')
 DEFAULT_CLASS = "Default"
 SEGMENT_KEYS = ("layer", "start", "end", "width")
 VIA_KEYS = ("x", "y", "diameter", "drill")
+SIDE_LAYERS = {"F": "F.Cu", "B": "B.Cu"}   # place_footprint side -> the layer KiCad takes
 # netclass field -> rules() key that backs it when neither KiCad nor the project sets it
 CLASS_TO_RULE = {"clearance": "min_clearance", "track_width": "min_track_width",
                  "via_diameter": "min_via_diameter", "via_drill": "min_via_drill"}
@@ -198,7 +200,8 @@ def _check_segment(segment: dict, copper: list[str]) -> tuple[int, Point, Point,
         raise BoardApiError(f"segment {segment!r} lacks {missing}; each needs {SEGMENT_KEYS}")
     layer = str(segment["layer"])
     if layer not in copper:
-        raise BoardApiError(f"unknown copper layer {layer!r}; this board's copper layers are {copper}")
+        raise BoardApiError(
+            f"unknown copper layer {layer!r}; this board's copper layers are {copper}")
     start, end = _point(segment["start"], "start"), _point(segment["end"], "end")
     width = _positive(segment["width"], "track width")
     if start == end:
@@ -219,6 +222,44 @@ def _check_via(spec: dict) -> tuple[float, float, float, float]:
     if drill >= diameter:
         raise BoardApiError(f"via drill {drill} mm must be smaller than its diameter {diameter} mm")
     return x, y, diameter, drill
+
+
+def _check_lib_id(lib_id: str, table: Path) -> str:
+    """``lib_id`` when it is '<nickname>:<footprint>'; the error names the
+    project table the nickname must be a row of."""
+    nickname, sep, name = lib_id.partition(":") if isinstance(lib_id, str) else ("", "", "")
+    if not (nickname.strip() and sep and name.strip()):
+        raise BoardApiError(f"lib_id must be '<nickname>:<footprint>' with the nickname a row "
+                            f"of {table} or a stock footprint library, got {lib_id!r}")
+    return lib_id
+
+
+def _check_ref(ref: str) -> str:
+    if not isinstance(ref, str) or not ref.strip() or any(ch.isspace() for ch in ref):
+        raise BoardApiError(f"reference must be a non-empty string without spaces, got {ref!r}")
+    return ref
+
+
+def _side_layer(side: str) -> int:
+    """BoardLayer value for side 'F' / 'B' (KiCad places on F.Cu or B.Cu only)."""
+    key = side.upper() if isinstance(side, str) else ""
+    if key not in SIDE_LAYERS:
+        raise BoardApiError(f"side must be 'F' or 'B', got {side!r}")
+    return items.layer_value(SIDE_LAYERS[key])
+
+
+def _degrees(value: Any) -> float:
+    number = _num(value)
+    if number is None:
+        raise BoardApiError(f"rot must be a number in degrees, got {value!r}")
+    return number
+
+
+def _angle(degrees: float) -> Any:
+    """A kipy Angle; kipy_bridge exports none yet, and every caller already
+    passed kb.require() (BoardApi.open), so kipy imports."""
+    from kipy.geometry import Angle
+    return Angle.from_degrees(degrees)
 
 
 # --- union-find over item ids -------------------------------------------------
@@ -372,7 +413,8 @@ class BoardApi:
             raise BoardApiError(
                 f"{exc}; KiCad {self.kicad_version} predates GetBoardEnabledLayers (needs "
                 f"{ENABLED_LAYERS_MIN_VERSION}) and {self._path} has no readable (layers ...) "
-                "table: open the board through a headless KiCad 11 session (mode='headless')") from exc
+                "table: open the board through a headless KiCad 11 session (mode='headless')"
+            ) from exc
         self._note(f"enabled layers unavailable on KiCad {self.kicad_version} (needs "
                    f"{ENABLED_LAYERS_MIN_VERSION}); copper layers read from the file's layer "
                    f"table: {copper}")
@@ -556,10 +598,64 @@ class BoardApi:
         self._call(f"saving a copy to {target}", self._board.save_as, target, overwrite)
         return target
 
+    # --- library footprints -------------------------------------------------
+    def place_footprint(self, lib_id: str, ref: str, x_mm: float, y_mm: float,
+                        rot: float = 0, side: str = "F", value: str = "") -> dict:
+        """Place library footprint ``lib_id`` ('<nickname>:<footprint>': a row
+        of the project fp-lib-table that existed when the board was opened, or
+        a stock library) with its origin at (x_mm, y_mm), rotated ``rot``
+        degrees, on side 'F' or 'B' (KiCad flips it), as ``ref`` with
+        ``value`` ('' keeps the library's, the footprint name). The footprint
+        libraries load first (headless: once per session). Returns {id, ref,
+        value, x, y, rot, side, bbox, pads (count), lib_id (KiCad's FPID)};
+        the pads have no nets yet. Every library error names the lib_id and
+        the project fp-lib-table."""
+        self._require_open()
+        _check_lib_id(lib_id, Path(self._path).parent / sess.FP_TABLE)
+        _check_ref(ref)
+        if not isinstance(value, str):
+            raise BoardApiError(f"value must be a string, got {value!r}")
+        position = kb.vec(_coord(x_mm, "x"), _coord(y_mm, "y"))
+        angle, layer = _angle(_degrees(rot)), _side_layer(side)
+        self._refuse_duplicate(ref)
+        self._session.load_libraries((kb.LT_FOOTPRINT,))
+        placed = self._place(lib_id, ref, position, angle, layer)
+        self._dirty = True                       # KiCad holds the footprint from here on
+        placed.reference_field.text.value = ref
+        if value:
+            placed.value_field.text.value = value
+        updated = self._call(f"naming the placed {lib_id} {ref} (the board now holds it "
+                             "unnamed, unsaved; discard() drops it)",
+                             self._board.update_items, [placed])
+        footprint = updated[0] if updated else placed
+        bbox = self._call(f"bounding box of {ref}", self._board.get_item_bounding_box, footprint)
+        fpid = str(footprint.definition.id)
+        return {**items.footprint_dict(footprint, bbox, len(_definition_pads(footprint))),
+                "lib_id": fpid if fpid.strip(":") else lib_id}
+
+    def _refuse_duplicate(self, ref: str) -> None:
+        taken = {str(fp.reference_field.text.value)
+                 for fp in self._call("reading footprints", self._board.get_footprints)}
+        if ref in taken:
+            raise BoardApiError(f"reference {ref} is already used on {self._path}; pick a free "
+                                "one (footprints() lists the board's references)")
+
+    def _place(self, lib_id: str, ref: str, position: kb.Vector2, angle: Any,
+               layer: int) -> kb.FootprintInstance:
+        try:
+            return self._board.place_footprint_from_library(lib_id, position, angle, layer)
+        except kb.KIPY_EXCEPTIONS as exc:
+            hint = self._session.footprint_library_hint(lib_id.partition(":")[0])
+            raise BoardApiError(f"placing {lib_id} as {ref} on {self._path} failed: {exc}; "
+                                f"{hint}") from exc
+
     # --- internals ----------------------------------------------------------
-    def _call(self, what: str, fn, *args, **kwargs) -> Any:
+    def _require_open(self) -> None:
         if self._closed:
             raise BoardApiError(f"{self._path} is closed; open it again with BoardApi.open")
+
+    def _call(self, what: str, fn, *args, **kwargs) -> Any:
+        self._require_open()
         try:
             return fn(*args, **kwargs)
         except kb.KIPY_EXCEPTIONS as exc:
@@ -615,8 +711,7 @@ class BoardApi:
         Only a KiCad that has NO handler for GetConnectedItems settles
         ``connectivity_available`` to False; any other failure (a timeout on
         a busy KiCad, a dropped socket) is reported and leaves it as it was."""
-        if self._closed:
-            raise BoardApiError(f"{self._path} is closed; open it again with BoardApi.open")
+        self._require_open()
         try:
             found = self._board.get_connected_items(pad)
         except kb.KIPY_EXCEPTIONS as exc:
@@ -628,7 +723,8 @@ class BoardApi:
             raise BoardApiError(
                 f"connectivity unavailable on KiCad {self.kicad_version} ({exc}); "
                 "GetConnectedItems needs KiCad >= 10.0.1: open the board through a headless "
-                "KiCad 11 session (mode='headless') or use kicad-cli DRC's unconnected items") from exc
+                "KiCad 11 session (mode='headless') or use kicad-cli DRC's unconnected items"
+            ) from exc
         self._connectivity = True
         return list(found)
 

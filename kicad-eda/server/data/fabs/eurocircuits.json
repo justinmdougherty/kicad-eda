@@ -1,0 +1,34 @@
+{
+  "schema": "kicad-eda/fabs@1",
+  "id": "eurocircuits",
+  "name": "Eurocircuits",
+  "retrieved": "2026-10-04",
+  "sources": [
+    {"title": "Eurocircuits defined impedance pool (fetched 2026-10-05)", "url": "https://eurocircuits.com/pcb-assembly-defined-impedance-pool"},
+    {"title": "Eurocircuits RF pool insights and details (fetched 2026-10-05)", "url": "https://www.eurocircuits.com/blog/rf-pool-insights-and-details/"}
+  ],
+  "capabilities": {
+    "layer_counts": null,
+    "layer_counts_note": "general layer-count range not read; detailed build-ups are only in their online buildup editor",
+    "impedance_layer_counts": [4, 6, 8],
+    "impedance_tolerance_pct": null,
+    "impedance_note": "defined-impedance pool: 4, 6 or 8 layers, Isola IS400 (pooled) or 370HR (non-pooled), 1.00 mm (4L only) or 1.55 mm; other builds non-pooled through the online calculator",
+    "thicknesses_mm": [1.0, 1.55],
+    "thickness_tolerance": null,
+    "min_track_mm": {"pooled": 0.1, "non-pooled": 0.09},
+    "min_clearance_mm": {"pooled": 0.1, "non-pooled": 0.09},
+    "materials": ["category:fr4"],
+    "materials_note": "Isola IS400 (pooled), Isola 370HR (non-pooled high Tg)",
+    "rf": {
+      "materials": ["rogers.ro4350b", "rogers.ro4003c"],
+      "layer_counts": [1, 2, 4, 6, 8, 10, 12, 14, 16],
+      "thickness_mm": {"0-2": [0.25, 0.5], "4": [1.0], "6-16": [1.55]},
+      "note": "RF pool: I-Tera and RO4350 pooled on 2 and 4 layers; RO4003 and 1 / 6-16 layers non-pooled; multilayer prepreg Isola PCL370HR"
+    },
+    "hybrid": true,
+    "hybrid_note": "RF pool build-up options include mixed RF and FR4",
+    "ptfe_multilayer": null
+  },
+  "dk_basis": "design",
+  "templates": {}
+}

@@ -5,21 +5,28 @@ The schema types every key a pipeline consumer reads today (lint_netlist,
 sch_build, swig_build_board, place_engine, swig_gate_checks, swig_board_fixes,
 netclass_writer, ipc_rules, impedance, thermal_check, design_report, gates,
 run_pipeline) and the roadmap keys of docs/ROADMAP_DECISIONS.md D1-D5:
-``libraries``, ``board.corner_radius|outline|cutouts|datum``, component
-``at`` and ``board_only``, ``copper_layers``, ``source``, ``rebuild``, ``mode``
-and ``assumptions``. docs/PIPELINE.md section 2 is the human-readable side.
+``libraries``, ``board.corner_radius|outline|cutouts|datum|panel_cutouts``,
+component ``at``, ``board_only``, ``dnp``, ``in_bom`` and ``edge``,
+``copper_layers``, ``source`` (with the import provenance files), ``rebuild``,
+``variant``, ``blocks``, ``mode`` and ``assumptions``. docs/PIPELINE.md section 2
+is the human-readable side.
 
 Policy:
-  * Unknown keys pass at the top level, on components and inside the classic
-    blocks (hand notes, forward compatibility); every KNOWN key is typed. The
+  * Unknown keys pass at the top level, on components, inside the classic
+    blocks and on the provenance records (``source``, ``variant``, a block
+    entry: hand notes, forward compatibility); every KNOWN key is typed. The
     new fixed-shape blocks (``libraries``, ``board.outline``, a cutout) reject
     unknown keys so a typo cannot silently fall back to a rectangle.
   * ``null`` is accepted exactly where every consumer treats it as absent
-    (``board``, ``planes``, ``emc``, ``height_zones``, ...).
-  * Integers are strict (``4.0`` is not a layer count, ``1.0`` is not pad "1").
+    (``board``, ``planes``, ``emc``, ``height_zones``, component ``edge``, a
+    block's ``source`` / ``rebuild``, ...).
+  * Integers are strict (``4.0`` is not a layer count, ``1.0`` is not pad "1");
+    ``thermal.ep_vias_min`` is the exception: its consumers read it via int(),
+    so a whole-number float (4.0) passes.
   * Semantics stay out: duplicate refs, single-pin nets, unknown refs in nets
-    are lint_netlist's job; geometry (closed loops, radius vs size) belongs to
-    the outline module.
+    (or in a block's ref_map / drop_refs) are lint's job; geometry (closed
+    loops, radius vs size, loop bbox at the origin) belongs to the outline
+    module.
 
 Importing this module is stdlib-only, so KiCad-python (SWIG) scripts may read
 the shared constants; ``validate()`` needs ``jsonschema`` (server/requirements).
@@ -37,8 +44,11 @@ from pathlib import Path
 from typing import Any
 
 # --- shared enums (the decisions' vocabularies; import these, never re-type) --
-SOURCE_KINDS = ("kicad", "eagle", "altium", "easyeda", "vision")    # D4
+SOURCE_KINDS = ("kicad", "eagle", "altium", "easyeda", "vision", "gerber")  # D4 (+F4/F6)
 REBUILD_MODES = ("keep", "reflow")                                  # D4
+COPPER_MODES = ("carry", "reroute")             # source.copper (keep rebuilds, F46-29)
+VARIANT_HOLES = ("source", "corners", "none")   # variant.holes (rebuild_variant, F46-10)
+BOARD_EDGES = ("top", "bottom", "left", "right")    # component edge (F3-12), antenna_keepout
 MODES = ("napkin",)                                                 # D5
 CONFIDENCE_LEVELS = ("high", "med", "low")                          # D5
 COPPER_LAYER_COUNTS = (2, 4, 6)                                     # D4
@@ -50,7 +60,7 @@ IPC_CLASSES = (1, 2, 3)
 X_MESSAGE = "x-message"
 
 _NUM = {"type": "number"}
-_INT = {"type": "integer"}
+_POS = {"type": "number", "exclusiveMinimum": 0}
 _BOOL = {"type": "boolean"}
 _STR = {"type": "string"}
 _NAME = {"type": "string", "minLength": 1}
@@ -62,6 +72,43 @@ def _ref(name: str) -> dict:
 
 def _numbers(*keys: str) -> dict:
     return {k: _NUM for k in keys}
+
+
+def _positive(*keys: str) -> dict:
+    return {k: _POS for k in keys}
+
+
+def _key_name(what: str) -> dict:
+    """propertyNames subschema: a non-empty key, named in the message."""
+    return {"minLength": 1, X_MESSAGE: f"a {what} must not be empty"}
+
+
+def _name_map(key: str) -> dict:
+    """{<key>: <non-empty string>} with non-empty keys."""
+    return {"type": "object", "propertyNames": _key_name(key), "additionalProperties": _NAME}
+
+
+# D4 provenance written by the importers (kicad_import, import_pipeline, F46-*):
+# every file is relative to the netlist.json directory (D1 rule) or absolute.
+_SOURCE_FILES = ("reference",      # reference pad nets of the source board as imported
+                 "erc_baseline",   # source ERC report: ERC is judged against it
+                 "drc_baseline",   # source DRC report (informational)
+                 "import_report",  # the import report (default <dir>/import_report.json)
+                 "via",            # the intermediate .kicad_pro a foreign import went through
+                 "board")          # a source board KiCad 9/10 pcbnew can load (copper carry)
+_SOURCE_BODY: dict[str, Any] = {
+    "required": ["kind", "path"],
+    "properties": {
+        "kind": {"enum": list(SOURCE_KINDS)},
+        "path": _NAME,
+        "sha256": _ref("sha256"),
+        "tool": _NAME,
+        **{k: _NAME for k in _SOURCE_FILES},
+        "files": {"type": "object", "propertyNames": _key_name("file name"),
+                  "additionalProperties": _ref("sha256")},
+        "copper": {"enum": list(COPPER_MODES)},
+    },
+}
 
 
 _DEFS: dict[str, Any] = {
@@ -85,6 +132,9 @@ _DEFS: dict[str, Any] = {
     "nickname": {"type": "string", "pattern": r"^[^:\x00-\x1f]+$",
                  X_MESSAGE: "a library nickname is non-empty, without ':' or "
                             "control characters"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$",
+               X_MESSAGE: "sha256 is 64 hex digits"},
+    "ref_list": {"type": "array", "items": _NAME},
     # --- connectivity ---
     "pad": {"type": ["string", "integer"], "minLength": 1},
     "pad_ref": {"type": "array", "prefixItems": [_NAME, _ref("pad")],
@@ -121,17 +171,23 @@ _DEFS: dict[str, Any] = {
     },
     "auto_field": {"type": ["object", "null"],
                    "properties": {"x": {"type": ["number", "null"]},
-                                  **_numbers("y", "w", "h")}},
+                                  **_numbers("y"), **_positive("w", "h")}},
+    # Contracts beyond the schema (outline.from_board_block): an outline loop's
+    # bbox starts at (0, 0) and w/h then match it; corner_radius only with w/h.
+    # A block of auto_* keys alone is rejected on purpose (they are windows in
+    # a FIXED board; an auto-sized board has no board block).
     "board": {
         "type": ["object", "null"],
         "properties": {
-            **_numbers("w", "h", "auto_y", "auto_w", "auto_h"),
+            **_positive("w", "h", "auto_w", "auto_h"),
+            "auto_y": _NUM,
             "auto_x": {"type": ["number", "null"]},
             "auto_b": _ref("auto_field"),
             "corner_radius": {"type": "number", "minimum": 0},
             "outline": _ref("outline"),
             "cutouts": {"type": "array", "items": _ref("cutout")},
             "datum": _ref("point"),
+            "panel_cutouts": _BOOL,     # F3-13: a connector may face a cutout edge
         },
         "dependentRequired": {"w": ["h"], "h": ["w"]},
         "allOf": [{
@@ -170,6 +226,10 @@ _DEFS: dict[str, Any] = {
             "lcsc": {"type": ["string", "null"]},
             "mpn": {"type": ["string", "null"]},
             "board_only": _BOOL,                                    # D4
+            "dnp": _BOOL,                   # D4: in the design, not populated
+            "in_bom": _BOOL,                # D4: false = left out of the BOM
+            # F3-12: the board edge a connector mates through (null = top)
+            "edge": {"enum": [*BOARD_EDGES, None]},
         },
         "dependentRequired": {"x": ["y"], "y": ["x"]},
         "dependentSchemas": {"at": {
@@ -224,7 +284,7 @@ _DEFS: dict[str, Any] = {
     "antenna_keepout": {
         "type": ["object", "null"],
         "properties": {
-            "edge": {"enum": ["top", "bottom", "left", "right"]},
+            "edge": {"enum": list(BOARD_EDGES)},
             "depth": _NUM, "name": _STR,
             "rect": {"type": "array", "prefixItems": [_NUM, _NUM, _NUM, _NUM],
                      "minItems": 4, "maxItems": 4,
@@ -240,15 +300,28 @@ _DEFS: dict[str, Any] = {
     },
 
     # --- D4 / D5 provenance and assumptions ---
-    "source": {
+    "source": {"type": "object", **_SOURCE_BODY},
+    # rebuild_variant (F46-10): how this design was derived from an import
+    "variant": {
         "type": "object",
-        "required": ["kind", "path"],
+        "required": ["mode"],
+        "properties": {"mode": {"enum": list(REBUILD_MODES)}, "from": _NAME,
+                       "dropped_refs": _ref("ref_list"),
+                       "holes": {"enum": list(VARIANT_HOLES)}},
+    },
+    # design_blocks.compose (F46-10 / F46-27): one entry per composed block
+    "block": {
+        "type": "object",
+        "required": ["name", "ref_map"],
         "properties": {
-            "kind": {"enum": list(SOURCE_KINDS)},
-            "path": _NAME,
-            "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$",
-                       X_MESSAGE: "sha256 is 64 hex digits"},
-            "tool": _NAME,
+            "name": _NAME,
+            "source": {"type": ["object", "null"], **_SOURCE_BODY},
+            "rebuild": {"enum": [*REBUILD_MODES, None]},
+            "ref_map": {**_name_map("reference"), "minProperties": 1,
+                        X_MESSAGE: "ref_map lists every block ref, old -> new "
+                                   "(identity entries included)"},
+            "net_map": _name_map("net name"),
+            "drop_refs": _ref("ref_list"),      # BASE refs this compose step removed
         },
     },
     "assumption": {
@@ -281,7 +354,7 @@ SCHEMA: dict[str, Any] = {
         "board": _ref("board"),
         "mounting_holes": _ref("mounting_holes"),
         "components": {"type": "array", "minItems": 1, "items": _ref("component")},
-        "nets": {"type": "object", "propertyNames": {"minLength": 1},
+        "nets": {"type": "object", "propertyNames": _key_name("net name"),
                  "additionalProperties": {"type": "array", "items": _ref("pad_ref")}},
         "no_connect": {"type": "array", "items": _ref("pad_ref")},
         "power_flags": {"type": "array", "items": _NAME},
@@ -296,11 +369,16 @@ SCHEMA: dict[str, Any] = {
         "height_zones": {"type": ["array", "null"], "items": _ref("height_zone")},
         "thermal": {"type": ["object", "null"],
                     "properties": {**_numbers("t_ambient", "tj_margin"),
-                                   "ep_vias_min": _INT}},
+                                   # consumers read it via int(): 4.0 passes
+                                   "ep_vias_min": {"type": "number", "multipleOf": 1,
+                                                   X_MESSAGE: "ep_vias_min is a whole "
+                                                              "number of vias, e.g. 4 or 4.0"}}},
         "stackup": {"type": ["object", "null"], "properties": _numbers("h", "er", "t")},
         "require_sourcing": {"type": ["boolean", "null"]},
         "source": _ref("source"),
         "rebuild": {"enum": list(REBUILD_MODES)},
+        "variant": _ref("variant"),
+        "blocks": {"type": "array", "items": _ref("block")},
         "assumptions": {"type": "array", "items": _ref("assumption")},
     },
     "$defs": _DEFS,

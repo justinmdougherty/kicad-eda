@@ -13,7 +13,9 @@ Live tier (skipped without KiCad): the real probe of every install.
 """
 from __future__ import annotations
 
+import sys
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -55,8 +57,11 @@ def installs() -> list[env.KiCadInstall]:
 def test_classify_eagle_board_and_schematic(tmp_path):
     brd = ff.classify(eagle_brd(tmp_path))
     sch = ff.classify(eagle_sch(tmp_path))
-    assert (brd.kind, brd.role, brd.pcb_format, brd.swig_plugin) == ("eagle", "board", "eagle", "")
+    assert (brd.kind, brd.role, brd.pcb_format) == ("eagle", "board", "eagle")
+    # LoadBoard(EAGLE) returns None on pcbnew 9 and works on 10 (D4 as amended)
+    assert (brd.swig_plugin, brd.swig_min_major) == ("EAGLE", 10)
     assert (sch.kind, sch.role, sch.sch_format) == ("eagle", "schematic", "eagle")
+    assert (sch.swig_plugin, sch.swig_min_major) == ("", 0)
 
 
 def test_classify_refuses_a_non_eagle_brd(tmp_path):
@@ -67,8 +72,8 @@ def test_classify_refuses_a_non_eagle_brd(tmp_path):
 
 def test_classify_altium_and_easyeda(tmp_path):
     pcb = ff.classify(altium(tmp_path, "x.PcbDoc"))
-    assert (pcb.kind, pcb.role, pcb.pcb_format, pcb.swig_plugin) == \
-        ("altium", "board", "altium", "ALTIUM_DESIGNER")
+    assert (pcb.kind, pcb.role, pcb.pcb_format, pcb.swig_plugin, pcb.swig_min_major) == \
+        ("altium", "board", "altium", "ALTIUM_DESIGNER", 0)
     sch = ff.classify(altium(tmp_path, "power.SchDoc"))
     assert (sch.kind, sch.role, sch.sch_format) == ("altium", "schematic", "altium")
     board = ff.classify(easyeda_std(tmp_path, "pcb.json", "3"))
@@ -97,6 +102,8 @@ def test_classify_gui_only_cases(tmp_path):
         z.writestr("readme.txt", "x")
     with pytest.raises(ff.ForeignFormatError, match="EasyEDA Pro"):
         ff.classify(empty)
+    with pytest.raises(ff.ForeignFormatError, match=r"not an EasyEDA Pro project \("):
+        ff.classify(write(tmp_path / "plain.epro", "not a zip archive"))
 
 
 def test_classify_libraries(tmp_path):
@@ -199,10 +206,28 @@ def test_probe_is_cached_per_install(fake_install, cli_log):
     first = ff.capabilities(inst)
     n = len(read_calls(cli_log))
     assert n == 5                                        # one --help per command
-    assert ff.capabilities(inst) is first and len(read_calls(cli_log)) == n
+    assert ff.capabilities(inst) == first and len(read_calls(cli_log)) == n
     ff.clear_cache()
     ff.capabilities(inst)
     assert len(read_calls(cli_log)) == 2 * n
+
+
+def test_cache_holds_only_cli_fields_python_and_version_come_per_call(fake_install, cli_log,
+                                                                      tmp_path):
+    """A transient `import pcbnew` probe left the first discover() without a
+    python; the next discover() finds it: the cached CLI probe must not pin
+    python=None (nor an old version) for the life of the process."""
+    without = fake_install("k9")
+    assert ff.capabilities(without).python is None
+    n = len(read_calls(cli_log))
+    python = tmp_path / "python.exe"
+    found = replace(without, python=python, version="9.0.4-1", version_tuple=(9, 0, 5))
+    caps = ff.capabilities(found)
+    assert len(read_calls(cli_log)) == n                 # the CLI was not probed again
+    assert caps.python == python and caps.as_dict()["python"] == str(python)
+    assert (caps.version, caps.version_tuple) == ("9.0.4-1", (9, 0, 5))
+    assert caps.fp_upgrade and not caps.pcb_import       # the cached CLI-derived fields
+    assert ff.capabilities(without).python is None       # and back, per call
 
 
 def test_transient_probe_failure_is_not_cached(fake_install, monkeypatch):
@@ -222,13 +247,38 @@ def test_transient_probe_failure_is_not_cached(fake_install, monkeypatch):
     assert "timed out" in caps.probe_errors[0]
     again = ff.capabilities(inst)                        # probed again, now settled
     assert again.project_import and again.probe_errors == ()
-    assert ff.capabilities(inst) is again
+    assert ff.capabilities(inst) == again
 
 
 def test_discover_capabilities_newest_first(fake_install):
     caps = ff.discover_capabilities([fake_install("k9"), fake_install("k11"),
                                      fake_install("k10")])
     assert [c.version_tuple[:2] for c in caps] == [(10, 99), (10, 0), (9, 0)]
+
+
+# ---------------------------------------------------------------------------
+# run_child: stdin detached, timeouts and launch failures are TRANSIENT_RC
+# ---------------------------------------------------------------------------
+def test_run_child_detaches_stdin_and_decodes_utf8(tmp_path):
+    r = ff.run_child([sys.executable, "-c", "import sys; d = sys.stdin.read(); "
+                      "sys.stdout.buffer.write(('in=%d \\u00b5' % len(d)).encode('utf-8'))"],
+                     30, cwd=tmp_path)
+    assert r.returncode == 0 and r.stdout == "in=0 µ"
+
+
+def test_run_child_timeout_and_launch_failure(tmp_path):
+    slow = ff.run_child([sys.executable, "-c", "import time; print('x', flush=True); "
+                         "time.sleep(30)"], 1)
+    assert slow.returncode == env.TRANSIENT_RC and "timed out after 1 s" in slow.stderr
+    missing = ff.run_child([str(tmp_path / "no-such-kicad-cli.exe"), "--help"], 5)
+    assert missing.returncode == env.TRANSIENT_RC and "cannot start" in missing.stderr
+    assert missing.stdout == ""
+
+
+def test_decode_accepts_bytes_text_and_none():
+    assert ff._decode("µ".encode("utf-8")) == "µ"
+    assert ff._decode(b"\xff") == "�"
+    assert ff._decode("text") == "text" and ff._decode(None) == ""
 
 
 

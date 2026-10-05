@@ -171,6 +171,37 @@ def test_component_only_in_one_reading() -> None:
     assert kinds(reverse) == ["component_extra"]
 
 
+def test_empty_reading_against_a_full_one_scores_zero() -> None:
+    """Review regression 3: with parts on a side but none shared, no field
+    agrees (wave 1 scored the uncompared fields 1.0, i.e. 0.25 overall)."""
+    empty = {"components": []}
+    for a, b in ((design(), empty), (empty, design())):
+        res = vc.crosscheck(a, b)
+        assert dict(res.scores) == {"components": 0.0, "fields": 0.0, "connectivity": 0.0}
+        assert res.score == 0.0 and not res.agree
+        assert res.counts["fields_compared"] == 0
+
+
+def test_two_empty_readings_agree_fully() -> None:
+    res = vc.crosscheck({"components": []}, {"components": []})
+    assert res.agree and res.score == 1.0 and res.scores["fields"] == 1.0
+
+
+def test_no_shared_parts_scores_no_field_agreement() -> None:
+    a = {"components": [{"ref": "R1", "value": "1k"}], "nets": {}}
+    b = {"components": [{"ref": "R2", "value": "1k"}], "nets": {}}
+    res = vc.crosscheck(a, b)
+    assert res.scores["components"] == 0.0 and res.scores["fields"] == 0.0
+
+
+def test_shared_parts_without_any_field_still_agree() -> None:
+    """Identical readings score 1.0 even when no part carries a field."""
+    bare = {"components": [{"ref": "R1"}, {"ref": "R2"}],
+            "nets": {"N": [["R1", "1"], ["R2", "1"]]}}
+    res = vc.crosscheck(bare, copy.deepcopy(bare))
+    assert res.agree and res.score == 1.0 and res.scores["fields"] == 1.0
+
+
 def test_listed_part_without_wiring_still_reports_its_pins() -> None:
     """B lists D1 but wires none of its pins: no component diff, so the pins
     themselves are the disagreement."""
@@ -214,9 +245,23 @@ def test_values_disagree(a: str, b: str) -> None:
     assert not vc.values_agree(a, b) and not vc.values_agree(b, a)
 
 
+@pytest.mark.parametrize("a, b, same", [
+    # review regression 4: a unit letter is an RKM decimal mark like R
+    ("3.3V", "3V3", True), ("3V3", "3.3", True), ("2A5", "2.5A", True), ("1W5", "1.5W", True),
+    ("4F7", "4.7F", True), ("2H2", "2.2H", True), ("5V0", "5V", True),
+    ("10uF 6V3", "10uF/6.3V", True),
+    ("3V3", "3.3A", False), ("3V3", "33V", False), ("2A5", "25A", False), ("3V3", "5V", False),
+    ("1M", "1m", False), ("1M", "1mV", False),
+])
+def test_values_agree_unit_letter_as_decimal_mark(a: str, b: str, same: bool) -> None:
+    assert vc.values_agree(a, b) is same and vc.values_agree(b, a) is same
+
+
 @pytest.mark.parametrize("text, expected", [
     ("4k7", (4700.0, "")), ("100nF", (1e-7, "F")), ("2R2", (2.2, "ohm")), ("10kΩ", (1e4, "ohm")),
     ("1.5 mH", (1.5e-3, "H")), ("12V", (12.0, "V")), ("LM358", None), ("", None),
+    ("3V3", (3.3, "V")), ("2A5", (2.5, "A")), ("1W5", (1.5, "W")), ("4F7", (4.7, "F")),
+    ("2H2", (2.2, "H")), ("2N3904", None), ("74HC14", None),
 ])
 def test_parse_value(text: str, expected: tuple[float, str] | None) -> None:
     got = vc.parse_value(text)
@@ -293,6 +338,31 @@ def test_no_connect_marked_by_one_reading_only() -> None:
     b["nets"]["DBG"] = [["J2", "3"]]                   # B: alone on a net of its own
     (d,) = vc.crosscheck(a, b).disagreements
     assert d.kind == "no_connect_mismatch" and "DBG" in d.message
+
+
+def _with_and_without_j2() -> tuple[dict[str, Any], dict[str, Any]]:
+    """A = {R1, J2} with J2.3 marked no-connect; B = {R1} (no J2 at all)."""
+    r1 = {"ref": "R1", "lib_id": "Device:R", "value": "10k", "footprint": "R:R_0603"}
+    j2 = {"ref": "J2", "lib_id": "Connector_Generic:Conn_01x03", "value": "DBG",
+          "footprint": "Connector:Conn_01x03"}
+    a = {"components": [dict(r1), j2], "nets": {"N1": [["R1", "1"], ["J2", "1"]],
+                                                 "N2": [["R1", "2"], ["J2", "2"]]},
+         "no_connect": [["J2", "3"]]}
+    b = {"components": [dict(r1)], "nets": {"N1": [["R1", "1"]], "N2": [["R1", "2"]]},
+         "no_connect": []}
+    return a, b
+
+
+def test_no_connect_on_a_part_the_other_reading_lacks_is_not_repeated() -> None:
+    """Review regression 1 (wave 1 swapped gone_a / gone_b): a no-connect pin
+    of a part only one reading has is covered by its component row."""
+    a, b = _with_and_without_j2()
+    res = vc.crosscheck(a, b)
+    assert kinds(res) == ["component_missing"], res.markdown()
+    assert res.disagreements[0].subject == "J2"
+    reverse = vc.crosscheck(b, a)
+    assert kinds(reverse) == ["component_extra"], reverse.markdown()
+    assert reverse.disagreements[0].subject == "J2"
 
 
 def test_no_connect_against_a_real_connection_is_a_merge() -> None:
@@ -398,6 +468,131 @@ def test_cli_compare_errors_exit_2(tmp_path: Path, capsys: pytest.CaptureFixture
     assert vc.main(["compare", str(a), str(bad)]) == 2
     assert "bad.json" in capsys.readouterr().err
     assert vc.main(["compare", str(a), str(tmp_path / "missing.json")]) == 2
+    broken = tmp_path / "broken.json"
+    broken.write_text("{nope", encoding="utf-8")
+    assert vc.main(["compare", str(a), str(broken)]) == 2
+    assert "not valid JSON" in capsys.readouterr().err
+    assert vc.main(["compare", str(a), str(a), "--ref-map", "[1]"]) == 2
+    assert "--ref-map" in capsys.readouterr().err
+
+
+# ----------------------------------------------------------------------------
+# File-level helpers (what the MCP layer wraps, F46-13)
+# ----------------------------------------------------------------------------
+def renamed_d1() -> dict[str, Any]:
+    d = design()
+    comp(d, "D1")["ref"] = "LED1"
+    for pads in d["nets"].values():
+        for pad in pads:
+            if pad[0] == "D1":
+                pad[0] = "LED1"
+    return d
+
+
+def test_crosscheck_files_is_crosscheck_on_the_loaded_files(tmp_path: Path) -> None:
+    b_design = design()
+    comp(b_design, "R1")["value"] = "47k"
+    a, b = write(tmp_path / "a.json", design()), write(tmp_path / "b.json", b_design)
+    res = vc.crosscheck_files(a, b, labels=("r1", "r2"))
+    assert isinstance(res, vc.CrosscheckResult)
+    assert res.as_dict() == vc.crosscheck(design(), b_design, labels=("r1", "r2")).as_dict()
+    assert res.markdown().startswith("# Vision cross-check: r1 vs r2")
+    assert vc.crosscheck_files(str(a), str(a), ref_map={}, labels=["A", "B"]).agree
+
+
+@pytest.mark.parametrize("form", ["mapping", "inline", "file", "path"])
+def test_crosscheck_files_ref_map_forms(tmp_path: Path, form: str) -> None:
+    a, b = write(tmp_path / "a.json", design()), write(tmp_path / "b.json", renamed_d1())
+    map_file = write(tmp_path / "map.json", {"D1": "LED1"})
+    ref_map = {"mapping": {"D1": "LED1"}, "inline": ' {"D1": "LED1"}', "file": str(map_file),
+               "path": map_file}[form]
+    assert not vc.crosscheck_files(a, b).agree
+    assert vc.crosscheck_files(a, b, ref_map=ref_map).agree
+
+
+def test_crosscheck_files_errors(tmp_path: Path) -> None:
+    a = write(tmp_path / "a.json", design())
+    with pytest.raises(FileNotFoundError):
+        vc.crosscheck_files(a, tmp_path / "missing.json")
+    with pytest.raises(ValueError, match="ref-map|ref_map"):
+        vc.crosscheck_files(a, a, ref_map="[1, 2]")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        vc.crosscheck_files(a, a, ref_map="{nope")
+    assert vc.load_ref_map("  ") is None and vc.crosscheck_files(a, a, ref_map="").agree
+    with pytest.raises(TypeError, match="ref_map"):
+        vc.crosscheck_files(a, a, ref_map=5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="labels"):
+        vc.crosscheck_files(a, a, labels=("same", "same"))
+
+
+def test_pin_check_file_anchors_project_libraries_at_the_netlist(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = tmp_path / "proj"
+    (project / "libs").mkdir(parents=True)
+    shutil.copy(FIXTURE_SYMBOLS / "TestLib.kicad_sym", project / "libs" / "my_parts.kicad_sym")
+    d = amp_design()
+    d["libraries"] = {"symbols": {"MyParts": "libs/my_parts.kicad_sym"}}
+    for c in d["components"]:
+        if c.get("lib_id", "").startswith("TestLib:"):
+            c["lib_id"] = c["lib_id"].replace("TestLib:", "MyParts:")
+    netlist = write(project / "netlist.json", d)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)                       # relative paths follow the netlist
+    out = vc.pin_check_file(str(netlist))
+    assert json.loads(json.dumps(out)) == out
+    assert out["ok"] is True and out["issues"] == 0, out
+    assert out["netlist"] == str(netlist.resolve()) and out["summary"].startswith("pins ok")
+    assert "MyParts:BaseAmp" in out["symbols"]
+
+
+def test_pin_check_file_reports_issues(tmp_path: Path) -> None:
+    d = amp_design()
+    d["no_connect"].remove(["U2", "6"])
+    out = vc.pin_check_file(write(tmp_path / "n.json", d), symbols_dir=FIXTURE_SYMBOLS)
+    assert out["ok"] is False and out["issues"] == 1 and "U2.6" in out["summary"]
+    with pytest.raises(FileNotFoundError):
+        vc.pin_check_file(tmp_path / "missing.json", symbols_dir=FIXTURE_SYMBOLS)
+
+
+# ----------------------------------------------------------------------------
+# Edge paths
+# ----------------------------------------------------------------------------
+def test_summary_of_a_disagreement() -> None:
+    b = design()
+    comp(b, "R1")["value"] = "47k"
+    text = vc.crosscheck(design(), b).summary()
+    assert text.startswith("REVIEW: 1 disagreement(s)") and "1 high" in text
+
+
+def test_design_that_is_not_an_object_is_named_by_its_label() -> None:
+    with pytest.raises(ValueError, match="design first"):
+        vc.crosscheck([], design(), labels=("first", "second"))  # type: ignore[arg-type]
+
+
+def test_stock_symbols_are_looked_up_only_for_undeclared_libraries(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import kicad_env
+    monkeypatch.setattr(kicad_env, "pick_cli", lambda: None)
+    assert vc._stock_symbols_dir() is None              # no KiCad: no stock library
+    d = {"components": [{"ref": "R1", "lib_id": "TestLib:PosFileR"}],
+         "nets": {"N": [["R1", "1"], ["R1", "2"]]}}
+    rep = vc.pin_check(d, netlist_dir=tmp_path, symbols_dir=None)
+    assert [u["ref"] for u in rep.unresolved] == ["R1"]
+    monkeypatch.setattr(vc, "_stock_symbols_dir", lambda: FIXTURE_SYMBOLS)
+    rep = vc.pin_check(d, netlist_dir=tmp_path, symbols_dir=None)
+    assert rep.ok, rep.as_dict()
+
+
+def test_module_doc_records_the_open_conventions() -> None:
+    """The conventions D4 does not fix yet (the reader prompt is checked in
+    test_rasterize.py)."""
+    doc = vc.__doc__ or ""
+    for text in ("0.25 components", "0.25 fields", "0.5 connectivity", "VIS-<n>",
+                 "'schematic-reader (Claude vision) + pymupdf <ver> @ <dpi> dpi'",
+                 "\"rebuild\": \"reflow\"", "lib_id / footprint med", "no-connect low"):
+        assert text in doc, text
+    assert dict(vc.WEIGHTS) == {"components": 0.25, "fields": 0.25, "connectivity": 0.5}
 
 
 # ----------------------------------------------------------------------------
@@ -446,6 +641,71 @@ def test_pin_check_unknown_and_unlisted_pins() -> None:
     assert u1["unlisted"] == [{"number": "7", "name": "~", "type": "output"}]
     assert rep.as_dict()["issues"] == 2
     assert "U1.9" in rep.summary() and "U1.7" in rep.summary()
+
+
+NC_LIB = """(kicad_symbol_lib
+  (version 20241209)
+  (generator "kicad-eda-tests")
+  (symbol "LDO_NC"
+    (in_bom yes)
+    (on_board yes)
+    (property "Reference" "U" (at 0 5.08 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "LDO_NC" (at 0 -5.08 0) (effects (font (size 1.27 1.27))))
+    (symbol "LDO_NC_1_1"
+      (pin power_in line (at -7.62 2.54 0) (length 2.54) (name "VIN" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      (pin power_in line (at 0 -7.62 90) (length 2.54) (name "GND" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
+      (pin input line (at -7.62 0 0) (length 2.54) (name "EN" (effects (font (size 1.27 1.27)))) (number "3" (effects (font (size 1.27 1.27)))))
+      (pin no_connect line (at 7.62 0 180) (length 2.54) (name "NC" (effects (font (size 1.27 1.27)))) (number "4" (effects (font (size 1.27 1.27)))))
+      (pin power_out line (at 7.62 2.54 180) (length 2.54) (name "VOUT" (effects (font (size 1.27 1.27)))) (number "5" (effects (font (size 1.27 1.27)))))))
+)
+"""  # noqa: E501
+
+
+def nc_design() -> dict[str, Any]:
+    """An LDO whose symbol pin 4 has electrical type no_connect (like the stock
+    Regulator_Linear:AP2112K-3.3 'NC'); the reading never mentions pin 4."""
+    return {"components": [{"ref": "U1", "lib_id": "NcLib:LDO_NC", "value": "LDO",
+                            "footprint": "X:Y"}],
+            "nets": {"VIN": [["U1", "1"], ["U1", "3"]], "GND": [["U1", "2"]],
+                     "VOUT": [["U1", "5"]]},
+            "no_connect": []}
+
+
+@pytest.fixture
+def nc_symbols(tmp_path: Path) -> Path:
+    folder = tmp_path / "nc_symbols"
+    folder.mkdir()
+    (folder / "NcLib.kicad_sym").write_text(NC_LIB, encoding="utf-8")
+    return folder
+
+
+def test_pin_check_nc_type_pin_is_informational(nc_symbols: Path) -> None:
+    """Review regression 2: a symbol pin of electrical type no_connect is not
+    an unread pin (wave 1 counted it as 'unlisted')."""
+    rep = vc.pin_check(nc_design(), symbols_dir=nc_symbols)
+    assert rep.ok and rep.issues == 0, rep.as_dict()
+    (u1,) = rep.parts
+    assert u1["unlisted"] == [] and u1["unknown"] == []
+    assert u1["nc_pins"] == [{"number": "4", "name": "NC", "type": "no_connect"}]
+    assert rep.as_dict()["ok"] is True
+    assert "U1.4" not in rep.summary() and "1 NC-type pin" in rep.summary()
+
+
+def test_pin_check_nc_type_pin_named_by_the_reading(nc_symbols: Path) -> None:
+    d = nc_design()
+    d["no_connect"] = [["U1", "4"]]
+    (u1,) = vc.pin_check(d, symbols_dir=nc_symbols).parts
+    assert u1["nc_pins"] == [] and u1["unlisted"] == []
+
+
+def test_pin_check_other_unread_pins_still_count(nc_symbols: Path) -> None:
+    d = nc_design()
+    d["nets"]["VIN"] = [["U1", "1"]]              # EN (input) read nowhere
+    rep = vc.pin_check(d, symbols_dir=nc_symbols)
+    (u1,) = rep.parts
+    assert [p["number"] for p in u1["unlisted"]] == ["3"]
+    assert [p["number"] for p in u1["nc_pins"]] == ["4"]
+    assert rep.issues == 1 and "U1.3" in rep.summary() and "U1.4" not in rep.summary()
 
 
 def test_pin_check_unresolved_symbols() -> None:
@@ -498,3 +758,16 @@ def test_live_pin_check_against_stock_symbols() -> None:
     assert rep.ok, rep.as_dict()
     led = {p["number"]: p["name"] for p in rep.symbols["Device:LED"]}
     assert led == {"1": "K", "2": "A"}                     # Device:LED pin 1 = cathode
+
+
+@requires_symbols
+def test_live_stock_nc_pin_is_not_an_issue() -> None:
+    """The shipped examples' AP2112K-3.3: pin 4 'NC' is of type no_connect."""
+    d = {"components": [{"ref": "U1", "lib_id": "Regulator_Linear:AP2112K-3.3",
+                         "value": "AP2112K-3.3", "footprint": "Package_TO_SOT_SMD:SOT-23-5"}],
+         "nets": {"VIN": [["U1", "1"], ["U1", "3"]], "GND": [["U1", "2"]],
+                  "+3V3": [["U1", "5"]]}}
+    rep = vc.pin_check(d, symbols_dir=KICAD.symbols)
+    assert rep.ok, rep.as_dict()
+    (u1,) = rep.parts
+    assert [(p["number"], p["type"]) for p in u1["nc_pins"]] == [("4", "no_connect")]

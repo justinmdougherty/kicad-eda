@@ -1,0 +1,35 @@
+{
+  "schema": "kicad-eda/fabs@1",
+  "id": "generic",
+  "name": "generic (no fab)",
+  "retrieved": "2026-10-04",
+  "sources": [
+    {"title": "JLCPCB PCB capabilities: FR-4 dielectric constant 4.5 (2-layer PCB) (fetched 2026-10-04)", "url": "https://jlcpcb.com/capabilities/pcb-capabilities"}
+  ],
+  "capabilities": {
+    "layer_counts": null,
+    "impedance_layer_counts": null,
+    "impedance_tolerance_pct": null,
+    "thicknesses_mm": null,
+    "thickness_tolerance": null,
+    "materials": null,
+    "rf": null,
+    "hybrid": null,
+    "ptfe_multilayer": null,
+    "note": "no fab: nothing is checked"
+  },
+  "dk_basis": "typical",
+  "default_templates": {"by_count": {"1": "2L-1.6", "2": "2L-1.6"}},
+  "templates": {
+    "2L-1.6": {
+      "copper_layers": 2, "thickness_mm": 1.6, "outer_oz": 1,
+      "default_roles": ["signal", "mixed"],
+      "unverified": true,
+      "note": "ADR D7.2.4: core 1.51 mm, Dk 4.5 per the JLC capabilities page (frequency and core thickness unverified); 1 oz copper; 1.58 mm without mask, 1.641 mm with 0.0305 mm masks",
+      "source": "https://jlcpcb.com/capabilities/pcb-capabilities",
+      "stack": [
+        {"cu": 0.035, "oz": 1}, {"core": "generic.fr4", "c": "core", "t": 1.51}, {"cu": 0.035, "oz": 1}
+      ]
+    }
+  }
+}

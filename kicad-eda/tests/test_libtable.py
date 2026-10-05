@@ -1,67 +1,28 @@
-"""libtable — KiCad sym-lib-table / fp-lib-table parsing and writing, and the
-D1 nickname resolver (netlist ``libraries`` block > project table > stock).
+"""libtable — the D1 nickname resolver (netlist ``libraries`` block > project
+table > stock), materialize, library_generator and the consumer helpers. The
+table syntax itself (libtable_sexp) is tested in test_libtable_sexp.
 
-Unit tier (no KiCad): the table excerpts are verbatim from the KiCad 9.0 /
-10.99 templates and from tables the KiCad 11 nightly ``pcb import`` / ``sch
-import`` wrote. Live tier (skipped without KiCad): the full templates parse;
-``kicad-cli sch erc`` honours materialized tables beside a minimal .kicad_pro;
-KiCad's bundled Python imports the module and resolves the same map.
+Unit tier (no KiCad). Live tier (skipped without KiCad): the full templates
+parse; ``kicad-cli sch erc`` honours materialized tables beside a minimal
+.kicad_pro; KiCad's bundled Python (3.11 on KiCad 9) imports both modules and
+resolves the same map.
 """
 from __future__ import annotations
 
-import ast
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
 import kicad_env as env
 import libtable as lt
+from test_libtable_sexp import (FAMILIES, IMPORT_FP, IMPORT_SYM, K9_FP,  # verbatim tables
+                                K9_SYM, kicad_install)
 
 TOOLS = Path(__file__).resolve().parents[1] / "server" / "tools"
 LIVE_TIMEOUT_S = 120
-
-# --- verbatim excerpts ------------------------------------------------------
-# KiCad 9.0 template/global fp-lib-table: the OLD unquoted row syntax, no
-# version line, and "Kicad" (lower-case k) on the first row.
-K9_FP = """(fp_lib_table
-  (lib (name Audio_Module)(type Kicad)(uri ${KICAD9_FOOTPRINT_DIR}/Audio_Module.pretty)(options "")(descr "Audio Module footprints"))
-  (lib (name Connector_BarrelJack)(type KiCad)(uri ${KICAD9_FOOTPRINT_DIR}/Connector_BarrelJack.pretty)(options "")(descr "(DC) barrel jack connector footprints"))
-  (lib (name Resistor_SMD)(type KiCad)(uri ${KICAD9_FOOTPRINT_DIR}/Resistor_SMD.pretty)(options "")(descr "Resistor footprints, surface mount (SMD)"))
-)
-"""
-# KiCad 9.0 template sym-lib-table: quoted, no spaces between tokens.
-K9_SYM = """(sym_lib_table
-  (lib (name "Device")(type "KiCad")(uri "${KICAD9_SYMBOL_DIR}/Device.kicad_sym")(options "")(descr "Generic symbols for common devices"))
-  (lib (name "power")(type "KiCad")(uri "${KICAD9_SYMBOL_DIR}/power.kicad_sym")(options "")(descr "Power symbols, special power flags"))
-)
-"""
-# KiCad 10.99 template: (version 7), tab indent, spaces between tokens (CRLF
-# as installed on Windows).
-K11_FP = ("(fp_lib_table\r\n\t(version 7)\r\n"
-          '\t(lib (name "MountingHole") (type "KiCad") (uri "${KICAD10_FOOTPRINT_DIR}/'
-          'MountingHole.pretty") (options "") (descr "Mechanical fasteners"))\r\n'
-          '\t(lib (name "Resistor_SMD") (type "KiCad") (uri "${KICAD10_FOOTPRINT_DIR}/'
-          'Resistor_SMD.pretty") (options "") (descr "Resistor footprints, surface mount '
-          '(SMD)"))\r\n)\r\n')
-K11_DEVICE_ROW = ('(lib (name "Device") (type "KiCad") (uri "${KICAD10_SYMBOL_DIR}/'
-                  'Device.kicad_sym") (options "") (descr "Generic symbols for common devices"))')
-# Written by the KiCad 11 nightly: `pcb import` (Altium + EasyEDA into one dir)
-# and `sch import` of an EasyEDA Pro project.
-IMPORT_FP = """(fp_lib_table
-\t(version 7)
-\t(lib (name "eDP_adapter_dvt1-import-fps") (type "KiCad") (uri "${KIPRJMOD}/eDP_adapter_dvt1-import-fps.pretty") (options "kicad_import_cache=1") (descr ""))
-\t(lib (name "pcb_watch-import-fps") (type "KiCad") (uri "${KIPRJMOD}/pcb_watch-import-fps.pretty") (options "kicad_import_cache=1") (descr ""))
-)
-"""
-IMPORT_SYM = """(sym_lib_table
-\t(version 7)
-\t(lib (name "yuzuki-import-syms") (type "KiCad") (uri "${KIPRJMOD}/yuzuki-import-syms.kicad_sym") (options "kicad_import_cache=1") (descr ""))
-)
-"""
 
 
 # --- helpers ----------------------------------------------------------------
@@ -79,6 +40,11 @@ def make_lib(path: Path) -> Path:
 
 def same(a: Path | str, b: Path | str) -> bool:
     return os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(b)))
+
+
+def row(name: str, uri: str, tail: str = "") -> str:
+    """One quoted-syntax table row."""
+    return f'(lib (name "{name}")(type "KiCad")(uri "{uri}")(options "")(descr ""){tail})'
 
 
 @pytest.fixture
@@ -101,8 +67,10 @@ def proj(tmp_path: Path) -> Path:
     make_lib(d / "libs" / "MyDevice.kicad_sym")
     (d / "sym-lib-table").write_text(
         '(sym_lib_table\n'
-        '  (lib (name "ProjSym")(type "KiCad")(uri "${KIPRJMOD}/libs/ProjSym.kicad_sym")(options "")(descr ""))\n'
-        '  (lib (name "Device")(type "KiCad")(uri "${KIPRJMOD}/libs/MyDevice.kicad_sym")(options "")(descr "shadows stock"))\n'
+        '  (lib (name "ProjSym")(type "KiCad")(uri "${KIPRJMOD}/libs/ProjSym.kicad_sym")'
+        '(options "")(descr ""))\n'
+        '  (lib (name "Device")(type "KiCad")(uri "${KIPRJMOD}/libs/MyDevice.kicad_sym")'
+        '(options "")(descr "shadows stock"))\n'
         ')\n', encoding="utf-8")
     return d
 
@@ -111,95 +79,25 @@ BLOCK = {"symbols": {"SPS_parts": "libs/SPS_parts.kicad_sym"},
          "footprints": {"SPS_parts": "${KIPRJMOD}/libs/SPS_parts.pretty"}}
 
 
-def resolver(proj: Path, stock: tuple[Path, Path], block: dict | None = BLOCK,
+def resolver(proj: Path, stock: tuple[Path, Path], block: dict = BLOCK,
              **kw) -> lt.LibraryResolver:
     kw.setdefault("env", {})
     return lt.LibraryResolver(proj, block, stock[0], stock[1], **kw)
 
 
-# --- 1. parsing both syntaxes -----------------------------------------------
-def test_parses_both_row_syntaxes_kicad9_to_11_and_import_caches():
-    t = lt.parse_table(K9_FP)                                   # KiCad 9, old unquoted
-    assert t.tag == "fp_lib_table" and t.version is None
-    assert [r.name for r in t.rows] == ["Audio_Module", "Connector_BarrelJack", "Resistor_SMD"]
-    first = t.rows[0]
-    assert first.type == "Kicad" and first.is_kicad          # legacy spelling still KiCad
-    assert first.uri == "${KICAD9_FOOTPRINT_DIR}/Audio_Module.pretty"
-    assert first.options == "" and first.descr == "Audio Module footprints"
-    assert t.rows[1].descr == "(DC) barrel jack connector footprints"
-    assert not any(r.disabled or r.hidden or r.managed for r in t.rows)
-    t = lt.parse_table(K9_SYM)                                  # KiCad 9, quoted
-    assert t.tag == "sym_lib_table" and t.version is None
-    assert {r.name: r.uri for r in t.rows} == {
-        "Device": "${KICAD9_SYMBOL_DIR}/Device.kicad_sym",
-        "power": "${KICAD9_SYMBOL_DIR}/power.kicad_sym"}
-    t = lt.parse_table(K11_FP)                                  # (version 7), tabs, CRLF
-    assert t.version == 7 and [r.name for r in t.rows] == ["MountingHole", "Resistor_SMD"]
-    assert t.rows[1].descr == "Resistor footprints, surface mount (SMD)"
-    fp, sym = lt.parse_table(IMPORT_FP), lt.parse_table(IMPORT_SYM)
-    assert all(r.import_cache for r in fp.rows + sym.rows)
-    assert fp.rows[0].option_map == {"kicad_import_cache": "1"}
-    assert not lt.LibRow("X", "u", options="a=1|b").import_cache
-    assert lt.LibRow("X", "u", options="a=1|b").option_map == {"a": "1", "b": ""}
+def dir_resolver(d: Path, stock: tuple[Path, Path], **kw) -> lt.LibraryResolver:
+    """No netlist: the directory's tables as KiCad reads them."""
+    kw.setdefault("env", {})
+    return lt.LibraryResolver.for_directory(d, stock[0], stock[1], **kw)
 
 
-def test_flags_escapes_and_unknown_tokens_round_trip():
-    text = ('(fp_lib_table (version 7)\n'
-            '  (lib (name "My \\"Lib\\"")(type "KiCad")(uri "C:\\\\libs\\\\x.pretty")'
-            '(options "")(descr "d")(disabled)(hidden)(future_token 1))\n'
-            '  (future_top (a b))\n)\n')
-    t = lt.parse_table(text)
-    row = t.rows[0]
-    assert row.name == 'My "Lib"' and row.uri == "C:\\libs\\x.pretty"
-    assert row.disabled and row.hidden
-    out = lt.format_table(t)
-    assert t.extra == ((1, "(future_top (a b))"),)          # verbatim, after one row
-    assert row.raw in out and out.index(row.raw) < out.index("(future_top (a b))")
-    assert lt.parse_table(out) == t
-    built = lt.LibRow('My "Lib"', "C:\\libs\\x.pretty", disabled=True, hidden=True)
-    assert lt.parse_table(f"(fp_lib_table {built.to_sexp()})").rows[0] == built
-    raw = lt.parse_table('(fp_lib_table (lib (name a)(type KiCad)(uri "C:\\libs\\x")'
-                         '(descr "1\\n2")))').rows[0]    # unknown pairs stay as written
-    assert (raw.uri, raw.descr) == ("C:\\libs\\x", "1\n2")
-
-
-def test_new_rows_are_written_in_kicad11_style():
-    row = lt.LibRow("Device", "${KICAD10_SYMBOL_DIR}/Device.kicad_sym",
-                    descr="Generic symbols for common devices")
-    assert row.to_sexp() == K11_DEVICE_ROW
-    text = lt.format_table(lt.LibTable("sym_lib_table", (row,)))
-    assert text == f"(sym_lib_table\n\t(version 7)\n\t{K11_DEVICE_ROW}\n)\n"
-
-
-@pytest.mark.parametrize("text, needle", [
-    ("", "empty"),
-    ("(fp_lib_table (lib (name a)(type KiCad)(uri b))", "unclosed"),
-    ("(fp_lib_table))", "unbalanced"),
-    ("(fp_lib_table) (sym_lib_table)", "after the table"),
-    ('(fp_lib_table (lib (name "a)))', "unterminated"),
-    ("(kicad_pcb (version 1))", "not a library table"),
-    ("(fp_lib_table (lib (name a)(type KiCad)))", "uri"),
-    ("(fp_lib_table (lib (name a)(uri b)))", "type"),
-    ("(fp_lib_table (lib (name a)(name b)(type KiCad)(uri c)))", "duplicate"),
-    ("(fp_lib_table (version seven))", "version"),
-    ("(fp_lib_table (lib name))", "malformed"),
-    ("(fp_lib_table (lib (name a)(type KiCad)(uri b)(disabled yes)))", "disabled"),
-    ("(fp_lib_table stray)", "stray"),
-    ('(fp_lib_table (lib (name a b)(type KiCad)(uri c)))', "one value"),
-    ("(fp_lib_table (lib (type KiCad)(uri b)))", "no .name"),
-    ("lib (fp_lib_table)", "expected '\\('"),
-])
-def test_malformed_tables_fail_loudly(text, needle):
-    with pytest.raises(lt.LibTableError, match=f"(?i)bad.table.*{needle}"):
-        lt.parse_table(text, source="bad.table")
-
-
-# --- 4. variable expansion ----------------------------------------------------
+# --- variable expansion --------------------------------------------------------
 @pytest.mark.parametrize("n", [6, 7, 8, 9, 10, 11])
 def test_versioned_stock_vars_alias_the_chosen_install(n: int, tmp_path: Path):
     syms, fps, models = tmp_path / "s", tmp_path / "f", tmp_path / "m"
     kw = dict(symbols_dir=syms, footprints_dir=fps, models_dir=models, env={})
-    assert lt.expand_vars(f"${{KICAD{n}_SYMBOL_DIR}}/D.kicad_sym", **kw) == (f"{syms}/D.kicad_sym", ())
+    assert lt.expand_vars(f"${{KICAD{n}_SYMBOL_DIR}}/D.kicad_sym", **kw) == (
+        f"{syms}/D.kicad_sym", ())
     assert lt.expand_vars(f"$(KICAD{n}_FOOTPRINT_DIR)/R.pretty", **kw) == (f"{fps}/R.pretty", ())
     assert lt.expand_vars(f"${{KICAD{n}_3DMODEL_DIR}}/a.step", **kw) == (f"{models}/a.step", ())
 
@@ -208,9 +106,11 @@ def test_kiprjmod_legacy_env_and_unresolved_vars(tmp_path: Path):
     kw = dict(kiprjmod=tmp_path / "p", symbols_dir=tmp_path / "s",
               footprints_dir=tmp_path / "f",
               env={"MYLIBS": "/opt/libs", "KICAD9_SYMBOL_DIR": "/wrong/install"})
-    assert lt.expand_vars("${KIPRJMOD}/libs/x.pretty", **kw) == (f"{tmp_path / 'p'}/libs/x.pretty", ())
+    assert lt.expand_vars("${KIPRJMOD}/libs/x.pretty", **kw) == (
+        f"{tmp_path / 'p'}/libs/x.pretty", ())
     assert lt.expand_vars("${KISYSMOD}/R.pretty", **kw)[0] == f"{tmp_path / 'f'}/R.pretty"
-    assert lt.expand_vars("${KICAD_SYMBOL_DIR}/D.kicad_sym", **kw)[0] == f"{tmp_path / 's'}/D.kicad_sym"
+    assert lt.expand_vars("${KICAD_SYMBOL_DIR}/D.kicad_sym", **kw)[0] == (
+        f"{tmp_path / 's'}/D.kicad_sym")
     assert lt.expand_vars("${MYLIBS}/x.pretty", **kw) == ("/opt/libs/x.pretty", ())
     # the chosen install beats a stale environment variable of the same name
     assert lt.expand_vars("${KICAD9_SYMBOL_DIR}/D", **kw)[0] == f"{tmp_path / 's'}/D"
@@ -226,13 +126,13 @@ def test_project_rows_with_any_install_var_resolve_to_the_chosen_install(tmp_pat
     d.mkdir()
     (d / "fp-lib-table").write_text(K9_FP, encoding="utf-8")
     make_lib(stock[1] / "Audio_Module.pretty")
-    r = resolver(d, stock, None)
+    r = dir_resolver(d, stock)
     assert same(r.footprint_lib_path("Resistor_SMD"), stock[1] / "Resistor_SMD.pretty")
     assert r.source("Audio_Module") == "project"           # a project row, not stock
     assert any("Connector_BarrelJack" in e for e in r.errors())   # absent from this stock
 
 
-# --- 2. resolution order ----------------------------------------------------
+# --- resolution order ----------------------------------------------------
 def test_resolution_order_netlist_project_stock(proj, stock):
     r = resolver(proj, stock)
     assert r.source("SPS_parts") == "netlist"                       # block beats stock
@@ -278,8 +178,8 @@ def test_block_vs_project_conflict_is_an_error(proj, stock):
         r.materialize(proj)
     # the same library, but disabled in the project table: KiCad would not load it
     (proj / "sym-lib-table").write_text(
-        '(sym_lib_table (lib (name "ProjSym")(type "KiCad")(uri "${KIPRJMOD}/libs/'
-        'ProjSym.kicad_sym")(options "")(descr "")(disabled)))', encoding="utf-8")
+        f'(sym_lib_table {row("ProjSym", "${KIPRJMOD}/libs/ProjSym.kicad_sym", "(disabled)")})',
+        encoding="utf-8")
     r = resolver(proj, stock, {"symbols": {"ProjSym": "libs/ProjSym.kicad_sym"}})
     assert [e for e in r.errors() if "'ProjSym'" in e and "disabled" in e] == r.errors() != []
     with pytest.raises(lt.LibTableError, match="ProjSym.*disabled"):
@@ -293,7 +193,7 @@ def test_import_cache_rows_resolve(tmp_path, stock):
     (d / "sym-lib-table").write_text(IMPORT_SYM, encoding="utf-8")
     make_lib(d / "eDP_adapter_dvt1-import-fps.pretty")
     make_lib(d / "yuzuki-import-syms.kicad_sym")
-    r = resolver(d, stock, None)
+    r = dir_resolver(d, stock)
     hit = r.resolve("footprint", "eDP_adapter_dvt1-import-fps")
     assert hit.source == "project" and hit.import_cache and hit.exists
     assert same(hit.path, d / "eDP_adapter_dvt1-import-fps.pretty")
@@ -305,10 +205,9 @@ def test_import_cache_rows_resolve(tmp_path, stock):
 def test_disabled_project_row_hides_the_nickname_like_kicad(tmp_path, stock):
     d = tmp_path / "p"
     d.mkdir()
-    (d / "sym-lib-table").write_text(
-        '(sym_lib_table (lib (name "power")(type "KiCad")(uri "x.kicad_sym")(options "")'
-        '(descr "")(disabled)))', encoding="utf-8")
-    r = resolver(d, stock, None)
+    (d / "sym-lib-table").write_text(f'(sym_lib_table {row("power", "x.kicad_sym", "(disabled)")})',
+                                     encoding="utf-8")
+    r = dir_resolver(d, stock)
     assert r.resolve("symbol", "power") is None             # not the stock one either
     with pytest.raises(lt.LibraryNotFoundError, match="disabled"):
         r.symbol_lib_path("power")
@@ -318,8 +217,7 @@ def test_disabled_project_row_hides_the_nickname_like_kicad(tmp_path, stock):
     r.materialize(out)
     assert _managed(out / "sym-lib-table")["power"].disabled  # out_dir hides it too
     (other / "sym-lib-table").write_text(                     # same library, enabled there
-        f'(sym_lib_table (lib (name "power")(type "KiCad")(uri "{(d / "x.kicad_sym").as_posix()}")'
-        '(options "")(descr "")))', encoding="utf-8")
+        f'(sym_lib_table {row("power", (d / "x.kicad_sym").as_posix())})', encoding="utf-8")
     with pytest.raises(lt.LibTableError, match="power.*enabled there"):
         r.materialize(other)
 
@@ -340,7 +238,7 @@ def test_without_a_netlist_managed_rows_resolve_as_kicad_reads_them(tmp_path, st
     block = {"symbols": {"Device": "libs/MyDevice.kicad_sym"},
              "footprints": {"Own": "libs/Own.pretty"}}
     resolver(d, stock, block).materialize(d)
-    r = resolver(d, stock, None)               # e.g. a consumer holding a schematic dir
+    r = dir_resolver(d, stock)                 # e.g. a consumer holding a schematic dir
     assert r.dir_only and r.source("Device") == "project" and r.errors() == []
     assert same(r.symbol_lib_path("Device"), d / "libs" / "MyDevice.kicad_sym")  # not stock
     assert same(r.footprint_lib_path("Own"), d / "libs" / "Own.pretty")
@@ -357,7 +255,57 @@ def test_without_a_netlist_managed_rows_resolve_as_kicad_reads_them(tmp_path, st
         gone.footprint_lib_path("Own")
     assert "only as a 'kicad-eda managed' row" in gone.errors(footprints=["Own"])[0]
     gone.materialize(d)                        # removes them; KiCad now agrees
-    assert resolver(d, stock, None).source("Device") == "stock"
+    assert dir_resolver(d, stock).source("Device") == "stock"
+
+
+# --- dir-only mode is explicit: for_directory; None is refused -----------------------
+def test_for_directory_reads_the_tables_as_kicad_does(tmp_path, stock, monkeypatch):
+    d, ext = tmp_path / "sch", tmp_path / "ext"
+    make_lib(d / "libs" / "Own.pretty"), make_lib(ext / "Ext.kicad_sym")
+    lt.write_table(d / "fp-lib-table", lt.LibTable("fp_lib_table", (
+        lt.LibRow("Own", "${KIPRJMOD}/libs/Own.pretty", descr=lt.MANAGED_DESCR),)))
+    lt.write_table(d / "sym-lib-table", lt.LibTable("sym_lib_table", (
+        lt.LibRow("Ext", "${MYLIBS}/Ext.kicad_sym"),)))
+    r = lt.LibraryResolver.for_directory(d, *stock, env={"MYLIBS": str(ext)})
+    assert r.dir_only and r.netlist_dir == r.project_dir == d
+    assert r.source("Own") == "project"            # a managed row counts: no netlist owns it
+    assert same(r.symbol_lib_path("Ext"), ext / "Ext.kicad_sym")     # env= honoured
+    assert r.source("Device") == "stock" and r.errors() == []
+    m = r.library_map()
+    assert m["netlist_dir"] == m["project_dir"] == str(d) and m["footprints"]["Own"]["managed"]
+    bare = lt.LibraryResolver.for_directory(str(d), None, None, env={})
+    errs = bare.errors()
+    assert [e for e in errs if "${MYLIBS}" in e and "undefined" in e] == errs != []
+    assert bare.resolve("symbol", "Device") is None                   # no stock configured
+    monkeypatch.setenv("MYLIBS", str(ext))                            # env=None: os.environ
+    assert lt.LibraryResolver.for_directory(d, None, None).errors() == []
+
+
+def test_constructor_refuses_none_and_points_to_for_directory(proj, stock):
+    for kw in ({}, {"project_dir": proj, "env": {}}):
+        with pytest.raises(TypeError, match="for_directory"):
+            lt.LibraryResolver(proj, None, *stock, **kw)
+    assert not lt.LibraryResolver(proj, {}, *stock, env={}).dir_only    # block-less netlist
+    assert not lt.LibraryResolver.for_design(proj, {"name": "x"}, *stock, env={}).dir_only
+    with pytest.raises(lt.LibTableError, match="object"):               # still a block error
+        lt.LibraryResolver(proj, [], *stock, env={})
+
+
+@pytest.mark.parametrize("kw", [{"symbols": "Device"}, {"footprints": "SPS_parts"},
+                                {"symbols": b"power"}])
+def test_a_bare_str_of_nicknames_is_a_type_error(kw, tmp_path, proj, stock):
+    r = resolver(proj, stock)
+    with pytest.raises(TypeError, match=r"(symbols|footprints)=.*bare (str|bytes).*\["):
+        r.errors(**kw)
+    out = tmp_path / "out"
+    out.mkdir()
+    with pytest.raises(TypeError, match="bare"):
+        r.materialize(out, **kw)
+    assert list(out.iterdir()) == []                                  # nothing written
+    assert r.errors(symbols=["Device"], footprints=("SPS_parts",)) == []
+    assert r.errors(symbols=(n for n in ["Nope"])) != []               # any other iterable
+    rep = r.materialize(out, symbols={"SPS_parts"}, footprints=[])
+    assert rep["sym-lib-table"]["managed"] == ["SPS_parts"] and not rep["fp-lib-table"]["written"]
 
 
 def test_errors_cover_missing_files_wrong_kinds_vars_and_duplicates(tmp_path, stock):
@@ -365,10 +313,8 @@ def test_errors_cover_missing_files_wrong_kinds_vars_and_duplicates(tmp_path, st
     make_lib(d / "libs" / "Dir.kicad_sym.pretty")
     (d / "libs" / "File.pretty").write_text("not a dir", encoding="utf-8")
     (d / "sym-lib-table").write_text(
-        '(sym_lib_table\n (lib (name "A")(type "KiCad")(uri "${MYLIBS}/a.kicad_sym")(options "")(descr ""))\n'
-        ' (lib (name "A")(type "KiCad")(uri "a2.kicad_sym")(options "")(descr ""))\n'
-        ' (lib (name "D")(type "KiCad")(uri "${KIPRJMOD}/libs/Dir.kicad_sym.pretty")(options "")(descr ""))\n)',
-        encoding="utf-8")
+        f'(sym_lib_table\n {row("A", "${MYLIBS}/a.kicad_sym")}\n {row("A", "a2.kicad_sym")}\n'
+        f' {row("D", "${KIPRJMOD}/libs/Dir.kicad_sym.pretty")}\n)', encoding="utf-8")
     block = {"symbols": {"Gone": "libs/Gone.kicad_sym", "Odd": "libs/odd.lib"},
              "footprints": {"F": "libs/File.pretty"}}
     errs = "\n".join(resolver(d, stock, block).errors())
@@ -397,14 +343,14 @@ def test_malformed_libraries_block_fails_fast(block, needle, proj, stock):
 def test_malformed_or_wrong_kind_project_tables_are_refused(tmp_path, stock):
     (tmp_path / "fp-lib-table").write_text("(fp_lib_table (lib (name x)", encoding="utf-8")
     with pytest.raises(lt.LibTableError, match="fp-lib-table"):
-        resolver(tmp_path, stock, None)
+        dir_resolver(tmp_path, stock)
     (tmp_path / "fp-lib-table").write_text(K9_SYM, encoding="utf-8")
     with pytest.raises(lt.LibTableError, match="expected \\(fp_lib_table"):
-        resolver(tmp_path, stock, None)
+        dir_resolver(tmp_path, stock)
     nl = tmp_path / "nl"
     nl.mkdir()
     with pytest.raises(lt.LibTableError, match="expected \\(fp_lib_table"):
-        resolver(nl, stock, None).materialize(tmp_path)
+        dir_resolver(nl, stock).materialize(tmp_path)
 
 
 def test_project_dir_absolute_paths_and_missing_stock_dirs(tmp_path, proj, stock):
@@ -470,6 +416,44 @@ def test_design_nicknames_feed_errors_and_materialize(tmp_path, proj, stock):
     assert rep["fp-lib-table"]["managed"] == ["SPS_parts"]
 
 
+# --- library_generator: 'generated' parts for the review (F2-08 / F5-06) ------------
+GEN_SYM = ('(kicad_symbol_lib\r\n\t(version 20241209)\r\n\t(generator "{g}")\r\n'
+           '\t(generator_version "9.0")\r\n\t(symbol "X")\r\n)\r\n')
+GEN_FP = '(footprint "{n}" (version 20241229) (generator "{g}") (layer "F.Cu"))\n'
+
+
+def test_library_generator_true_false_and_mixed_pretty(tmp_path: Path):
+    def write(path: Path, text: str) -> Path:
+        path.write_text(text, encoding="utf-8")
+        return path
+    gen = lt.KICAD_EDA_GENERATOR
+    assert gen == "kicad-eda"
+    assert lt.library_generator(write(tmp_path / "a.kicad_sym", GEN_SYM.format(g=gen))) == gen
+    assert lt.library_generator(str(tmp_path / "a.kicad_sym")) == gen
+    bom = tmp_path / "bom.kicad_sym"
+    bom.write_text(GEN_SYM.format(g=gen), encoding="utf-8-sig")
+    assert lt.library_generator(bom) == gen
+    other = write(tmp_path / "b.kicad_sym", GEN_SYM.format(g="kicad_symbol_editor"))
+    assert lt.library_generator(other) is None
+    assert lt.library_generator(make_lib(tmp_path / "c.kicad_sym")) is None   # no generator
+    pretty = tmp_path / "Gen.pretty"
+    pretty.mkdir()
+    for n in ("A", "B"):
+        write(pretty / f"{n}.kicad_mod", GEN_FP.format(n=n, g=gen))
+    write(pretty / "README.txt", "not a footprint")
+    assert lt.library_generator(pretty) == gen                     # every .kicad_mod
+    assert lt.library_generator(pretty / "A.kicad_mod") == gen     # one part (F5-06)
+    write(pretty / "C.kicad_mod", GEN_FP.format(n="C", g="pcbnew"))
+    assert lt.library_generator(pretty) is None                    # mixed
+    assert lt.library_generator(pretty / "A.kicad_mod") == gen
+    (tmp_path / "Empty.pretty").mkdir()
+    for p in (tmp_path / "Empty.pretty", tmp_path / "missing.pretty", tmp_path / "gone.kicad_sym",
+              tmp_path, write(tmp_path / "x.txt", GEN_FP.format(n="x", g=gen))):
+        assert lt.library_generator(p) is None, p
+    authored = "".join(p.read_text(encoding="utf-8") for p in TOOLS.glob("*_author*.py"))
+    assert f'"{gen}"' in authored                  # what fp_author / sym_author stamp
+
+
 # --- library_map (the JSON handed to the SWIG builder) ------------------------
 def test_library_map_is_json_and_lookup_matches_the_resolver(tmp_path, proj, stock):
     r = resolver(proj, stock)
@@ -486,12 +470,12 @@ def test_library_map_is_json_and_lookup_matches_the_resolver(tmp_path, proj, sto
     assert lt.lookup(m, "footprint", "Nope") is None
     with pytest.raises(ValueError, match="kind"):
         lt.lookup(m, "symbols", "x")
-    bare = lt.LibraryResolver(proj, None, None, None, env={}).library_map()
+    bare = lt.LibraryResolver.for_directory(proj, None, None, env={}).library_map()
     assert bare["stock"] == {"symbols": None, "footprints": None}
     assert lt.lookup(bare, "symbol", "power") is None
 
 
-# --- 3. materialize ----------------------------------------------------------
+# --- materialize ----------------------------------------------------------
 FOREIGN_FP = """(fp_lib_table
   (version 7)
   (lib (name Battery)(type KiCad)(uri ${KICAD9_FOOTPRINT_DIR}/Battery.pretty)(options "")(descr "Battery and battery holder footprints"))
@@ -499,7 +483,7 @@ FOREIGN_FP = """(fp_lib_table
   (lib (name "Qwiic_Button-import-fps") (type "KiCad") (uri "${KIPRJMOD}/Qwiic_Button-import-fps.pretty") (options "kicad_import_cache=1") (descr ""))
   (future_item (x))
 )
-"""
+"""  # noqa: E501
 
 
 def _managed(path: Path) -> dict[str, lt.LibRow]:
@@ -509,8 +493,8 @@ def _managed(path: Path) -> dict[str, lt.LibRow]:
 def test_materialize_writes_nothing_without_project_libraries(tmp_path, stock):
     nl, out = tmp_path / "nl", tmp_path / "out"
     nl.mkdir(), out.mkdir()
-    for block in (None, {}):
-        rep = resolver(nl, stock, block).materialize(out)
+    for r in (dir_resolver(nl, stock), resolver(nl, stock, {})):
+        rep = r.materialize(out)
         assert list(out.iterdir()) == []
         assert not rep["sym-lib-table"]["written"] and not rep["fp-lib-table"]["written"]
     with pytest.raises(lt.LibTableError, match="does not exist"):
@@ -529,13 +513,15 @@ def test_materialize_is_idempotent_and_preserves_unmanaged_rows(tmp_path, proj, 
     after = lt.read_table(fp_table)
     text = fp_table.read_text(encoding="utf-8")
     assert after.rows[:3] == foreign.rows and after.version == 7
-    for row in foreign.rows:
-        assert row.raw in text                                   # byte-for-byte
+    for foreign_row in foreign.rows:
+        assert foreign_row.raw in text                           # byte-for-byte
     # the unknown item stays after the user's rows; our rows go at the end
     assert text.index("Qwiic") < text.index("(future_item (x))") < text.index('"SPS_parts"')
-    row = _managed(fp_table)["SPS_parts"]
-    assert row.descr == "kicad-eda managed" and row.uri == "${KIPRJMOD}/../proj/libs/SPS_parts.pretty"
-    assert same(lt.expand_vars(row.uri, kiprjmod=out, env={})[0], proj / "libs" / "SPS_parts.pretty")
+    managed = _managed(fp_table)["SPS_parts"]
+    assert managed.descr == "kicad-eda managed"
+    assert managed.uri == "${KIPRJMOD}/../proj/libs/SPS_parts.pretty"
+    assert same(lt.expand_vars(managed.uri, kiprjmod=out, env={})[0],
+                proj / "libs" / "SPS_parts.pretty")
     assert list(_managed(out / "sym-lib-table")) == ["SPS_parts"]
 
     before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in out.iterdir()}
@@ -557,9 +543,8 @@ def test_materialize_replaces_and_removes_only_its_own_rows(tmp_path, proj, stoc
     assert _managed(out / "fp-lib-table")["SPS_parts"].uri.endswith("/proj/v2/SPS_parts.pretty")
     assert rep["sym-lib-table"]["removed"] == ["SPS_parts"]       # dropped from the block
     assert _managed(out / "sym-lib-table") == {}
-    # no netlist (None): the tables are read as KiCad reads them, so nothing is stale
-    assert resolver(proj, stock, None, project_dir=out).materialize(out)["fp-lib-table"][
-        "removed"] == []
+    # no netlist: the tables are read as KiCad reads them, so nothing is stale
+    assert dir_resolver(out, stock).materialize(out)["fp-lib-table"]["removed"] == []
     rep = resolver(proj, stock, {}, project_dir=out).materialize(out)   # block-less netlist
     assert rep["fp-lib-table"]["removed"] == ["SPS_parts"]
     assert lt.read_table(out / "fp-lib-table").rows == foreign     # back to the user's rows
@@ -587,17 +572,17 @@ def test_materialize_elsewhere_copies_project_rows_with_rebased_uris(tmp_path, s
     r.materialize(out, footprints=["eDP_adapter_dvt1-import-fps", "Resistor_SMD"])
     rows = _managed(out / "fp-lib-table")
     assert list(rows) == ["eDP_adapter_dvt1-import-fps"]        # filter; stock never copied
-    row = rows["eDP_adapter_dvt1-import-fps"]
-    assert row.import_cache and row.uri == "${KIPRJMOD}/../../imp/eDP_adapter_dvt1-import-fps.pretty"
-    assert _managed(out / "sym-lib-table")["Abs"].uri == lib.as_posix()   # absolute stays absolute
+    imported = rows["eDP_adapter_dvt1-import-fps"]
+    assert imported.import_cache
+    assert imported.uri == "${KIPRJMOD}/../../imp/eDP_adapter_dvt1-import-fps.pretty"
+    assert _managed(out / "sym-lib-table")["Abs"].uri == lib.as_posix()   # absolute stays
 
 
 def test_materialize_keeps_unknown_vars_and_falls_back_to_absolute(tmp_path, stock, monkeypatch):
     d, out = tmp_path / "p", tmp_path / "out"
     d.mkdir(), out.mkdir()
-    (d / "fp-lib-table").write_text(
-        '(fp_lib_table (lib (name "Ext")(type "KiCad")(uri "${MYLIBS}/Ext.pretty")'
-        '(options "")(descr "")))', encoding="utf-8")
+    (d / "fp-lib-table").write_text(f'(fp_lib_table {row("Ext", "${MYLIBS}/Ext.pretty")})',
+                                    encoding="utf-8")
     lib = make_lib(d / "libs" / "Own.kicad_sym")
     r = resolver(d, stock, {"symbols": {"Own": "libs/Own.kicad_sym"}})
     assert any("${MYLIBS}" in e for e in r.errors())
@@ -618,8 +603,7 @@ def test_materialize_refuses_a_conflicting_unmanaged_row(uri, flag, needle, tmp_
     out = tmp_path / "out"
     out.mkdir()
     uri = uri.format(lib=(proj / "libs" / "SPS_parts.pretty").as_posix())
-    clash = (f'(fp_lib_table (lib (name "SPS_parts")(type "KiCad")(uri "{uri}")(options "")'
-             f'(descr ""){flag}))\n')
+    clash = f'(fp_lib_table {row("SPS_parts", uri, flag)})\n'
     (out / "fp-lib-table").write_text(clash, encoding="utf-8")
     with pytest.raises(lt.LibTableError, match=f"SPS_parts.*unmanaged.*{needle}"):
         resolver(proj, stock).materialize(out)
@@ -627,23 +611,47 @@ def test_materialize_refuses_a_conflicting_unmanaged_row(uri, flag, needle, tmp_
     assert not (out / "sym-lib-table").exists()                  # nothing half-written
 
 
-def test_table_file_errors_name_the_file_and_a_failed_write_leaves_no_debris(tmp_path,
-                                                                             monkeypatch):
-    table = tmp_path / "fp-lib-table"
-    table.write_text("(fp_lib_table (lib", encoding="utf-8")
-    with pytest.raises(lt.LibTableError, match="fp-lib-table"):
-        lt.read_table(table)
-    with pytest.raises(lt.LibTableError, match="cannot read library table"):
-        lt.read_table(tmp_path / "missing" / "sym-lib-table")
-    table.write_text(K9_FP, encoding="utf-8")
+@pytest.mark.parametrize("key, lib", [("footprints", "SPS_parts.pretty"),
+                                      ("symbols", "SPS_parts.kicad_sym")])
+def test_same_relative_uri_text_in_another_dir_is_a_clash(key, lib, tmp_path, proj, stock):
+    """Repro: the out table's row has the block's exact URI text, but a relative /
+    ${KIPRJMOD} URI resolves against the out dir: another library, not ours."""
+    out = tmp_path / "out"
+    make_lib(out / "libs" / lib)
+    table = "fp-lib-table" if key == "footprints" else "sym-lib-table"
+    text = f'({table.replace("-", "_")} {row("SPS_parts", BLOCK[key]["SPS_parts"])})\n'
+    (out / table).write_text(text, encoding="utf-8")
+    r = resolver(proj, stock, {key: BLOCK[key]})
+    with pytest.raises(lt.LibTableError,
+                       match=r"SPS_parts.*unmanaged.*pointing to .*out.*same URI text"):
+        r.materialize(out)
+    assert (out / table).read_text(encoding="utf-8") == text
 
-    def locked(src, dst):
-        raise PermissionError("the file is open in another program")
-    monkeypatch.setattr(lt.os, "replace", locked)
-    with pytest.raises(PermissionError):
-        lt.write_table(table, lt.LibTable("fp_lib_table", (lt.LibRow("X", "x.pretty"),)))
-    assert [p.name for p in tmp_path.iterdir()] == ["fp-lib-table"]
-    assert table.read_text(encoding="utf-8") == K9_FP
+
+def test_same_absolute_path_or_install_var_is_not_a_clash(tmp_path, proj, stock):
+    out = tmp_path / "out"
+    out.mkdir()
+    lib = proj / "libs" / "SPS_parts.pretty"
+    text = (f'(fp_lib_table {row("SPS_parts", lib.as_posix())}\n'
+            f' {row("Ext", "${MYLIBS}/Ext.pretty")})\n')       # unresolved: text decides
+    (out / "fp-lib-table").write_text(text, encoding="utf-8")
+    (proj / "fp-lib-table").write_text(f'(fp_lib_table {row("Ext", "${MYLIBS}/Ext.pretty")})',
+                                       encoding="utf-8")
+    rep = resolver(proj, stock, {"footprints": {"SPS_parts": str(lib)}}).materialize(out)
+    assert set(rep["fp-lib-table"]["skipped"]) == {"SPS_parts", "Ext"}
+    assert not rep["fp-lib-table"]["written"]
+    assert (out / "fp-lib-table").read_text(encoding="utf-8") == text
+    link = tmp_path / "link"                       # another spelling of the same real path
+    try:
+        link.symlink_to(proj / "libs", target_is_directory=True)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"cannot create a symlink here: {e}")
+    (out / "fp-lib-table").write_text(
+        f'(fp_lib_table {row("SPS_parts", (link / "SPS_parts.pretty").as_posix())})',
+        encoding="utf-8")
+    rep = resolver(proj, stock, {"footprints": BLOCK["footprints"]}).materialize(out)
+    assert rep["fp-lib-table"]["skipped"] == {"SPS_parts": f"already in {out / 'fp-lib-table'} "
+                                                           f"as an unmanaged row"}
 
 
 def test_write_minimal_kicad_pro_never_overwrites(tmp_path):
@@ -658,55 +666,13 @@ def test_write_minimal_kicad_pro_never_overwrites(tmp_path):
         lt.write_minimal_kicad_pro(tmp_path / "board.json")
 
 
-# --- 5. stdlib only ------------------------------------------------------------------
-def test_module_imports_only_the_standard_library_and_loads_without_site_packages():
-    tree = ast.parse((TOOLS / "libtable.py").read_text(encoding="utf-8"))
-    names = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            assert node.level == 0, "no relative imports"
-            names.add(node.module.split(".")[0])
-    assert names and names <= set(sys.stdlib_module_names), names - set(sys.stdlib_module_names)
-    code = ("import sys; sys.path.insert(0, sys.argv[1]); import libtable; "
-            "extra = {m.split('.')[0] for m in sys.modules} - set(sys.stdlib_module_names)"
-            " - {'libtable', '__main__'}; print(sorted(extra))")
-    proc = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(TOOLS)],
-                          capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == "[]"
-
-
-# --- live tier ------------------------------------------------------------------------
-FAMILIES = {"9": lambda v: v[0] == 9, "10": lambda v: v[0] == 10 and v[1] < 99,
-            "11": lambda v: v >= (10, 99, 0)}
-
-
-def _install(family: str) -> env.KiCadInstall:
-    for inst in env.discover():
-        if FAMILIES[family](inst.version_tuple):
-            return inst
-    pytest.skip(f"no KiCad {family} install")
-
-
-@pytest.mark.parametrize("family", sorted(FAMILIES))
-def test_live_full_templates_parse(family):
-    inst = _install(family)
-    for name in ("sym-lib-table", "fp-lib-table"):
-        path = inst.share / "template" / name
-        text = path.read_text(encoding="utf-8")
-        table = lt.read_table(path)
-        assert len(table.rows) == text.count("(lib (name") > 50
-        assert len({r.name for r in table.rows}) == len(table.rows)
-        assert all(r.uri.startswith("${KICAD") and r.is_kicad for r in table.rows)
-
-
+# --- live tier (FAMILIES / kicad_install: test_libtable_sexp) ----------------------
 T_SYM = """(kicad_symbol_lib (version 20241209) (generator "kicad-eda")
  (symbol "R" (pin_numbers (hide yes)) (exclude_from_sim no) (in_bom yes) (on_board yes)
   %PROPS% (symbol "R_1_1" %PINS%) (embedded_fonts no)))
 """
-T_PROPS = ' '.join(f'(property "{k}" "{v}" (at 0 0 0) (effects (font (size 1.27 1.27)) (hide yes)))'
+T_PROPS = ' '.join(f'(property "{k}" "{v}" (at 0 0 0) (effects (font (size 1.27 1.27)) '
+                   f'(hide yes)))'
                    for k, v in [("Reference", "R"), ("Value", "R"), ("Footprint", ""),
                                 ("Datasheet", "~"), ("Description", "")])
 T_PINS = ' '.join(f'(pin passive line (at 0 {y} {a}) (length 1.27) (name "~" (effects (font '
@@ -727,7 +693,7 @@ T_SCH = """(kicad_sch (version 20250114) (generator "kicad-eda") (generator_vers
  (no_connect (at 50.8 34.29) (uuid "6b0c2f1e-1d7a-4c51-9b0e-3f0a1d2c4e05"))
  (no_connect (at 50.8 41.91) (uuid "6b0c2f1e-1d7a-4c51-9b0e-3f0a1d2c4e06"))
  (sheet_instances (path "/" (page "1"))) (embedded_fonts no))
-"""
+"""  # noqa: E501
 
 
 def _erc_library_warnings(cli: Path, sch: Path) -> list[str]:
@@ -743,7 +709,7 @@ def _erc_library_warnings(cli: Path, sch: Path) -> list[str]:
 
 @pytest.mark.parametrize("family", sorted(FAMILIES))
 def test_live_kicad_erc_honours_materialized_tables(family, tmp_path):
-    inst = _install(family)
+    inst = kicad_install(family)
     sub = lambda s: s.replace("%PROPS%", T_PROPS).replace("%PINS%", T_PINS)  # noqa: E731
     (tmp_path / "libs").mkdir()
     (tmp_path / "libs" / "T.kicad_sym").write_text(sub(T_SYM), encoding="utf-8")
@@ -768,8 +734,10 @@ def test_live_kicad_erc_honours_materialized_tables(family, tmp_path):
     assert lt.write_minimal_kicad_pro(tmp_path / "t.kicad_pro")
     assert _erc_library_warnings(inst.kicad_cli, sch) == []
     assert [x.name for x in lt.read_table(tmp_path / "fp-lib-table").rows] == ["Other", "T"]
-    seen = lt.LibraryResolver(tmp_path, None, None, None, env={})   # dir-only = KiCad's view
+    seen = lt.LibraryResolver.for_directory(tmp_path, None, None, env={})   # KiCad's view
     assert (seen.source("T"), seen.errors()) == ("project", [])
+    assert lt.library_generator(pretty) == lt.library_generator(tmp_path / "libs" /
+                                                                "T.kicad_sym") == "kicad-eda"
 
 
 CHILD = """import json, sys
@@ -778,20 +746,27 @@ import kicad_quiet  # noqa: F401  (D0: no modal wx dialogs in a KiCad-python chi
 import libtable
 stock = json.loads(sys.argv[4])
 r = libtable.LibraryResolver(sys.argv[2], json.loads(sys.argv[3]), stock[0], stock[1], env={})
+d = libtable.LibraryResolver.for_directory(sys.argv[2], stock[0], stock[1], env={})
 m = r.library_map()
-print(json.dumps({"map": m, "fp": libtable.lookup(m, "footprint", "SPS_parts")}))
+print(json.dumps({"map": m, "fp": libtable.lookup(m, "footprint", "SPS_parts"),
+                  "dir": d.library_map(), "gen": libtable.library_generator(sys.argv[5]),
+                  "version": list(sys.version_info[:2])}))
 """
 
 
-def test_live_kicad_bundled_python_imports_and_resolves(proj, stock):
+def test_live_kicad_bundled_python_imports_and_resolves(tmp_path, proj, stock):
     py = next((i.python for i in env.discover() if i.python is not None), None)
     if py is None:
         pytest.skip("no KiCad bundled Python")
+    gen = tmp_path / "gen.kicad_mod"
+    gen.write_text(GEN_FP.format(n="gen", g="kicad-eda"), encoding="utf-8")
     argv = [str(py), "-c", CHILD, str(TOOLS), str(proj), json.dumps(BLOCK),
-            json.dumps([str(stock[0]), str(stock[1])])]
+            json.dumps([str(stock[0]), str(stock[1])]), str(gen)]
     proc = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                           timeout=LIVE_TIMEOUT_S)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     got = json.loads(proc.stdout.strip().splitlines()[-1])
     assert got["map"] == json.loads(json.dumps(resolver(proj, stock).library_map()))
+    assert got["dir"] == json.loads(json.dumps(dir_resolver(proj, stock).library_map()))
     assert same(got["fp"], proj / "libs" / "SPS_parts.pretty")
+    assert got["gen"] == "kicad-eda" and got["version"] >= [3, 11]

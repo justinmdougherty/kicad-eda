@@ -7,7 +7,7 @@
     <out_dir>/netlist.json                     the design (docs/PIPELINE.md s2)
     <out_dir>/libs/<name>_imported.kicad_sym   the schematic's embedded symbols
     <out_dir>/libs/<name>_imported.pretty/     the board's footprints (KiCad 9
-                                               dialect boards; else reported)
+                                               dialect: kicad_import_d0's routes)
     <out_dir>/import_report.json               mismatches, assumptions, checks
 
 Inputs: the schematic netlist exported by kicad-cli (``--format kicadxml``,
@@ -46,8 +46,8 @@ all pass for ``ok``; disagreements inside the source design are reported,
 not failed.
 
 CLI: ``kicad_import.py <project> <out_dir> [--rebuild keep|reflow] [--name N]
-[--netlist-xml X] [--kicad-cli C] [--no-footprints]`` prints a summary as
-JSON; exit 0 when every check passed, 1 when one failed, 2 on an error.
+[--netlist-xml X] [--kicad-cli C] [--no-footprints] [--footprint-source D]...``
+prints a summary as JSON; exit 0 when every check passed, 1 when one failed, 2 on an error.
 """
 from __future__ import annotations
 
@@ -68,10 +68,12 @@ for _p in (str(_HERE), str(_HERE.parent)):
         sys.path.insert(0, _p)
 
 import kicad_import_checks as kchk  # noqa: E402
+import kicad_import_d0 as kd0  # noqa: E402
 import kicad_import_fplib as kfp  # noqa: E402
 import kicad_import_pcb as kpcb  # noqa: E402
 import kicad_import_sch as ksch  # noqa: E402
 import net_equivalence as ne  # noqa: E402
+import sexpr_read as sr  # noqa: E402
 
 REBUILD_MODES = ("keep", "reflow")
 SUPPORTED_COPPER = (2, 4, 6)          # netlist_schema.COPPER_LAYER_COUNTS when importable
@@ -138,7 +140,7 @@ class _Part:
 
 
 def _natural(text: str) -> tuple:
-    return ne._natural(text)
+    return sr.natural_key(text)
 
 
 # ----------------------------------------------------------------------------
@@ -267,7 +269,7 @@ def _design_nets(board_nets: Mapping[str, list[tuple[str, str]]], rep: _Report
     names = _net_names(multi)
     rep.extra["net_name_map"] = {names[o]: o for o in sorted(multi, key=_natural)
                                  if names[o] != o}
-    out = {names[o]: [list(k) for k in sorted(keys, key=ne._pad_order)]
+    out = {names[o]: [list(k) for k in sorted(keys, key=sr.pad_order)]
            for o, keys in multi.items()}
     return dict(sorted(out.items(), key=lambda kv: _natural(kv[0])))
 
@@ -645,12 +647,14 @@ def _netlist_text(files: ProjectFiles, sheets: list[tuple[str, str]], netlist_xm
 def convert(project: str | Path, out_dir: str | Path, *, rebuild: str = "keep",
             name: str | None = None, netlist_xml: str | None = None,
             kicad_cli: str | None = None, kicad_python: str | None = None,
-            extract_footprints: bool = True) -> dict:
+            extract_footprints: bool = True,
+            footprint_sources: Iterable[str | Path] = ()) -> dict:
     """Convert a KiCad project into ``<out_dir>/netlist.json`` + libraries +
     ``import_report.json`` (module doc). ``netlist_xml``: an existing
     kicadxml export to use instead of running kicad-cli; ``kicad_cli`` /
     ``kicad_python``: override the installs picked; ``extract_footprints``:
-    False keeps the board's own footprint ids. Returns {"ok", "netlist",
+    False keeps the board's own footprint ids; ``footprint_sources``: libraries
+    (the KiCad 11 importer's) for kicad_import_d0's routes. Returns {"ok", "netlist",
     "report_file", "design", "report"}; ``ok`` = every check of
     kicad_import_checks.check_design ran and passed (source mismatches are
     reported, not failed). Raises on unreadable input."""
@@ -669,9 +673,10 @@ def convert(project: str | Path, out_dir: str | Path, *, rebuild: str = "keep",
     sym_path = libs / f"{nick}.kicad_sym"
     plan, sym_info = ksch.write_symbol_library(
         sorted(linked.values(), key=lambda c: _natural(c.ref)), sheets, sym_path)
-    fplib, fp_info = kfp.write_footprint_library(
-        files.pcb, board, [fp.index for fp in board.footprints if fp.index not in linked],
-        nick, libs / f"{nick}.pretty", kicad_python, extract_footprints)
+    fplib, fp_info = kd0.provide_footprints(
+        files.pcb, board, nick, libs / f"{nick}.pretty", sources=footprint_sources,
+        keep_instance_attrs=[fp.index for fp in board.footprints if fp.index not in linked],
+        kicad_python=kicad_python, enabled=extract_footprints)
     footprint_libs = ({nick: f"{LIBS_DIR}/{nick}.pretty"} if fplib
                       else kfp.project_footprint_libs(files.root, board))
     source = source_block(files, sheets, tool)
@@ -709,6 +714,7 @@ def summary(result: Mapping[str, Any]) -> dict:
             "sch_vs_pcb": rep["sch_vs_pcb"]["summary"],
             "mismatch_kinds": sorted({m["kind"] for m in rep["mismatches"]}),
             "footprints_extracted": rep["libraries"]["footprints"]["extracted"],
+            "footprint_route": rep["libraries"]["footprints"].get("route"),
             "footprint_format": rep["libraries"]["footprints"].get("format"),
             "library_paths_too_long": len(checks["library_paths"]["too_long"])}
 
@@ -725,11 +731,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--kicad-cli", help="kicad-cli to export the schematic with")
     ap.add_argument("--no-footprints", action="store_true",
                     help="keep the board's footprint ids, extract no footprint library")
+    ap.add_argument("--footprint-source", action="append", default=[], metavar="DIR",
+                    help="a footprint library to take items from (KiCad 11 importer's)")
     args = ap.parse_args(argv)
     try:
         res = convert(args.project, args.out_dir, rebuild=args.rebuild, name=args.name,
                       netlist_xml=args.netlist_xml, kicad_cli=args.kicad_cli,
-                      extract_footprints=not args.no_footprints)
+                      extract_footprints=not args.no_footprints,
+                      footprint_sources=args.footprint_source)
     except (OSError, ValueError, RuntimeError) as e:
         print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
         return 2

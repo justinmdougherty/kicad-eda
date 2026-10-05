@@ -39,15 +39,18 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import kicad_dialect as kd  # noqa: E402
 import net_equivalence as ne  # noqa: E402
+import sexpr_read as sr  # noqa: E402
 
 FLAG_DNP, FLAG_NO_BOM, FLAG_NO_BOARD = "dnp", "exclude_from_bom", "exclude_from_board"
 _FLAGS = frozenset({FLAG_DNP, FLAG_NO_BOM, FLAG_NO_BOARD})
 NO_CONNECT_SUFFIX = "+no_connect"
 # KiCad 9's schematic format; anything newer needs KiCad 10+ to load
 K9_SCH_FORMAT = 20250114
-# the .kicad_sym dialect written for the extracted symbols: KiCad 9's for a
-# KiCad 9 schematic (D0), KiCad 10's for anything newer
+# the .kicad_sym dialect the extracted symbols are read in: KiCad 9's for a
+# KiCad 9 schematic (D0), KiCad 10's for anything newer (write_symbol_library
+# then writes them in KiCad 9's through kicad_dialect when it can)
 K9_SYM_FORMAT, K10_SYM_FORMAT = 20241209, 20251024
 _SHEETFILE_NAMES = ("Sheetfile", "Sheet file")      # KiCad 7+ / KiCad 6
 _SYMBOL_NAME = re.compile(r'\(\s*symbol\s+"((?:[^"\\]|\\.)*)"')
@@ -217,7 +220,7 @@ def child_spans(text: str, start: int, end: int) -> list[tuple[str, int, int]]:
     text[start:end] (which must start with its own '(')."""
     out: list[tuple[str, int, int]] = []
     depth, opened = 0, 0
-    for m in ne._TOKEN.finditer(text, start, end):
+    for m in sr.TOKEN_RE.finditer(text, start, end):
         tok = m.group()
         if tok == "(":
             depth += 1
@@ -225,7 +228,7 @@ def child_spans(text: str, start: int, end: int) -> list[tuple[str, int, int]]:
                 opened = m.start()
         elif tok == ")":
             if depth == 2:
-                head = ne._HEAD.match(text, opened)
+                head = sr.HEAD_RE.match(text, opened)
                 out.append((head.group(1) if head else "", opened, m.end()))
             depth -= 1
             if depth == 0:
@@ -234,11 +237,11 @@ def child_spans(text: str, start: int, end: int) -> list[tuple[str, int, int]]:
 
 
 def _root_span(text: str, head: str, what: str) -> tuple[int, int]:
-    start = len(text) - len(text.lstrip(ne._LEADING))
-    if ne._head_of(text) != head:
+    start = len(text) - len(text.lstrip(sr.LEADING))
+    if sr.head_of(text) != head:
         raise ValueError(f"{what} is not a '({head} ...' file")
     depth = 0
-    for m in ne._TOKEN.finditer(text, start):
+    for m in sr.TOKEN_RE.finditer(text, start):
         tok = m.group()
         if tok == "(":
             depth += 1
@@ -263,9 +266,9 @@ def _sheet_files(text: str, spans: list[tuple[str, int, int]]) -> list[str]:
         for phead, ps, pe in child_spans(text, s, e):
             if phead != "property":
                 continue
-            node = ne._sexp(text[ps:pe])
-            if len(node) >= 3 and ne._atom(node[1]) in _SHEETFILE_NAMES:
-                out.append(ne._atom(node[2]))
+            node = sr.parse(text[ps:pe])
+            if len(node) >= 3 and sr.atom(node[1]) in _SHEETFILE_NAMES:
+                out.append(sr.atom(node[2]))
     return out
 
 
@@ -467,23 +470,61 @@ def plan_symbols(components: Iterable[SchComponent],
                       variants=tuple(variants), problems=tuple(problems))
 
 
+def verify_symbols(path: Path) -> dict:
+    """KiCad 9's own load check of a written symbol library (kicad_dialect.k9_check)."""
+    return kd.k9_check(path, "sym")
+
+
+def _in_kicad9_dialect(text: str, fmt: int, info: dict) -> tuple[str, dict]:
+    """(text to write, report entry) for a library newer than KiCad 9's:
+    kicad_dialect's KiCad 9 text, or, when it refuses a symbol (D0 needs
+    every one), the newer text and the refused constructs."""
+    res = kd.downgrade_symbol_library(text)
+    if res.ok:
+        return res.text, {**info, "format": K9_SYM_FORMAT, "d0_dialect": True,
+                          "downgraded_from": fmt, "downgrade": {
+                              "dropped": {c.rule: c.count for c in res.dropped},
+                              "rewritten": {c.rule: c.count for c in res.rewritten}}}
+    refused = ([{"item": n, "construct": c, "reason": r} for n, c, r in res.refused_items]
+               or [{"item": "(library)", "construct": res.construct or "",
+                    "reason": res.refused or ""}])
+    constructs = ", ".join(sorted({r["construct"] for r in refused}))
+    return text, {**info, "d0_dialect": False, "refused": refused, "kicad11_path_required": (
+        f"the schematic is newer than KiCad 9 and kicad_dialect refused {constructs} "
+        f"({len(refused)} symbol(s)); its symbols are written as format {fmt}, which KiCad 9 "
+        "cannot load")}
+
+
+def _k9_checked(path: Path, info: dict) -> dict:
+    check = verify_symbols(path)
+    summary = {k: check[k] for k in ("loaded", "compared", "reason") if k in check}
+    summary.update({k: len(check[k]) for k in ("differing", "missing") if k in check})
+    summary["errors"] = list(check.get("errors", ()))[:3]
+    return {**info, "k9_verified": check.get("ok"), "k9_check": summary}
+
+
 def write_symbol_library(components: Iterable[SchComponent], sheets: list[tuple[str, str]],
                          path: Path) -> tuple[SymbolPlan, dict]:
     """``path`` (.kicad_sym) holding the embedded symbol of every component
     (read_sheets output for ``sheets``); returns the plan and its report
-    entry. Nothing is written when no symbol was found."""
+    entry. A schematic newer than KiCad 9's gives KiCad 9 symbols
+    (kicad_dialect, then KiCad 9's own load check: ``k9_verified``) unless a
+    symbol has no KiCad 9 form (``refused``, ``kicad11_path_required``).
+    Nothing is written when no symbol was found."""
     plan = plan_symbols(components, embedded_symbols(sheets))
     fmt = symbol_format_for(schematic_version(sheets[0][1]))
     info: dict = {"file": str(path), "format": fmt, "symbols": len(plan.entries),
                   "variants": list(plan.variants), "missing": list(plan.missing),
-                  "problems": list(plan.problems)}
+                  "problems": list(plan.problems), "d0_dialect": fmt <= K9_SYM_FORMAT}
+    if not plan.entries:
+        return plan, info
+    text = symbol_library_text(plan.entries, fmt)
     if fmt > K9_SYM_FORMAT:
-        info["kicad11_path_required"] = ("the schematic is newer than KiCad 9; its symbols are "
-                                         f"written as format {fmt}, which KiCad 9 cannot load")
-    if plan.entries:
-        io_path(path.parent).mkdir(parents=True, exist_ok=True)
-        io_path(path).write_text(symbol_library_text(plan.entries, fmt), encoding="utf-8",
-                                 newline="\n")
+        text, info = _in_kicad9_dialect(text, fmt, info)
+    io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    io_path(path).write_text(text, encoding="utf-8", newline="\n")
+    if fmt > K9_SYM_FORMAT and info["d0_dialect"]:
+        info = _k9_checked(path, info)
     return plan, info
 
 

@@ -1,0 +1,90 @@
+{
+  "family": "SAM D21 A variants (ATSAMD21E15A..E18A, G15A..G18A, J15A..J18A)",
+  "source": "Atmel/Microchip SAM D21E / SAM D21G / SAM D21J datasheet (Atmel-42181; same table in Microchip DS40001882), section 7.1 'Multiplexed Signals', Table 7-1 'PORT Function Multiplexing'",
+  "verified": "pin numbers cross-checked against KiCad 9.0 MCU_Microchip_SAMD.kicad_sym (ATSAMD21E15A-A/-M, G15A-A/-M, J15A-A/-M; the 16A/17A/18A symbols extend them)",
+  "columns": {
+    "pin": "Table 7-1 columns SAMD21E / SAMD21G / SAMD21J: the pad number of the I/O pin per package (null = not bonded out)",
+    "extint": "peripheral function A, EIC: the EXTINT[n] line number; \"NMI\" on PA08 (not an EXTINT line)",
+    "sercom": "peripheral function C, SERCOM: [n, k] = SERCOMn/PAD[k]; null = none",
+    "sercom_alt": "peripheral function D, SERCOM-ALT: [n, k] = SERCOMn/PAD[k]; null = none"
+  },
+  "parts_note": "regexes searched (case-insensitive) in the lib_id, then the value; the 256 KB parts (E18/G18/J18) exist only as the A variant, so an 18 part named without its variant letter (an Eagle import's 'ATSAMD21G18_QFN') is the A",
+  "parts": [
+    {"match": "ATSAMD21E1[5-8]A|ATSAMD21E18(?![A-Z0-9])", "package": "E"},
+    {"match": "ATSAMD21G1[5-8]A|ATSAMD21G18(?![A-Z0-9])", "package": "G"},
+    {"match": "ATSAMD21J1[5-8]A|ATSAMD21J18(?![A-Z0-9])", "package": "J"}
+  ],
+  "packages": {
+    "E": {
+      "name": "SAMD21E: TQFP-32 / QFN-32 (QFN exposed pad = 33)",
+      "other_pins": {"9": "VDDANA", "10": "GND", "26": "RESET", "28": "GND", "29": "VDDCORE",
+                     "30": "VDDIN", "33": "EP"}
+    },
+    "G": {
+      "name": "SAMD21G: TQFP-48 / QFN-48 (QFN exposed pad = 49)",
+      "other_pins": {"5": "GNDANA", "6": "VDDANA", "17": "VDDIO", "18": "GND", "35": "GND",
+                     "36": "VDDIO", "40": "RESET", "42": "GND", "43": "VDDCORE", "44": "VDDIN",
+                     "49": "EP"}
+    },
+    "J": {
+      "name": "SAMD21J: TQFP-64 / QFN-64 (QFN exposed pad = 65)",
+      "other_pins": {"7": "GNDANA", "8": "VDDANA", "21": "VDDIO", "22": "GND", "33": "GND",
+                     "34": "VDDIO", "47": "GND", "48": "VDDIO", "52": "RESET", "54": "GND",
+                     "55": "VDDCORE", "56": "VDDIN", "65": "EP"}
+    }
+  },
+  "pins": {
+    "PA00": {"pin": {"E": 1, "G": 1, "J": 1}, "extint": 0, "sercom": null, "sercom_alt": [1, 0]},
+    "PA01": {"pin": {"E": 2, "G": 2, "J": 2}, "extint": 1, "sercom": null, "sercom_alt": [1, 1]},
+    "PA02": {"pin": {"E": 3, "G": 3, "J": 3}, "extint": 2, "sercom": null, "sercom_alt": null},
+    "PA03": {"pin": {"E": 4, "G": 4, "J": 4}, "extint": 3, "sercom": null, "sercom_alt": null},
+    "PB04": {"pin": {"E": null, "G": null, "J": 5}, "extint": 4, "sercom": null, "sercom_alt": null},
+    "PB05": {"pin": {"E": null, "G": null, "J": 6}, "extint": 5, "sercom": null, "sercom_alt": null},
+    "PB06": {"pin": {"E": null, "G": null, "J": 9}, "extint": 6, "sercom": null, "sercom_alt": null},
+    "PB07": {"pin": {"E": null, "G": null, "J": 10}, "extint": 7, "sercom": null, "sercom_alt": null},
+    "PB08": {"pin": {"E": null, "G": 7, "J": 11}, "extint": 8, "sercom": null, "sercom_alt": [4, 0]},
+    "PB09": {"pin": {"E": null, "G": 8, "J": 12}, "extint": 9, "sercom": null, "sercom_alt": [4, 1]},
+    "PA04": {"pin": {"E": 5, "G": 9, "J": 13}, "extint": 4, "sercom": null, "sercom_alt": [0, 0]},
+    "PA05": {"pin": {"E": 6, "G": 10, "J": 14}, "extint": 5, "sercom": null, "sercom_alt": [0, 1]},
+    "PA06": {"pin": {"E": 7, "G": 11, "J": 15}, "extint": 6, "sercom": null, "sercom_alt": [0, 2]},
+    "PA07": {"pin": {"E": 8, "G": 12, "J": 16}, "extint": 7, "sercom": null, "sercom_alt": [0, 3]},
+    "PA08": {"pin": {"E": 11, "G": 13, "J": 17}, "extint": "NMI", "sercom": [0, 0], "sercom_alt": [2, 0]},
+    "PA09": {"pin": {"E": 12, "G": 14, "J": 18}, "extint": 9, "sercom": [0, 1], "sercom_alt": [2, 1]},
+    "PA10": {"pin": {"E": 13, "G": 15, "J": 19}, "extint": 10, "sercom": [0, 2], "sercom_alt": [2, 2]},
+    "PA11": {"pin": {"E": 14, "G": 16, "J": 20}, "extint": 11, "sercom": [0, 3], "sercom_alt": [2, 3]},
+    "PB10": {"pin": {"E": null, "G": 19, "J": 23}, "extint": 10, "sercom": null, "sercom_alt": [4, 2]},
+    "PB11": {"pin": {"E": null, "G": 20, "J": 24}, "extint": 11, "sercom": null, "sercom_alt": [4, 3]},
+    "PB12": {"pin": {"E": null, "G": null, "J": 25}, "extint": 12, "sercom": [4, 0], "sercom_alt": null},
+    "PB13": {"pin": {"E": null, "G": null, "J": 26}, "extint": 13, "sercom": [4, 1], "sercom_alt": null},
+    "PB14": {"pin": {"E": null, "G": null, "J": 27}, "extint": 14, "sercom": [4, 2], "sercom_alt": null},
+    "PB15": {"pin": {"E": null, "G": null, "J": 28}, "extint": 15, "sercom": [4, 3], "sercom_alt": null},
+    "PA12": {"pin": {"E": null, "G": 21, "J": 29}, "extint": 12, "sercom": [2, 0], "sercom_alt": [4, 0]},
+    "PA13": {"pin": {"E": null, "G": 22, "J": 30}, "extint": 13, "sercom": [2, 1], "sercom_alt": [4, 1]},
+    "PA14": {"pin": {"E": 15, "G": 23, "J": 31}, "extint": 14, "sercom": [2, 2], "sercom_alt": [4, 2]},
+    "PA15": {"pin": {"E": 16, "G": 24, "J": 32}, "extint": 15, "sercom": [2, 3], "sercom_alt": [4, 3]},
+    "PA16": {"pin": {"E": 17, "G": 25, "J": 35}, "extint": 0, "sercom": [1, 0], "sercom_alt": [3, 0]},
+    "PA17": {"pin": {"E": 18, "G": 26, "J": 36}, "extint": 1, "sercom": [1, 1], "sercom_alt": [3, 1]},
+    "PA18": {"pin": {"E": 19, "G": 27, "J": 37}, "extint": 2, "sercom": [1, 2], "sercom_alt": [3, 2]},
+    "PA19": {"pin": {"E": 20, "G": 28, "J": 38}, "extint": 3, "sercom": [1, 3], "sercom_alt": [3, 3]},
+    "PB16": {"pin": {"E": null, "G": null, "J": 39}, "extint": 0, "sercom": [5, 0], "sercom_alt": null},
+    "PB17": {"pin": {"E": null, "G": null, "J": 40}, "extint": 1, "sercom": [5, 1], "sercom_alt": null},
+    "PA20": {"pin": {"E": null, "G": 29, "J": 41}, "extint": 4, "sercom": [5, 2], "sercom_alt": [3, 2]},
+    "PA21": {"pin": {"E": null, "G": 30, "J": 42}, "extint": 5, "sercom": [5, 3], "sercom_alt": [3, 3]},
+    "PA22": {"pin": {"E": 21, "G": 31, "J": 43}, "extint": 6, "sercom": [3, 0], "sercom_alt": [5, 0]},
+    "PA23": {"pin": {"E": 22, "G": 32, "J": 44}, "extint": 7, "sercom": [3, 1], "sercom_alt": [5, 1]},
+    "PA24": {"pin": {"E": 23, "G": 33, "J": 45}, "extint": 12, "sercom": [3, 2], "sercom_alt": [5, 2]},
+    "PA25": {"pin": {"E": 24, "G": 34, "J": 46}, "extint": 13, "sercom": [3, 3], "sercom_alt": [5, 3]},
+    "PB22": {"pin": {"E": null, "G": 37, "J": 49}, "extint": 6, "sercom": null, "sercom_alt": [5, 2]},
+    "PB23": {"pin": {"E": null, "G": 38, "J": 50}, "extint": 7, "sercom": null, "sercom_alt": [5, 3]},
+    "PA27": {"pin": {"E": 25, "G": 39, "J": 51}, "extint": 15, "sercom": null, "sercom_alt": null},
+    "PA28": {"pin": {"E": 27, "G": 41, "J": 53}, "extint": 8, "sercom": null, "sercom_alt": null},
+    "PA30": {"pin": {"E": 31, "G": 45, "J": 57}, "extint": 10, "sercom": null, "sercom_alt": [1, 2]},
+    "PA31": {"pin": {"E": 32, "G": 46, "J": 58}, "extint": 11, "sercom": null, "sercom_alt": [1, 3]},
+    "PB30": {"pin": {"E": null, "G": null, "J": 59}, "extint": 14, "sercom": null, "sercom_alt": [5, 0]},
+    "PB31": {"pin": {"E": null, "G": null, "J": 60}, "extint": 15, "sercom": null, "sercom_alt": [5, 1]},
+    "PB00": {"pin": {"E": null, "G": null, "J": 61}, "extint": 0, "sercom": null, "sercom_alt": [5, 2]},
+    "PB01": {"pin": {"E": null, "G": null, "J": 62}, "extint": 1, "sercom": null, "sercom_alt": [5, 3]},
+    "PB02": {"pin": {"E": null, "G": 47, "J": 63}, "extint": 2, "sercom": null, "sercom_alt": [5, 0]},
+    "PB03": {"pin": {"E": null, "G": 48, "J": 64}, "extint": 3, "sercom": null, "sercom_alt": [5, 1]}
+  }
+}

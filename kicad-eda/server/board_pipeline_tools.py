@@ -11,23 +11,32 @@ board, kicad-cli 11 for a board saved by the KiCad 11 API session, never a
 mismatched nightly), Freerouting under Java. No IPC required.
 
 Plain functions; kicad_server registers everything in TOOLS with FastMCP.
+
+The stage bodies live in their own modules (X-09 split; locate code by
+function name): board_build.build (build_board_from_netlist,
+release_board_session, apply_netclasses), board_autoroute.run
+(autoroute_board, freerouting_args and the rest of the Freerouting stage),
+board_fab.export (export_fab_package, write_assembly_csvs). Every tool keeps
+its name, signature and docstring here as a thin wrapper; the private aliases
+below keep the old names other code uses.
 """
 
 from __future__ import annotations
 
-import glob
-import json
-import os
 import shutil
-import subprocess
-import sys
-import tempfile
-import zipfile
 from pathlib import Path
 
+import board_autoroute
+import board_build
+import board_fab
 import kicad_env as env
 import kicad_ipc as ipc
 import toolchain as tc
+
+# the pre-split private names (tests/test_freerouting_args.py and later owners)
+_freerouting_args = board_autoroute.freerouting_args
+_release_board_session = board_build.release_board_session
+_apply_netclasses = board_build.apply_netclasses
 
 
 def drc_pcb(pcb: str, fab_profile: str = "") -> dict:
@@ -96,191 +105,26 @@ def build_board_from_netlist(netlist: str, board_w: float, board_h: float,
     router more room on a re-route. A board-API session (open_board) that
     still holds out_pcb is closed first (released_boards), or the build is
     refused while it has unsaved changes (blocking_board)."""
-    kpy = tc.kicad_python()
-    if not kpy:
-        return {"ok": False, "reason": "KiCad bundled Python (with pcbnew) not found"}
-    script = tc.TOOLS_DIR / "swig_build_board.py"
-    if not script.is_file():
-        return {"ok": False, "reason": f"missing {script}"}
-    out = out_pcb or str(Path(netlist).with_suffix(".kicad_pcb"))
-    fps = tc.footprints_dir(footprints_dir)
-    if not fps:
-        return {"ok": False, "reason": "footprints_dir not given and KiCad share dir not found"}
-    guard = ipc.write_guard(out)
-    if guard:
-        return guard
-    held = _release_board_session(out)
-    if held.get("ok") is False:
-        return held
-    args = [kpy, str(script), netlist, out, fps, str(board_w), str(board_h)]
-    if placement:
-        args.append(placement)
-    env = {**os.environ, "PACK_SCALE": str(pack_scale)}
-    r = tc.run(args, env=env)
-    res = tc.last_json(r.stdout) or {"ok": False}
-    res["ok"] = r.returncode == 0 and res.get("ok", False)
-    res["pcb"] = out
-    if r.stderr:
-        res["stderr"] = r.stderr[-1200:]
-    if res["ok"]:
-        res.update(_apply_netclasses(netlist, out, res.get("zones", [])))
-    return {**res, **held}
-
-
-def _release_board_session(pcb: str) -> dict:
-    """Before this module rewrites `pcb`: a board-API session that still holds
-    it would keep the old board in memory and could save it over the new
-    file. board_route_tools.release_for_rewrite closes an idle one (its
-    released_boards fields go into the response) and refuses a dirty one."""
-    import board_route_tools
-    return board_route_tools.release_for_rewrite(pcb)
-
-
-def _apply_netclasses(netlist: str, out_pcb: str, zones: list[str]) -> dict:
-    """Resolve electrical intent (net_specs + reliability class) into IPC-2221
-    net classes and write them into the .kicad_pro so BOTH the Specctra DSN
-    export (Freerouting routes power copper wider) and kicad-cli DRC honor
-    per-net widths/clearances. Default class 3 (high-reliability) unless the
-    netlist overrides "class". A netlist WITH net_specs whose classes cannot be
-    written fails the build (ok False) — a board routed at default widths must
-    never pass silently. A netlist without net_specs only reports the slip."""
-    design = json.loads(Path(netlist).read_text(encoding="utf-8"))
-    has_specs = bool(design.get("net_specs"))
-    try:
-        if str(tc.TOOLS_DIR) not in sys.path:
-            sys.path.insert(0, str(tc.TOOLS_DIR))
-        import netclass_writer
-        pro = str(Path(out_pcb).with_suffix(".kicad_pro"))
-        # nets backed by a poured plane ("In1.Cu:GND") or by designer preroutes
-        # are exempt from track-width classing — the plane or the prerouted
-        # copper carries the current, and a width class would make the net's
-        # signal taps unreachable for the router
-        planes = tuple(z.split(":", 1)[1] for z in zones if ":" in z)
-        planes += tuple(p["net"] for p in design.get("preroutes", []))
-        nc = netclass_writer.apply_to_project(
-            pro, design, int(design.get("class", 3)), plane_nets=planes)
-    except Exception as e:
-        nc = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
-    summary = {"profile": nc.get("class_profile"), "written": nc.get("classes_written", []),
-               "warnings": nc.get("warnings", [])}
-    if nc.get("ok"):
-        return {"netclasses": summary}
-    failure = {"netclasses": {**summary, "error": nc.get("reason", "unknown failure")}}
-    if not has_specs:
-        return failure
-    return {**failure, "ok": False,
-            "reason": f"net classes not written: {nc.get('reason', 'unknown failure')}"}
-
-
-def _freerouting_args(java: str, jar: str, w_dsn: str, w_ses: str,
-                      max_passes: int, route_timeout: int) -> list[str] | dict:
-    """The Freerouting command line, or an {ok: False} dict when the platform
-    cannot run this jar (1.x needs a display: xvfb-run on a headless Linux)."""
-    # -dct 0: skip the "Autorouter is about to start" countdown dialog (1.9
-    # and 2.x both take it) — no window may wait on a click in a hands-off run.
-    args = [java, "-Xmx4g", "-jar", jar, "-de", w_dsn, "-do", w_ses,
-            "-mp", str(max_passes), "-dct", "0"]
-    is_v2 = "freerouting-2" in Path(jar).name
-    # Freerouting 1.x initializes AWT/Swing even in CLI mode — on a
-    # display-less Linux box (Docker, CI) it dies with HeadlessException
-    # before routing anything. Wrap it in a virtual framebuffer.
-    if os.name != "nt" and not os.environ.get("DISPLAY") and not is_v2:
-        if not shutil.which("xvfb-run"):
-            return {"ok": False, "reason":
-                    "no display and xvfb-run not found — Freerouting 1.x "
-                    "needs one (install xvfb, e.g. apt-get install xvfb)"}
-        args = ["xvfb-run", "-a"] + args
-    if is_v2:
-        # Freerouting 2.x: true headless, internal wall-clock budget (so it
-        # finishes and WRITES the SES instead of being killed with nothing),
-        # multi-threaded routing, no interactive dialog stalls.
-        budget = max(60, route_timeout - 60)
-        hh, rem = divmod(budget, 3600)
-        mm_, ss = divmod(rem, 60)
-        args += ["--gui.enabled=false",
-                 f"--router.job_timeout={hh:02d}:{mm_:02d}:{ss:02d}",
-                 "--feature_flags.multi_threading=true"]
-    return args
-
-
-def _route(java: str, jar: str, dsn: str, ses: str, max_passes: int,
-           route_timeout: int) -> dict:
-    """Run Freerouting on a copy of the DSN in a space-free temp dir (its CLI
-    re-splits arguments on spaces, so paths like "OneDrive - NTS" break it)
-    and copy the SES back. Returns {ok, [reason|stderr]}."""
-    work = Path(tempfile.mkdtemp(prefix="frt_"))
-    w_dsn, w_ses = str(work / "in.dsn"), str(work / "out.ses")
-    shutil.copyfile(dsn, w_dsn)
-    args = _freerouting_args(java, jar, w_dsn, w_ses, max_passes, route_timeout)
-    if isinstance(args, dict):
-        shutil.rmtree(work, ignore_errors=True)
-        return args
-    try:
-        fr = tc.run(args, timeout=route_timeout)
-        if Path(w_ses).is_file():
-            shutil.copyfile(w_ses, ses)
-        return {"ok": Path(ses).is_file(), "stderr": (fr.stdout + fr.stderr)[-1500:]}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "reason": f"Freerouting exceeded {route_timeout}s and was killed"}
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
-
-def _unreadable(pcb: str, from_snapshot: bool) -> dict | None:
-    """The refusal for a board this pcbnew cannot read (one saved by the KiCad
-    11 API session), else None. from_snapshot with a pcbnew-readable X.k9
-    snapshot beside it: None (autoroute_board restores and routes that).
-    Without from_snapshot the refusal names the fallback when it exists."""
-    refusal = tc.swig_readable(pcb)
-    if not refusal:
-        return None
-    snapshot = tc.existing_snapshot(pcb)
-    restorable = snapshot is not None and not tc.is_pre_k11(pcb)   # a KiCad 11 board + snapshot
-    if from_snapshot and restorable:
-        unusable = tc.swig_readable(snapshot)
-        return None if not unusable else {"ok": False, "pre_k11_snapshot": snapshot,
-                                          "reason": f"the snapshot is unreadable too: {unusable}"}
-    if from_snapshot:
-        why = (f"no pre-KiCad-11 snapshot {Path(tc.pre_k11_snapshot_path(pcb)).name} exists"
-               if snapshot is None else f"{Path(pcb).name} is not a KiCad 11 board")
-        return {"ok": False, "reason": f"{refusal}; {why}, so there is nothing to fall back to "
-                                       "(rebuild with build_board_from_netlist)"}
-    if restorable:
-        return {"ok": False, "pre_k11_snapshot": snapshot,
-                "reason": f"{refusal}; or fall back to Freerouting on its pre-KiCad-11 snapshot: "
-                          "autoroute_board(pcb, from_snapshot=true) (the KiCad 11 copy moves to "
-                          f"{Path(tc.agent_copy_path(pcb)).name})"}
-    return {"ok": False, "reason": refusal}
-
-
-def _autoroute_preflight(pcb: str, jar: str,
-                         from_snapshot: bool = False) -> tuple[str, str, str] | dict:
-    """(kicad_python, java, freerouting_jar) for autoroute_board, or the refusal
-    dict: no pcbnew Python, a board it cannot read (one saved by the KiCad 11
-    API session: route it with the board API tools, or pass from_snapshot to
-    route its pre-KiCad-11 snapshot), no Java, no jar."""
-    kpy = tc.kicad_python()
-    if not kpy:
-        return {"ok": False, "reason": "KiCad bundled Python not found"}
-    refusal = _unreadable(pcb, from_snapshot)
-    if refusal:
-        return refusal
-    java = tc.find_java()
-    if not java:
-        return {"ok": False, "reason": "java not found (Freerouting needs a JRE/JDK)"}
-    fj = tc.freerouting_jar(jar)
-    if not fj:
-        return {"ok": False, "reason": "freerouting jar not found in server/tools or $FREEROUTING_JAR"}
-    return kpy, java, fj
+    return board_build.build(netlist, board_w, board_h, out_pcb=out_pcb,
+                             footprints_dir=footprints_dir, placement=placement,
+                             pack_scale=pack_scale)
 
 
 def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
-                    route_timeout: int = 300, from_snapshot: bool = False) -> dict:
+                    route_timeout: int = 300, from_snapshot: bool = False,
+                    dsn_seed: int = 0) -> dict:
     """Autoroute a board with Freerouting: export Specctra DSN, route, import the
     SES session back, and refill zones. Signal layers route on F.Cu/B.Cu while
     GND/power return to the inner planes. The router is killed after
     route_timeout seconds so a pathological board can never hang the pipeline.
-    Returns the resulting track count and unconnected count. A board newer
+    Returns the resulting track count and unconnected count. Routing is
+    deterministic for a given placement: the exported DSN is rewritten in a
+    canonical order (KiCad writes footprints and vias in random-UUID order and
+    Freerouting is order-sensitive), so the same placement gives the same
+    route every run; the result carries dsn_sha256 (the DSN Freerouting read)
+    and dsn_seed. dsn_seed > 0 routes a deterministic alternate footprint
+    order instead, for a retry when seed 0 leaves nets unrouted (a bad DSN
+    stops at step "dsn_canon"). A board newer
     than the pcbnew install can read (one saved by the KiCad 11 API session)
     is refused with {ok: False, reason}: route it with the board API tools.
     from_snapshot=true is the fallback when agent routing stalls (route_check
@@ -290,114 +134,9 @@ def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
     pre_k11_snapshot and agent_copy (a KiCad 9/10 board is routed as it is:
     fallback_from_snapshot false). A board-API session still holding the
     file is closed first (released_boards); one with unsaved changes refuses."""
-    pre = _autoroute_preflight(pcb, jar, from_snapshot)
-    if isinstance(pre, dict):
-        return pre
-    kpy, java, fj = pre
-    guard = ipc.write_guard(pcb)
-    if guard:
-        return guard
-    held = _release_board_session(pcb)
-    if held.get("ok") is False:
-        return held
-    fallback = _fallback_from_snapshot(pcb) if from_snapshot else {}
-    if fallback.get("ok") is False:
-        return {**fallback, **held}
-    return {**_autoroute(pcb, kpy, java, fj, max_passes, route_timeout), **held, **fallback}
-
-
-def _fallback_from_snapshot(pcb: str) -> dict:
-    """autoroute_board(from_snapshot=True)'s file step: restore the pre-KiCad-11
-    snapshot over a KiCad 11 board (toolchain.restore_snapshot); a KiCad 9/10
-    board stays as it is; a failed restore is {ok: False, step: "restore"}."""
-    if tc.is_pre_k11(pcb):
-        return {"fallback_from_snapshot": False,
-                "fallback_note": f"{Path(pcb).name} is already a KiCad 9/10 board: routed as it "
-                                 "is, no snapshot restored"}
-    try:
-        restored = tc.restore_snapshot(pcb)
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "step": "restore", "pcb": pcb,
-                "reason": f"restoring the pre-KiCad-11 snapshot failed: {exc}"}
-    return {"fallback_from_snapshot": True, "pre_k11_snapshot": restored["snapshot"],
-            "agent_copy": restored["agent_copy"], "restored": restored["restored"],
-            "moved": restored["moved"]}
-
-
-def _autoroute(pcb: str, kpy: str, java: str, fj: str, max_passes: int,
-               route_timeout: int) -> dict:
-    """DSN export -> Freerouting -> SES import + refill -> DRC unconnected count."""
-    base = str(Path(pcb).with_suffix(""))
-    dsn, ses = base + ".dsn", base + ".ses"
-    d = tc.run([kpy, str(tc.TOOLS_DIR / "swig_export_dsn.py"), pcb, dsn], timeout=120)
-    if not Path(dsn).is_file():
-        return {"ok": False, "step": "dsn", "stderr": (d.stdout + d.stderr)[-1200:]}
-    # remove any stale SES so a router timeout can't import a previous result
-    Path(ses).unlink(missing_ok=True)
-    routed = _route(java, fj, dsn, ses, max_passes, route_timeout)
-    if not routed["ok"]:
-        return {"ok": False, "step": "route", **{k: v for k, v in routed.items() if k != "ok"}}
-    im = tc.run([kpy, str(tc.TOOLS_DIR / "swig_import_ses.py"), pcb, ses], timeout=180)
-    imp = _parse_ses_import(im.stdout)
-    if not imp["ok"]:
-        return {"ok": False, "step": "import", "pcb": pcb, "dsn": dsn, "ses": ses,
-                "reason": imp.get("error") or "SES import failed",
-                "warnings": imp["warnings"], "import_log": (im.stdout + im.stderr)[-600:]}
-    # verify route completeness — Freerouting is non-deterministic and may leave a
-    # stub; report the unconnected count so the caller can re-run if it isn't zero.
-    unconnected = None
-    drc_note = None
-    if tc.board_cli(pcb):
-        c = tc.drc_counts(pcb)
-        unconnected = c["unconnected"] if "error" not in c else None
-        drc_note = c.get("error")
-    return {"ok": unconnected in (0, None), "pcb": pcb, "dsn": dsn, "ses": ses,
-            "tracks": imp["tracks"], "vias": imp["vias"], "unconnected": unconnected,
-            "warnings": imp["warnings"] + ([drc_note] if drc_note else []),
-            "import_log": im.stdout.strip()[-300:],
-            "note": None if unconnected in (0, None) else
-            f"{unconnected} net(s) left unrouted — re-run autoroute_board to converge"}
-
-
-def _parse_ses_import(stdout: str) -> dict:
-    """Result of swig_import_ses.py: its final JSON line
-    {"ok", "tracks", "vias", "warnings"[, "error"]} when present, else the
-    legacy 'ses_import True tracks N' token line."""
-    j = tc.last_json(stdout)
-    if j is not None and "ok" in j:
-        return {"ok": bool(j.get("ok")), "tracks": j.get("tracks"), "vias": j.get("vias"),
-                "warnings": list(j.get("warnings", [])), "error": j.get("error")}
-    digits = [int(tok) for tok in stdout.split() if tok.isdigit()]
-    return {"ok": "True" in stdout, "tracks": digits[-1] if digits else None,
-            "vias": None, "warnings": [],
-            "error": None if "True" in stdout else stdout.strip()[-300:]}
-
-
-def _write_assembly_csvs(netlist: str, out: str, pos: str) -> tuple[bool, bool]:
-    """JLCPCB BOM.csv + CPL.csv from the netlist and the kicad-cli pos file."""
-    import csv
-    design = json.loads(Path(netlist).read_text(encoding="utf-8"))
-    groups: dict[tuple, list] = {}
-    for c in design.get("components", []):
-        key = (c.get("value", ""), c.get("footprint", ""),
-               c.get("lcsc", ""), c.get("mpn", ""))
-        groups.setdefault(key, []).append(c["ref"])
-    with open(Path(out) / "BOM.csv", "w", newline="", encoding="utf-8") as f:
-        wr = csv.writer(f)
-        wr.writerow(["Comment", "Designator", "Footprint", "LCSC Part #", "MPN"])
-        for (val, fpr, lcsc, mpn), refs in sorted(groups.items()):
-            wr.writerow([val, ",".join(sorted(refs)), fpr.split(":")[-1], lcsc, mpn])
-    if not Path(pos).is_file():
-        return True, False
-    with open(pos, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    with open(Path(out) / "CPL.csv", "w", newline="", encoding="utf-8") as f:
-        wr = csv.writer(f)
-        wr.writerow(["Designator", "Mid X", "Mid Y", "Layer", "Rotation"])
-        for r0 in rows:
-            wr.writerow([r0.get("Ref"), r0.get("PosX"), r0.get("PosY"),
-                         r0.get("Side"), r0.get("Rot")])
-    return True, True
+    return board_autoroute.run(pcb, max_passes=max_passes, jar=jar,
+                               route_timeout=route_timeout, from_snapshot=from_snapshot,
+                               dsn_seed=dsn_seed)
 
 
 def export_fab_package(pcb: str, out_dir: str = "", zip_name: str = "",
@@ -409,28 +148,7 @@ def export_fab_package(pcb: str, out_dir: str = "", zip_name: str = "",
     line items; per-component "lcsc"/"mpn" netlist keys are carried through)
     and CPL.csv (Designator/Mid X/Mid Y/Layer/Rotation). Requires kicad-cli
     (the one of the KiCad that wrote the board, board_cli(pcb))."""
-    cli = tc.board_cli(pcb)
-    if not cli:
-        return {"ok": False, "reason": "kicad-cli not found; install KiCad."}
-    out = out_dir or (str(Path(pcb).with_suffix("")) + "_gerbers")
-    Path(out).mkdir(parents=True, exist_ok=True)
-    g = tc.run([cli, "pcb", "export", "gerbers", "-o", out, pcb])
-    dr = tc.run([cli, "pcb", "export", "drill", "-o", out, pcb])
-    pos = str(Path(out) / (Path(pcb).stem + "-pos.csv"))
-    p = tc.run([cli, "pcb", "export", "pos", "-o", pos, "--format", "csv", "--units", "mm", pcb])
-    bom_written = cpl_written = False
-    if netlist and Path(netlist).is_file():
-        bom_written, cpl_written = _write_assembly_csvs(netlist, out, pos)
-    zpath = zip_name or (str(Path(pcb).with_suffix("")) + f"_{tc.FAB_PROFILE}.zip")
-    files = [f for f in glob.glob(str(Path(out) / "*")) if not f.endswith(".zip")]
-    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in files:
-            z.write(f, arcname=Path(f).name)
-    return {"ok": g.returncode == 0 and dr.returncode == 0,
-            "out_dir": out, "zip": zpath, "fab_profile": tc.FAB_PROFILE, "kicad_cli": cli,
-            "bom": bom_written, "cpl": cpl_written,
-            "files": [Path(f).name for f in files],
-            "stderr": (g.stderr + dr.stderr + p.stderr)[-1200:]}
+    return board_fab.export(pcb, out_dir=out_dir, zip_name=zip_name, netlist=netlist)
 
 
 def check_design_gates(pcb: str, netlist: str, stage: str = "placement") -> dict:
@@ -502,7 +220,9 @@ def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.
     every hole, so the board stays DRC-clean. Pitch is lambda/20 at `max_freq_hz`
     (set it to your highest signal/RF frequency) or a 3 mm default. Run AFTER
     autoroute_board, BEFORE export_fab_package. Runs under KiCad's bundled Python;
-    a board that pcbnew cannot read (KiCad 11 format) is refused."""
+    a board that pcbnew cannot read (KiCad 11 format) is refused. A board-API
+    session still holding the file is closed first (released_boards); one with
+    unsaved changes refuses (blocking_board) before the board is touched."""
     pre = _stitch_preflight(pcb)
     if isinstance(pre, dict):
         return pre
@@ -512,10 +232,24 @@ def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.
     guard = ipc.write_guard(pcb)
     if guard:
         return guard
-    # TRANSACTIONAL: stitching must never make the board worse. Apply, verify
-    # with DRC; on any violation/unconnected roll back and retry fence-only
-    # (a dense interior grid can fragment a power plane); if even the fence
-    # fails, restore the original board and report the open task.
+    # a stale session could later save its old copy over the stitched board
+    held = board_build.release_board_session(pcb)
+    if held.get("ok") is False:
+        return held
+    # emc_stitch.py argv: <pcb> <max_freq_hz> <mode> [gnd_net] [er] [via_dia_mm] [via_drill_mm]
+    argv = [str(script), pcb, str(max_freq_hz)]
+    extra = [gnd_net, str(er), str(via_diameter_mm), str(via_drill_mm)]
+    modes = ("full", "fence") if interior else ("fence",)
+    return {**_stitch_transaction(pcb, kpy, argv, extra, modes), **held}
+
+
+def _stitch_transaction(pcb: str, kpy: str, argv: list[str], extra: list[str],
+                        modes: tuple[str, ...]) -> dict:
+    """add_ground_stitching's TRANSACTIONAL body: stitching must never make
+    the board worse. Apply, verify with DRC; on any violation/unconnected roll
+    back and retry the next mode (fence-only: a dense interior grid can
+    fragment a power plane); if even the fence fails, restore the original
+    board and report the open task."""
     bak = pcb + ".prestitch"
     shutil.copyfile(pcb, bak)
     cli = tc.board_cli(pcb)
@@ -523,11 +257,9 @@ def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.
         baseline = _stitch_baseline(pcb, bak)
         if baseline:
             return baseline
-    # emc_stitch.py argv: <pcb> <max_freq_hz> <mode> [gnd_net] [er] [via_dia_mm] [via_drill_mm]
-    extra = [gnd_net, str(er), str(via_diameter_mm), str(via_drill_mm)]
     res: dict = {"ok": False}
-    for mode in (("full", "fence") if interior else ("fence",)):
-        r = tc.run([kpy, str(script), pcb, str(max_freq_hz), mode] + extra, timeout=180)
+    for mode in modes:
+        r = tc.run([kpy, *argv, mode, *extra], timeout=180)
         res = tc.last_json(r.stdout) or {"ok": False, "stderr": (r.stdout + r.stderr)[-600:]}
         if not res.get("ok"):
             break

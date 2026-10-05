@@ -1,0 +1,19 @@
+{
+  "description": "ST-E6: 'planes' names a layer the stackup declares as a signal layer",
+  "design": {
+    "name": "st_e6",
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x02",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]]},
+    "planes": {"In1.Cu": "GND"},
+    "stackup": {"layers": [
+      {"type": "copper", "role": "signal"},
+      {"type": "dielectric", "kind": "prepreg", "material": "generic.fr4", "thickness": 0.2},
+      {"type": "copper", "role": "signal"},
+      {"type": "dielectric", "kind": "core", "material": "generic.fr4", "thickness": 1.0},
+      {"type": "copper", "role": "plane", "net": "GND"},
+      {"type": "dielectric", "kind": "prepreg", "material": "generic.fr4", "thickness": 0.2},
+      {"type": "copper", "role": "signal"}]}
+  },
+  "expect": {"error": "ST-E6", "path": "$.planes['In1.Cu']"}
+}

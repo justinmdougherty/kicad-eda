@@ -1,0 +1,27 @@
+{
+  "schema": "kicad-eda/materials@1",
+  "retrieved": "2026-10-04",
+  "note": "Solder masks. 'lpi' is the generic liquid photo-imageable mask used when neither the design nor the fab gives one (ADR D7.2.5).",
+  "materials": {
+    "lpi": {
+      "vendor": "generic", "product": "LPI solder mask", "family": "mask", "category": "mask",
+      "forms": ["mask"], "ptfe": false,
+      "dk": [
+        {"value": 3.8, "freq_hz": 1e9, "basis": "fab", "fab": "jlcpcb", "freq_assumed": true, "note": "JLC impedance calculator: coating dielectric CEr 3.8 (no frequency stated)", "source": "https://jlcpcb.com/impedance"},
+        {"value": 3.8, "freq_hz": 1e9, "basis": "typical", "freq_assumed": true, "note": "JLC's published LPI Er, used as the generic LPI value (no frequency stated)", "source": "https://jlcpcb.com/capabilities/pcb-capabilities"}
+      ],
+      "df": [
+        {"value": 0.025, "freq_hz": 1e9, "basis": "typical", "untraced": true, "note": "untraced: typical LPI loss tangent (ADR D7.3 seed); no fab publishes a mask Df"}
+      ],
+      "coating": {
+        "over_substrate": 0.0305, "over_trace": 0.0152, "between_traces": 0.0305, "basis": "typical",
+        "note": "generic LPI uses JLC's published C1 / C2 / C3 = 1.2 / 0.6 / 1.2 mil (0.03048 / 0.01524 / 0.03048 mm, rounded as in ADR D7.1/D7.14) as typical thicknesses",
+        "source": "https://jlcpcb.com/impedance"
+      },
+      "sources": [
+        {"title": "JLCPCB impedance page: solder mask C1/C2/C3 and CEr 3.8 (fetched 2026-10-04)", "url": "https://jlcpcb.com/impedance"},
+        {"title": "JLCPCB PCB capabilities: solder mask dielectric constant 3.8, LPI (fetched 2026-10-04)", "url": "https://jlcpcb.com/capabilities/pcb-capabilities"}
+      ]
+    }
+  }
+}

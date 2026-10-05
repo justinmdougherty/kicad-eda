@@ -15,12 +15,16 @@ Layout (all connection points on the 2.54 mm grid, pin length 2.54 mm):
   * per side, pins of one layout ``group`` sit on adjacent rows in spec
     order, with one empty row between groups;
   * the body is sized so the estimated pin-name text never overlaps
-    (CHAR_W is calibrated against kicad-cli 9 SVG output).
+    (CHAR_W is calibrated against kicad-cli 9 SVG output);
+  * Reference (left) and Value (right) sit one text height above the body,
+    or above the top pins' ends when the top side has pins: never on a pin.
 
-Stacking (D1): power pins (power_in / power_out) that share a NAME are one
-"power group"; every pin of it after the first (spec order) is placed on the
-first pin's connection point, hidden, and typed ``passive`` — KLC S4.3 and
-KiCad 9's own stock symbols (e.g. RF_GPS:L70-R GND pins 1/10/12). A hidden
+Stacking (D1): power pins (power_in / power_out) that share a NAME and a TYPE
+are one "power group"; every pin of it after the first (spec order) is placed
+on the first pin's connection point, hidden, and typed ``passive`` — KLC S4.3
+and KiCad 9's own stock symbols (e.g. RF_GPS:L70-R GND pins 1/10/12). Power
+pins sharing a name but not a type would make a mixed stack (a hidden
+power_out driver): spec_problems rejects that. A hidden
 ``power_in`` pin would also act as an implicit global net named after the pin,
 silently merging e.g. GND into a differently named ground net; ``passive``
 avoids that. Stacked pins are connected by KiCad's connectivity because they
@@ -41,6 +45,7 @@ The LAST stdout line is the JSON result (author_symbol's summary, or
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -242,7 +247,18 @@ def spec_problems(spec: SymbolSpec) -> list[str]:
                             f"{', '.join(ELECTRICAL_TYPES)}")
         if pin.side and pin.side not in SIDES:
             problems.append(f"{label}: side {pin.side!r} is not one of {', '.join(SIDES)}")
-    return problems
+    return problems + _mixed_stack_problems(spec)
+
+
+def _mixed_stack_problems(spec: SymbolSpec) -> list[str]:
+    """Power pins sharing a name but not a type (only when stacking is on):
+    stacking them would hide a power_out driver behind a passive pin."""
+    if not spec.stack_power:
+        return []
+    return [f"power pins named {name!r} mix "
+            + " and ".join(f"{etype} ({', '.join(nums)})" for etype, nums in types.items())
+            + ": a stack is one type -- rename them or set stack_power false"
+            for name, types in _power_pins(spec).items() if len(types) > 1]
 
 
 def _check(spec: SymbolSpec) -> None:
@@ -265,17 +281,25 @@ def pin_groups(spec: SymbolSpec) -> dict[str, list[str]]:
             if len(nums) > 1 and name not in _ANON_PIN_NAMES}
 
 
-def power_stacks(spec: SymbolSpec) -> dict[str, tuple[str, ...]]:
-    """{name: (numbers...)} for the power groups that get stacked: power_in /
-    power_out pins sharing a name, first (visible) pin first. Empty when the
-    spec turns stacking off."""
-    if not spec.stack_power:
-        return {}
-    by_name: dict[str, list[str]] = {}
+def _power_pins(spec: SymbolSpec) -> dict[str, dict[str, list[str]]]:
+    """{name: {etype: [numbers in spec order]}} of the named power pins."""
+    out: dict[str, dict[str, list[str]]] = {}
     for pin in spec.pins:
         if pin.etype in POWER_TYPES and pin.name not in _ANON_PIN_NAMES:
-            by_name.setdefault(pin.name, []).append(pin.number)
-    return {name: tuple(nums) for name, nums in by_name.items() if len(nums) > 1}
+            out.setdefault(pin.name, {}).setdefault(pin.etype, []).append(pin.number)
+    return out
+
+
+def power_stacks(spec: SymbolSpec) -> dict[str, tuple[str, ...]]:
+    """{name: (numbers...)} for the power groups that get stacked: power_in /
+    power_out pins sharing a name AND a type, first (visible) pin first. A
+    name carried by both types (a spec_problems error) keys one entry per
+    type, "name:etype". Empty when the spec turns stacking off."""
+    if not spec.stack_power:
+        return {}
+    return {(name if len(types) == 1 else f"{name}:{etype}"): tuple(nums)
+            for name, types in _power_pins(spec).items()
+            for etype, nums in types.items() if len(nums) > 1}
 
 
 # ----------------------------------------------------------------------------
@@ -432,17 +456,26 @@ def _pin_node(pin: PlacedPin) -> list:
     return node + [[S("name"), pin.name, _effects()], [S("number"), pin.number, _effects()]]
 
 
+def _field_y(lay: SymbolLayout) -> float:
+    """Reference / Value height: one text height above the body, or above the
+    top pins' connection points when the top side has pins, so the (centred,
+    FONT-high) text never lands on a pin or its number."""
+    top = max([lay.half_h, *(p.y for p in lay.pins if p.side == "top")])
+    return _r(top + FONT)
+
+
 def symbol_node(spec: SymbolSpec, lay: SymbolLayout | None = None) -> list:
     """The ``(symbol ...)`` node for ``spec`` (laid out here unless given)."""
     lay = lay or layout(spec)
     w2, h2 = lay.half_w, lay.half_h
     below = h2 + PIN_LENGTH
+    field_y = _field_y(lay)
     node: list = [
         S("symbol"), spec.name,
         [S("pin_names"), [S("offset"), NAME_OFFSET]],
         [S("exclude_from_sim"), S("no")], [S("in_bom"), S("yes")], [S("on_board"), S("yes")],
-        _prop("Reference", spec.reference, -w2, h2 + FONT, justify="left"),
-        _prop("Value", spec.value or spec.name, w2, h2 + FONT, justify="right"),
+        _prop("Reference", spec.reference, -w2, field_y, justify="left"),
+        _prop("Value", spec.value or spec.name, w2, field_y, justify="right"),
         _prop("Footprint", spec.footprint, 0, -(below + 2 * GRID), hide=True),
         _prop("Datasheet", spec.datasheet, 0, -(below + 3 * GRID), hide=True),
         _prop("Description", spec.description, 0, 0, hide=True),
@@ -550,7 +583,8 @@ def _atomic_write(path: Path, text: str) -> None:
         tmp.write_text(text, encoding="utf-8", newline="\n")
         os.replace(tmp, path)
     except OSError as e:
-        tmp.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):      # e.g. the parent is a file: nothing to clean
+            tmp.unlink(missing_ok=True)
         raise SymbolAuthorError(f"cannot write {path}: {e}") from e
 
 
@@ -616,7 +650,8 @@ def _kicad_resave(path: Path, kicad_cli: str,
         try:
             r = subprocess.run([kicad_cli, "sym", "upgrade", "--force", "-o", str(out),
                                 str(path)], stdin=subprocess.DEVNULL, capture_output=True,
-                               text=True, timeout=timeout, check=False)
+                               encoding="utf-8", errors="replace", timeout=timeout,
+                               check=False)
         except (OSError, subprocess.TimeoutExpired) as e:
             return {}, {}, [f"kicad-cli sym upgrade did not run: {e}"]
         console = (r.stdout or "") + (r.stderr or "")
@@ -733,8 +768,15 @@ def lg290p_spec(footprint: str = "") -> SymbolSpec:
     )
 
 
+def _usage_error(argv: list[str]) -> bool:
+    """True unless argv is ``<spec.json> <lib>`` or ``--lg290p <lib> [fp_lib_id]``."""
+    if argv and argv[0] == "--lg290p":
+        return len(argv) not in (2, 3)
+    return len(argv) != 2 or argv[0].startswith("-")
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or (argv[0] == "--lg290p" and len(argv) > 3):
+    if _usage_error(argv):
         print(__doc__)
         return 2
     try:

@@ -1,0 +1,127 @@
+{
+  "schema": "kicad-eda/materials@1",
+  "retrieved": "2026-10-04",
+  "note": "Rogers laminates and bondply. Process Dk = IPC-TM-650 2.5.5.5 clamped stripline at 10 GHz (a lot-QC number; Rogers notes it can read low because of air gaps); design Dk = differential phase length in circuit, 8-40 GHz (what Rogers says to design with). Arlon 25N/25FR (Rogers since 2015) live in arlon.json.",
+  "materials": {
+    "rogers.ro4003c": {
+      "vendor": "Rogers", "product": "RO4003C", "family": "hydrocarbon-ceramic", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": false, "process": "fr4-compatible", "tg_c": 280,
+      "dk": [
+        {"value": 3.38, "tol": 0.05, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5 clamped stripline", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"},
+        {"value": 3.55, "freq_hz": [8e9, 4e10], "basis": "design", "method": "differential phase length", "note": "note 2: an average over several lots on the most common thickness/s", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"}
+      ],
+      "df": [
+        {"value": 0.0027, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"},
+        {"value": 0.0021, "freq_hz": 2.5e9, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"}
+      ],
+      "tcdk_ppm_per_c": 40,
+      "standard_thicknesses_mm": [0.203, 0.305, 0.406, 0.508, 0.813, 1.524],
+      "sources": [
+        {"title": "Rogers RO4000 Series Laminates data sheet, PUB# 92-004 (rev 080322)", "url": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"}
+      ]
+    },
+    "rogers.ro4350b": {
+      "vendor": "Rogers", "product": "RO4350B", "family": "hydrocarbon-ceramic", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": false, "process": "fr4-compatible", "tg_c": 280,
+      "dk": [
+        {"value": 3.48, "tol": 0.05, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5 clamped stripline", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"},
+        {"value": 3.33, "tol": 0.05, "freq_hz": 1e10, "basis": "process", "when": {"thickness_mm": 0.101}, "method": "IPC-TM-650 2.5.5.5 clamped stripline", "note": "note 1: 4 mil (0.004 in) RO4350B laminates have a process Dk of 3.33 +/- 0.05", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"},
+        {"value": 3.66, "freq_hz": [8e9, 4e10], "basis": "design", "method": "differential phase length", "valid_thickness_mm": [0.508, 1.524], "interpretation": true, "note": "note 2: the design Dk is an average on the most common thickness/s; the LoPro paragraph says the design Dk decreases by about 0.1 as the core goes from 0.020 in to 0.004 in (standard foil unverified). valid_thickness_mm [0.508, 1.524] is OUR interpretation of 'most common thickness/s' (0.020-0.060 in); thinner cores raise ST-W5.", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"},
+        {"value": 3.48, "freq_hz": 1e10, "basis": "fab", "fab": "jlcpcb", "note": "JLCPCB high-frequency PCB page: RO4350B Dk 3.48 / Df 0.0037 at 10 GHz (2-layer RF builds only)", "source": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}
+      ],
+      "df": [
+        {"value": 0.0037, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"},
+        {"value": 0.0031, "freq_hz": 2.5e9, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"}
+      ],
+      "tcdk_ppm_per_c": 50,
+      "standard_thicknesses_mm": [0.101, 0.168, 0.254, 0.508, 0.762, 1.524],
+      "sources": [
+        {"title": "Rogers RO4000 Series Laminates data sheet, PUB# 92-004 (rev 080322)", "url": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4000-laminates-ro4003c-and-ro4350b---data-sheet.pdf"},
+        {"title": "JLCPCB high-frequency PCB (fetched 2026-10-04)", "url": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"}
+      ]
+    },
+    "rogers.ro4835": {
+      "vendor": "Rogers", "product": "RO4835", "family": "hydrocarbon-ceramic", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": false, "process": "fr4-compatible", "tg_c": 280,
+      "dk": [
+        {"value": 3.48, "tol": 0.05, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5 clamped stripline", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4835-laminate-data-sheet.pdf"},
+        {"value": 3.33, "tol": 0.05, "freq_hz": 1e10, "basis": "process", "when": {"thickness_mm": 0.101}, "method": "IPC-TM-650 2.5.5.5 clamped stripline", "note": "note 1: 4 mil RO4835 laminates have a process Dk of 3.33 +/- 0.05", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4835-laminate-data-sheet.pdf"},
+        {"value": 3.66, "freq_hz": [8e9, 4e10], "basis": "design", "method": "differential phase length", "note": "note 3: an average over several lots on the most common thickness/s", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4835-laminate-data-sheet.pdf"}
+      ],
+      "df": [
+        {"value": 0.0037, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4835-laminate-data-sheet.pdf"}
+      ],
+      "tcdk_ppm_per_c": 50,
+      "standard_thicknesses_mm": [0.101, 0.168, 0.254, 0.508, 0.762, 1.524],
+      "sources": [
+        {"title": "Rogers RO4835 Laminate data sheet, PUB# 92-160 (rev 092425)", "url": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro4835-laminate-data-sheet.pdf"}
+      ]
+    },
+    "rogers.ro3003": {
+      "vendor": "Rogers", "product": "RO3003", "family": "ptfe-ceramic", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": true, "process": "ptfe",
+      "dk": [
+        {"value": 3.0, "tol": 0.04, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5 clamped stripline", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro3000-laminate-data-sheet-ro3003----ro3006----ro3010----ro3035.pdf"},
+        {"value": 3.0, "freq_hz": [8e9, 4e10], "basis": "design", "method": "differential phase length", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro3000-laminate-data-sheet-ro3003----ro3006----ro3010----ro3035.pdf"}
+      ],
+      "df": [
+        {"value": 0.001, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro3000-laminate-data-sheet-ro3003----ro3006----ro3010----ro3035.pdf"}
+      ],
+      "tcdk_ppm_per_c": -3,
+      "standard_thicknesses_mm": [0.127, 0.254, 0.508, 0.762, 1.524],
+      "sources": [
+        {"title": "Rogers RO3000 Series Circuit Materials data sheet, PUB# 92-130 (rev 013024)", "url": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro3000-laminate-data-sheet-ro3003----ro3006----ro3010----ro3035.pdf"}
+      ]
+    },
+    "rogers.ro3010": {
+      "vendor": "Rogers", "product": "RO3010", "family": "ptfe-ceramic", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": true, "process": "ptfe",
+      "dk": [
+        {"value": 10.2, "tol": 0.3, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5 clamped stripline", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro3000-laminate-data-sheet-ro3003----ro3006----ro3010----ro3035.pdf"},
+        {"value": 11.2, "freq_hz": [8e9, 4e10], "basis": "design", "method": "differential phase length", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro3000-laminate-data-sheet-ro3003----ro3006----ro3010----ro3035.pdf"}
+      ],
+      "df": [
+        {"value": 0.0022, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro3000-laminate-data-sheet-ro3003----ro3006----ro3010----ro3035.pdf"}
+      ],
+      "tcdk_ppm_per_c": -395,
+      "standard_thicknesses_mm": [0.127, 0.254, 0.635, 1.27],
+      "sources": [
+        {"title": "Rogers RO3000 Series Circuit Materials data sheet, PUB# 92-130 (rev 013024)", "url": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/ro3000-laminate-data-sheet-ro3003----ro3006----ro3010----ro3035.pdf"}
+      ]
+    },
+    "rogers.rt5880": {
+      "vendor": "Rogers", "product": "RT/duroid 5880", "family": "ptfe-glass-microfiber", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": true, "process": "ptfe",
+      "dk": [
+        {"value": 2.2, "tol": 0.02, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/rt-duroid-5870---5880-data-sheet.pdf"},
+        {"value": 2.2, "freq_hz": [8e9, 4e10], "basis": "design", "method": "differential phase length", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/rt-duroid-5870---5880-data-sheet.pdf"}
+      ],
+      "df": [
+        {"value": 0.0009, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/rt-duroid-5870---5880-data-sheet.pdf"},
+        {"value": 0.0004, "freq_hz": 1e6, "basis": "process", "method": "IPC-TM-650 2.5.5.3", "source": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/rt-duroid-5870---5880-data-sheet.pdf"}
+      ],
+      "tcdk_ppm_per_c": -125,
+      "standard_thicknesses_mm": [0.127, 0.252, 0.508, 0.787, 1.575],
+      "sources": [
+        {"title": "Rogers RT/duroid 5870/5880 data sheet", "url": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/data-sheets/rt-duroid-5870---5880-data-sheet.pdf"}
+      ]
+    },
+    "rogers.ro4450f": {
+      "vendor": "Rogers", "product": "RO4450F", "family": "hydrocarbon-ceramic", "category": "rf-laminate",
+      "forms": ["bondply"], "ptfe": false, "process": "fr4-compatible", "tg_c": 280,
+      "dk": [
+        {"value": 3.52, "tol": 0.05, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "note": "no design Dk in the 2015 data sheet", "source": "https://www.epectec.com/downloads/Rogers-RO4400-Series-Data-Sheet.pdf"}
+      ],
+      "df": [
+        {"value": 0.004, "freq_hz": 1e10, "basis": "process", "method": "IPC-TM-650 2.5.5.5", "source": "https://www.epectec.com/downloads/Rogers-RO4400-Series-Data-Sheet.pdf"}
+      ],
+      "constructions": {"1ply": {"thickness_mm": 0.101}},
+      "standard_thicknesses_mm": [0.101],
+      "limits": {"max_copper_fill_mm_per_ply": 0.0457, "note": "fills at most 0.0018 in (45.7 um) of copper per ply; contact Rogers for > 6 metal layers, copper >= 35 um, planes on both sides or bonding to FR-4 cores"},
+      "sources": [
+        {"title": "Rogers RO4400 Series Bondply data sheet, PUB# 92-150 (2015)", "url": "https://www.epectec.com/downloads/Rogers-RO4400-Series-Data-Sheet.pdf"},
+        {"title": "Rogers fabrication guidelines for RO4400 bonding layers, PUB# 92-005 (2023)", "url": "https://www.rogerscorp.com/-/media/project/rogerscorp/documents/advanced-electronics-solutions/english/fabrication-information/fabrication-guidelines-ro4400-bonding-layers.pdf"}
+      ]
+    }
+  }
+}

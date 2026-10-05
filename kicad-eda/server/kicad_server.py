@@ -20,8 +20,8 @@ this file) by tool_registry.py.
   PCB: live IPC tools (pcb_ipc_tools.py), the headless board pipeline
       (board_pipeline_tools.py: kicad-cli, KiCad's bundled Python,
       Freerouting) and agent routing on KiCad's board API (board_route_tools.py,
-      its own board registry). build_schematic_from_netlist (here) uses the API backend
-      when available, else server/tools/sch_build.py.
+      its own board registry). build_schematic_from_netlist (here): the API backend when
+      available, else sch_stage_tools.py (+ build_pin_sidecars, design_report).
   TOOLCHAIN (kicad_env + toolchain.py): newest kicad-cli for schematics; for a
       board the kicad-cli of the KiCad that WROTE the file, the pcbnew install's
       for a new board (KICAD_CLI_POLICY); KiCad 11 api-server for both APIs.
@@ -58,6 +58,7 @@ import kicad_ipc as ipc                     # noqa: E402
 import library_tools                        # noqa: E402
 import mechanical_tools                     # noqa: E402
 import pcb_ipc_tools                        # noqa: E402
+import physics_tools                        # noqa: E402
 import review_tools                         # noqa: E402
 import sch_file_model as sfm                # noqa: E402
 import toolchain as tc                      # noqa: E402
@@ -66,6 +67,7 @@ from board_pipeline_tools import (          # noqa: E402,F401  (re-exported for 
     check_design_gates, drc_pcb, export_fab_package, export_gerbers, render_pcb)
 from mcp.server.fastmcp import FastMCP     # noqa: E402
 from pcb_ipc_tools import create_pcb        # noqa: E402,F401
+from sch_stage_tools import _build_via_sch_build, build_pin_sidecars, design_report  # noqa: E402
 from session_release import Release, close_error_fields  # noqa: E402
 from tool_registry import register_tool_modules  # noqa: E402
 
@@ -574,7 +576,7 @@ def render_sch(sch: str, out_png: str = "") -> dict:
 
 
 # ----------------------------------------------------------------------------
-# NET-MAP PIPELINE, schematic stage (netlist.json -> ERC-clean .kicad_sch)
+# NET-MAP PIPELINE, schematic stage (netlist.json -> .kicad_sch; file route: sch_stage_tools)
 # ----------------------------------------------------------------------------
 def _build_via_api(netlist: str, out: str, symbols_dir: str, sidecars_dir: str) -> dict:
     """backends.sch_api.build_from_netlist: KiCad 11 places every symbol from
@@ -598,27 +600,6 @@ def _build_via_api(netlist: str, out: str, symbols_dir: str, sidecars_dir: str) 
     if symbols_dir or sidecars_dir:
         res["note"] = ("symbols_dir / sidecars_dir are ignored by the API backend "
                        "(KiCad's own library tables and symbol geometry are used)")
-    return res
-
-
-def _build_via_sch_build(netlist: str, out: str, symbols_dir: str, sidecars_dir: str) -> dict:
-    """server/tools/sch_build.py under this venv (sexpdata)."""
-    script = TOOLS_DIR / "sch_build.py"
-    if not script.is_file():
-        return {"ok": False, "reason": f"missing {script}"}
-    syms = tc.symbols_dir(symbols_dir)
-    sides = sidecars_dir or str(PINS_DIR)
-    if not syms:
-        return {"ok": False, "reason": "symbols_dir not given and KiCad share dir not found"}
-    guard = ipc.write_guard(out)
-    if guard:
-        return guard
-    r = tc.run([sys.executable, str(script), netlist, out, syms, sides])
-    res = tc.last_json(r.stdout) or {}
-    res["ok"] = r.returncode == 0 and res.get("ok", False)
-    res["sch"] = out
-    if r.stderr:
-        res["stderr"] = r.stderr[-1200:]
     return res
 
 
@@ -648,58 +629,6 @@ def build_schematic_from_netlist(netlist: str, out_sch: str = "",
         # known false positive); same severity policy as the DRC gate.
         erc = tc.erc_json(out, str(Path(out).with_suffix("")) + "_erc.json")
         res.update({k: v for k, v in erc.items() if k != "report"})
-    return res
-
-
-def build_pin_sidecars(symbols: str, out_dir: str = "", symbols_dir: str = "") -> dict:
-    """Build pin-coordinate sidecars (pin name/number -> schematic-space offset) for
-    a comma-separated list of `Lib:Symbol` ids, used by the file-backend wiring
-    tools. Writes <Lib_Symbol>.pins.json into out_dir (default: this server's pins/)."""
-    script = TOOLS_DIR / "build_pin_sidecars.py"
-    if not script.is_file():
-        return {"ok": False, "reason": f"missing {script}"}
-    syms = tc.symbols_dir(symbols_dir)
-    out = out_dir or str(PINS_DIR)
-    if not syms:
-        return {"ok": False, "reason": "symbols_dir not given and KiCad share dir not found"}
-    ids = [s.strip() for s in symbols.split(",") if s.strip()]
-    if not ids:
-        raise ValueError("symbols must list at least one Library:Symbol id")
-    r = tc.run([sys.executable, str(script), syms, out] + ids)
-    summary = tc.last_json(r.stdout) or {}
-    return {"ok": r.returncode == 0 and summary.get("ok", r.returncode == 0),
-            "out_dir": out, "written": summary.get("written", []),
-            "failed": summary.get("failed", []),
-            "stdout": r.stdout[-800:], "stderr": r.stderr[-800:]}
-
-
-def design_report(netlist: str, symbols_dir: str = "", out_md: str = "") -> dict:
-    """Audit a netlist for design intent + assembly (DFA): part-count reduction
-    (repeated passives -> arrays), decoupling coverage (every IC power rail has a
-    bypass cap), the power tree (each rail's driver + load count), floating pins,
-    and nets that likely need a pull resistor. Reads pin electrical types from the
-    KiCad symbols. Returns the structured report and writes a Markdown copy next to
-    the netlist. This reviews; it does not modify the design. ok is False (with
-    `errors`) when a symbol could not be read: the pin-type checks did not cover
-    that part, so the review is incomplete rather than clean."""
-    if str(TOOLS_DIR) not in sys.path:
-        sys.path.insert(0, str(TOOLS_DIR))
-    try:
-        import design_report as dr
-    except Exception as e:
-        return {"ok": False, "reason": f"design_report import failed: {e}"}
-    design = json.loads(Path(netlist).read_text(encoding="utf-8"))
-    syms = tc.symbols_dir(symbols_dir) or ""
-    rep = dr.analyze(design, syms)
-    md = dr.to_markdown(rep)
-    md_path = out_md or (str(Path(netlist).with_suffix("")) + "_report.md")
-    Path(md_path).write_text(md, encoding="utf-8")
-    errors = list(rep.get("errors", []))
-    res = {"ok": not errors, "errors": errors, "report": rep, "markdown": md,
-           "markdown_path": md_path}
-    if errors:
-        res["reason"] = (f"design review could not run for {len(errors)} symbol(s): "
-                         + "; ".join(errors))
     return res
 
 
@@ -779,7 +708,7 @@ TOOLS: tuple[Callable[..., Any], ...] = (
 TOOL_MODULES: tuple[ModuleType, ...] = (
     sys.modules[__name__],                  # this module, also when run as __main__
     pcb_ipc_tools, board_pipeline_tools, board_route_tools,
-    library_tools, import_tools, review_tools, mechanical_tools)
+    library_tools, import_tools, review_tools, mechanical_tools, physics_tools)
 
 register_tool_modules(mcp, TOOL_MODULES)
 

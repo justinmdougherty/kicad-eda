@@ -15,21 +15,29 @@ Readers, each returning ``{net_name: {(ref, pad), ...}}`` with string pads;
    (run by ``export_schematic_xml``). ``sexpr_netlist_pad_nets`` reads the
    default S-expression export as well.
 3. ``pcb_pad_nets(text)``: a ``.kicad_pcb`` read as text, no KiCad needed:
-   KiCad 4/5 (``module``, bare-word nets), 6/7 (``fp_text reference``), 8/9
-   (``property "Reference"``, pad ``(net N "name")``) and 10/11 (pad
-   ``(net "name")``, no board net table).
+   KiCad 4/5 (``module``, bare-word nets and pad numbers), 6/7 (``fp_text
+   reference``), 8/9 (``property "Reference"``, pad ``(net N "name")``) and
+   10/11 (pad ``(net "name")``, no board net table). The text readers live in
+   sexpr_read.py. ``board_duplicate_refs`` lists references several
+   footprints share (their pads would collapse into one part).
+4. ``read_reference(path)``: a frozen ``kicad-eda.padnets/1`` reference
+   written by ``write_reference`` (faithful rebuilds compare against it
+   without the source tool).
 
-``load_pad_nets(path)`` picks the reader from the file content.
+``load_pad_nets(path)`` picks the reader from the file content;
+``load_pad_nets_meta`` also says what it read (kind, format version,
+duplicate and board-only references).
 
 ``compare(a, b, ref_map=None, ignore_single_pin=True)`` returns an
 ``EquivalenceResult``: ``split_nets`` (one net of ``a`` spread over several
 nets of ``b``), ``merged_nets`` (the reverse), ``missing_pins`` /
 ``extra_pins`` (connected pads the other side does not have at all) and
 ``details`` (counts, the 1:1 ``net_name_map`` that carries net_specs across,
-pads found on two nets, ...).
+pads found on two nets, ...). ``real_conflicts(details)`` drops the harmless
+pad conflicts.
 
 Only the S-expression readers need ``sexpdata`` (imported lazily), so
-``compare`` and the netlist.json / XML readers are stdlib-only.
+``compare`` and the netlist.json / XML / reference readers are stdlib-only.
 """
 from __future__ import annotations
 
@@ -41,60 +49,46 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-PadKey = tuple[str, str]
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import sexpr_read as sr  # noqa: E402
+from sexpr_read import NO_NET, PadKey, unescape_net_name  # noqa: E402
+
 PadNets = Mapping[str, Iterable[Any]]       # {net_name: iterable of (ref, pad)}
 
-NO_NET = ""                     # the "net" of pads present on no net (KiCad's net 0)
 DEFAULT_TIMEOUT_S = 300.0       # kicad-cli netlist export of a large hierarchy
-
-_LEADING = "\ufeff \t\r\n"      # BOM + whitespace before the first token
-_TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|[()]')   # a quoted string or a parenthesis
-_HEAD = re.compile(r'\(\s*([^\s()"]+)')
-_FP_NAME = re.compile(r'\(\s*(?:footprint|module)\s+("(?:[^"\\]|\\.)*"|[^\s()]+)')
-_VERSION = re.compile(r"\(\s*version\s+(\d+)\s*\)")
-_DIGITS = re.compile(r"([0-9]+)")
+REFERENCE_FORMAT = "kicad-eda.padnets/1"
+UNCONNECTED_PREFIX = "unconnected-("        # KiCad's name for a pin left on its own
 _ERROR_LINE = re.compile(r"\bError:")
-# KiCad's teardrop parser (parseTEARDROP_PARAMETERS) makes a child's '('
-# optional, and some 8.99/9.0 builds wrote `(curved_edges no)filter_ratio 0.9)`
-# (349 times in the KiCad 9.0.4 RoyalBlue54L-Feather demo, which KiCad loads).
-# Such a bare keyword right after ')' gets its '(' back before scanning.
-_TEARDROP_WORDS = ("enabled|allow_two_segments|prefer_zone_connections|best_length_ratio|"
-                   "max_length|best_width_ratio|max_width|curve_points|curved_edges|filter_ratio")
-_BARE_TEARDROP = re.compile(rf"\)\s*(?:{_TEARDROP_WORDS})\b")
-_BARE_TEARDROP_FIX = re.compile(rf'"(?:[^"\\]|\\.)*"|(\)\s*)((?:{_TEARDROP_WORDS})\b)')
-# technical (non-copper) layer names; anything else, including KiCad 4/5
-# custom copper names such as "Dessus", counts as copper
-_TECH_LAYER = re.compile(r"\.(?:Paste|Mask|SilkS|Adhes|Fab|CrtYd|Cuts|User)$"
-                         r"|^(?:Margin|User\.\d+)$")
-_FOOTPRINT_HEADS = frozenset({"footprint", "module"})
-# the footprint children the pad nets need: pads, attr (board_only) and the
-# reference (KiCad 8+ property, KiCad <= 7 fp_text); other properties are
-# skipped unparsed (Altium imports carry dozens per footprint)
-_FOOTPRINT_PART = re.compile(r'\(\s*(?:pad\b|attr\b|property\s+"?Reference"?\s'
-                             r'|fp_text\s+reference\s)')
 _EXCLUDED, _DNP = "exclude_from_board", "dnp"
+_NETLIST_VERSION = re.compile(r'<export\b[^>]*\bversion\s*=\s*["\']([^"\']*)'
+                              r'|\(\s*version\s+"?([^\s")]*)')
+
+# The old private names, kept for wave 2 only: server/tools/kicad_import.py
+# still uses _natural / _pad_order until F46-11 switches it to sexpr_read.
+_LEADING, _TOKEN, _HEAD = sr.LEADING, sr.TOKEN_RE, sr.HEAD_RE
+_FP_NAME, _VERSION = sr.FP_NAME_RE, sr.VERSION_RE
+_head_of, _sexp, _atom, _tag = sr.head_of, sr.parse, sr.atom, sr.tag
+_children, _child, _value = sr.children, sr.child, sr.value
+_restore_teardrop_parens, _natural, _pad_order = (sr.restore_teardrop_parens, sr.natural_key,
+                                                  sr.pad_order)
+_pad_number, _pad_net, _net_table = sr.pad_number, sr.pad_net, sr.net_table
 
 
 # ----------------------------------------------------------------------------
 # Small shared helpers
 # ----------------------------------------------------------------------------
-def _natural(text: str) -> tuple:
-    """'R10' sorts after 'R2'."""
-    return tuple(int(p) if i % 2 else p for i, p in enumerate(_DIGITS.split(text)))
-
-
-def _pad_order(key: PadKey) -> tuple:
-    return (_natural(key[0]), _natural(key[1]))
-
-
 def _sorted_pads(keys: Iterable[PadKey]) -> tuple[PadKey, ...]:
-    return tuple(sorted(keys, key=_pad_order))
+    return tuple(sorted(keys, key=sr.pad_order))
 
 
 def _pad_key(raw: Any, where: str, *, allow_empty_ref: bool = False) -> PadKey:
@@ -108,15 +102,22 @@ def _pad_key(raw: Any, where: str, *, allow_empty_ref: bool = False) -> PadKey:
     raise ValueError(f"{where}: {raw!r} is not a [ref, pad] pair")
 
 
-def unescape_net_name(name: str) -> str:
-    """KiCad stores a '/' inside a label as ``{slash}`` in board and
-    S-expression netlist net names (EscapeString CTX_NETNAME); the XML
-    netlist is already unescaped."""
-    return name.replace("{slash}", "/")
-
-
 def _flag_filter(include_excluded: bool, drop_dnp: bool) -> frozenset[str]:
     return frozenset(([] if include_excluded else [_EXCLUDED]) + ([_DNP] if drop_dnp else []))
+
+
+def _repeated(refs: Iterable[str]) -> list[str]:
+    return sorted((r for r, n in Counter(refs).items() if n > 1), key=sr.natural_key)
+
+
+def _refs(raw: Any, label: str) -> list[str]:
+    """A list of references, de-duplicated and natural-sorted."""
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Iterable):
+        raise ValueError(f"{label} must be a list of references, not {raw!r}")
+    refs = list(raw)
+    if not all(isinstance(r, str) for r in refs):
+        raise ValueError(f"{label} must be a list of references (strings): {refs!r}")
+    return sorted(set(refs), key=sr.natural_key)
 
 
 # ----------------------------------------------------------------------------
@@ -196,20 +197,20 @@ def sexpr_netlist_pad_nets(text: str, *, include_excluded: bool = False,
     """Pad nets of the default (S-expression) ``kicad-cli sch export netlist``
     output. KiCad already leaves board-excluded parts out of this format; the
     flags are honoured anyway when present. Net names are unescaped."""
-    if _head_of(text) != "export":
+    if sr.head_of(text) != "export":
         raise ValueError("not a KiCad S-expression netlist (expected '(export ...')")
-    tree = _sexp(text)
+    tree = sr.parse(text)
     flags = _flag_filter(include_excluded, drop_dnp)
-    skip = {_value(comp, "ref") for comp in _children(_child(tree, "components"), "comp")
-            if {_value(p, "name") for p in _children(comp, "property")} & flags}
-    nets = _child(tree, "nets")
+    skip = {sr.value(comp, "ref") for comp in sr.children(sr.child(tree, "components"), "comp")
+            if {sr.value(p, "name") for p in sr.children(comp, "property")} & flags}
+    nets = sr.child(tree, "nets")
     if nets is None:
         raise ValueError("the S-expression netlist has no (nets ...) section")
     out: dict[str, set[PadKey]] = {}
-    for net in _children(nets, "net"):
-        name = unescape_net_name(_value(net, "name")) or f"<net code {_value(net, 'code')}>"
-        for node in _children(net, "node"):
-            ref, pin = _value(node, "ref"), _value(node, "pin")
+    for net in sr.children(nets, "net"):
+        name = unescape_net_name(sr.value(net, "name")) or f"<net code {sr.value(net, 'code')}>"
+        for node in sr.children(net, "node"):
+            ref, pin = sr.value(node, "ref"), sr.value(node, "pin")
             if not ref:
                 raise ValueError(f"net {name!r} has a node without ref")
             if pin and ref not in skip:
@@ -254,204 +255,21 @@ def export_schematic_xml(sch: str | Path, out_xml: str | Path, kicad_cli: str | 
 
 
 # ----------------------------------------------------------------------------
-# S-expression helpers (sexpdata, lazily imported)
+# Reader 3: .kicad_pcb text (sexpr_read does the reading)
 # ----------------------------------------------------------------------------
-def _sexp(src: str) -> list:
-    try:
-        import sexpdata
-    except ImportError as e:
-        raise RuntimeError("reading KiCad S-expression files needs sexpdata "
-                           "(server/requirements.txt)") from e
-    try:
-        tree = sexpdata.loads(src.lstrip(_LEADING), nil=None, true=None, false=None)
-    except Exception as e:      # sexpdata raises its own exception classes
-        raise ValueError(f"cannot parse S-expression {src[:60]!r}: {e}") from e
-    if not isinstance(tree, list):
-        raise ValueError(f"not an S-expression list: {src[:60]!r}")
-    return tree
+_Footprint = tuple[str, bool, list[tuple[str, str]]]    # ref, board_only, [(pad, net)]
 
 
-def _atom(x: Any) -> str:
-    """A token as text: quoted string, bare word (sexpdata.Symbol is a str)
-    or a number (KiCad 4/5 write pad numbers and refs unquoted)."""
-    if isinstance(x, list):
-        raise ValueError(f"expected a value, found a list {x!r}")
-    return str(x)
+def _board_footprints(text: str) -> list[_Footprint]:
+    scan = sr.scan_board(text)
+    table = sr.net_table(scan.net_table)
+    return [sr.footprint_pads(lib, parts, table) for lib, parts in scan.footprints]
 
 
-def _tag(node: Any) -> str:
-    return str(node[0]) if isinstance(node, list) and node and not isinstance(node[0], list) else ""
-
-
-def _children(node: list | None, name: str) -> list[list]:
-    return [c for c in (node or [])[1:] if _tag(c) == name]
-
-
-def _child(node: list | None, name: str) -> list | None:
-    found = _children(node, name)
-    return found[0] if found else None
-
-
-def _value(node: list, name: str) -> str:
-    """``(name "value")`` child of node -> "value" ("" when absent/empty)."""
-    child = _child(node, name)
-    return _atom(child[1]) if child is not None and len(child) > 1 else ""
-
-
-def _head_of(text: str) -> str:
-    m = _HEAD.match(text, len(text) - len(text.lstrip(_LEADING)))
-    return m.group(1) if m else ""
-
-
-# ----------------------------------------------------------------------------
-# Reader 3: .kicad_pcb text
-# ----------------------------------------------------------------------------
-def _restore_teardrop_parens(text: str) -> str:
-    """``)filter_ratio 0.9)`` -> ``)(filter_ratio 0.9)`` outside quoted
-    strings, read the way KiCad reads it (see _TEARDROP_WORDS). Boards
-    without the defect are returned untouched after one cheap search."""
-    if not _BARE_TEARDROP.search(text):
-        return text
-    return _BARE_TEARDROP_FIX.sub(
-        lambda m: m.group(0) if m.group(1) is None else f"{m.group(1)}({m.group(2)}", text)
-
-
-@dataclass(frozen=True)
-class _BoardScan:
-    net_table: tuple[str, ...]                           # top-level (net N "name") sources
-    footprints: tuple[tuple[str, tuple[str, ...]], ...]  # (lib id, pad/reference/attr sources)
-
-
-def _scan_board(text: str) -> _BoardScan:
-    """One pass over the board text, tracking depth outside quoted strings:
-    collect the top-level net table and, per footprint, only the children the
-    pad nets need. sexpdata then parses those small pieces instead of the
-    whole file (zone fills dominate large boards: a 89 MB board scans in
-    seconds and never becomes one huge Python tree)."""
-    if _head_of(text) != "kicad_pcb":
-        raise ValueError("not a KiCad board (expected '(kicad_pcb ...')")
-    text = _restore_teardrop_parens(text)
-    start = len(text) - len(text.lstrip(_LEADING))
-    stack: list[int] = []
-    nets: list[str] = []
-    footprints: list[tuple[str, tuple[str, ...]]] = []
-    parts: list[str] | None = None
-    top, lib = "", ""
-    for m in _TOKEN.finditer(text, start):
-        tok = m.group()
-        if tok == "(":
-            stack.append(m.start())
-            if len(stack) == 2:
-                head = _HEAD.match(text, m.start())
-                top = head.group(1) if head else ""
-                parts = [] if top in _FOOTPRINT_HEADS else None
-                if parts is not None:
-                    name = _FP_NAME.match(text, m.start())
-                    lib = name.group(1).strip('"') if name else "?"
-        elif tok == ")":
-            if not stack:
-                raise ValueError(f"unbalanced parentheses: ')' at offset {m.start()} "
-                                 "closes nothing")
-            opened = stack.pop()
-            depth = len(stack) + 1
-            if depth == 3 and parts is not None:
-                if _FOOTPRINT_PART.match(text, opened):
-                    parts.append(text[opened:m.end()])
-            elif depth == 2:
-                if top == "net":
-                    nets.append(text[opened:m.end()])
-                elif parts is not None:
-                    footprints.append((lib, tuple(parts)))
-                parts = None
-    if stack:
-        raise ValueError(f"unbalanced parentheses: '(' at offset {stack[-1]} is never closed")
-    return _BoardScan(tuple(nets), tuple(footprints))
-
-
-def _net_table(sources: Iterable[str]) -> dict[int, str]:
-    """KiCad <= 9 board net table ``(net N "name")``; KiCad 10+ has none."""
-    table: dict[int, str] = {}
-    for src in sources:
-        node = _sexp(src)
-        if len(node) >= 3 and isinstance(node[1], int):
-            table[node[1]] = unescape_net_name(_atom(node[2]))
-    return table
-
-
-def _pad_net(pad: list, table: Mapping[int, str], where: str) -> str:
-    """The pad's net: ``(net N "name")`` (KiCad <= 9), ``(net "name")``
-    (KiCad 10+), ``(net N)`` resolved through the table, or NO_NET."""
-    for item in pad[2:]:
-        if _tag(item) != "net":
-            continue
-        args = item[1:]
-        if len(args) >= 2:
-            return unescape_net_name(_atom(args[1]))
-        if not args:
-            return NO_NET
-        only = args[0]
-        if isinstance(only, int):
-            if only in table:
-                return table[only]
-            if only == 0:
-                return NO_NET
-            raise ValueError(f"{where} references net {only}, which the board's net table "
-                             "does not define")
-        return unescape_net_name(_atom(only))
-    return NO_NET
-
-
-def _pad_number(pad: list) -> str:
-    """The pad's number as KiCad sees it after loading: PAD::CanHaveNumber
-    clears it for NPTH pads and for aperture pads (no copper layer), so
-    those carry no pad key; neither does an empty number."""
-    if len(pad) < 2 or isinstance(pad[1], list):
-        return ""
-    if len(pad) > 2 and not isinstance(pad[2], list) and str(pad[2]) == "np_thru_hole":
-        return ""
-    layers = _child(pad, "layers")
-    if layers is not None and len(layers) > 1 and all(
-            _TECH_LAYER.search(_atom(layer)) for layer in layers[1:]):
-        return ""
-    return _atom(pad[1])
-
-
-def _footprint_pads(lib: str, parts: Iterable[str], table: Mapping[int, str]
-                    ) -> tuple[str, bool, list[tuple[str, str]]]:
-    """(reference, board_only, [(pad number, net)]) of one footprint. A
-    footprint without a reference keeps ref "" (pcbnew reads it that way)."""
-    ref: str | None = None
-    board_only = False
-    numbered: list[tuple[str, list]] = []
-    for src in parts:
-        node = _sexp(src)
-        head = _tag(node)
-        if head in ("property", "fp_text") and len(node) >= 3:
-            # KiCad 8+ (property "Reference" ...) wins over KiCad <= 7 (fp_text reference ...)
-            if _atom(node[1]) in ("Reference", "reference") and (head == "property" or ref is None):
-                ref = _atom(node[2])
-        elif head == "attr":
-            board_only = "board_only" in {str(t) for t in node[1:] if not isinstance(t, list)}
-        elif head == "pad" and (number := _pad_number(node)):
-            numbered.append((number, node))
-    ref = ref or ""
-    return ref, board_only, [
-        (number, _pad_net(pad, table, f"{ref or '(no reference)'} pad {number} ({lib})"))
-        for number, pad in numbered]
-
-
-def pcb_pad_nets(text: str, *, exclude_board_only: bool = False) -> dict[str, set[PadKey]]:
-    """Pad nets of a ``.kicad_pcb`` (any format from KiCad 4 to 11), read as
-    text. Pads on no net go under NO_NET; ``exclude_board_only`` drops
-    footprints with the ``board_only`` attribute (KiCad 6+ "not in
-    schematic": holes, logos, fiducials). Copper elements sharing a number
-    are one pad key; on different nets the key lands in both (compare joins
-    them and reports a pad conflict)."""
-    scan = _scan_board(text)
-    table = _net_table(scan.net_table)
+def _footprint_nets(footprints: Iterable[_Footprint],
+                    exclude_board_only: bool) -> dict[str, set[PadKey]]:
     out: dict[str, set[PadKey]] = {}
-    for lib, parts in scan.footprints:
-        ref, board_only, pads = _footprint_pads(lib, parts, table)
+    for ref, board_only, pads in footprints:
         if exclude_board_only and board_only:
             continue
         for number, net in pads:
@@ -459,40 +277,182 @@ def pcb_pad_nets(text: str, *, exclude_board_only: bool = False) -> dict[str, se
     return out
 
 
+def pcb_pad_nets(text: str, *, exclude_board_only: bool = False) -> dict[str, set[PadKey]]:
+    """Pad nets of a ``.kicad_pcb`` (any format from KiCad 4 to 11), read as
+    text. Pads on no net go under NO_NET; ``exclude_board_only`` drops
+    footprints with the ``board_only`` attribute (KiCad 6+ "not in
+    schematic": holes, logos, fiducials). Copper elements sharing a number
+    are one pad key: on different nets the key lands in both (compare joins
+    them and reports a pad conflict); one netted and one on no net (U1 'EP'
+    on GND plus a no-net 'EP') puts the key under that net AND NO_NET, which
+    compare treats as connected and lists in ``partly_unconnected_pads``.
+    Footprints sharing a reference collapse into one part
+    (board_duplicate_refs)."""
+    return _footprint_nets(_board_footprints(text), exclude_board_only)
+
+
+def board_duplicate_refs(text: str) -> list[str]:
+    """References that two or more footprints of the board share (the
+    microwave demo's three POLY, tiny_tapeout's STITCH1 vias), natural-sorted;
+    "" when several footprints have none. Their pads collapse into one part in
+    pcb_pad_nets: rename them first (kicad_import_checks.board_as_imported)."""
+    return _repeated(ref for ref, _board_only, _pads in _board_footprints(text))
+
+
 def pcb_format_version(text: str) -> int | None:
     """The ``(version N)`` of a board header (20241229 = KiCad 9, 20260206 =
     KiCad 10, 20260901 = KiCad 11 nightly; 4 = KiCad 4), None when absent."""
-    m = _VERSION.search(text, 0, 4096)
+    m = sr.VERSION_RE.search(text, 0, 4096)
     return int(m.group(1)) if m else None
 
 
-def load_pad_nets(path: str | Path, *, exclude_board_only: bool = False) -> dict[str, set[PadKey]]:
-    """Read pad nets from a file, choosing the reader from its content:
-    netlist.json, a KiCad XML or S-expression netlist, or a .kicad_pcb.
-    ``exclude_board_only`` applies to netlist.json and boards (a schematic
-    export has no board-only parts). A .kicad_sch must be exported first."""
+# ----------------------------------------------------------------------------
+# Reader 4: the frozen reference (kicad-eda.padnets/1)
+# ----------------------------------------------------------------------------
+def write_reference(path: str | Path, pad_nets: PadNets, *, board_only: Iterable[str] = (),
+                    duplicate_refs: Iterable[str] = (),
+                    source: Mapping[str, Any] | None = None) -> Path:
+    """Freeze pad nets for a faithful rebuild (D4): UTF-8 JSON, '\\n' line
+    ends, ``{"format": "kicad-eda.padnets/1", "nets": {net: [[ref, pad],
+    ...]}, "board_only": [...], "duplicate_refs": [...], "source": {...}}``
+    with nets and pads natural-sorted, NO_NET pads under "" and empty nets
+    left out. Validates everything before writing; returns the path."""
+    nets: dict[str, set[PadKey]] = {}
+    for name, key in _entries(pad_nets, "pad_nets"):
+        nets.setdefault(name, set()).add(key)
+    if source is not None and not isinstance(source, Mapping):
+        raise ValueError(f"source must be an object (a netlist 'source' block), not {source!r}")
+    doc = {"format": REFERENCE_FORMAT,
+           "nets": {name: [list(k) for k in _sorted_pads(nets[name])]
+                    for name in sorted(nets, key=sr.natural_key)},
+           "board_only": _refs(board_only, "board_only"),
+           "duplicate_refs": _refs(duplicate_refs, "duplicate_refs"),
+           "source": dict(source or {})}
+    try:
+        text = json.dumps(doc, indent=1, ensure_ascii=False) + "\n"
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"source is not JSON-serialisable: {e}") from e
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text, encoding="utf-8", newline="\n")
+    return out
+
+
+def _reference(data: Any) -> tuple[dict[str, set[PadKey]], dict[str, Any]]:
+    fmt = data.get("format") if isinstance(data, Mapping) else None
+    if fmt != REFERENCE_FORMAT:
+        raise ValueError(f"not a pad-net reference: format {fmt!r}, expected "
+                         f"{REFERENCE_FORMAT!r}")
+    nets = data.get("nets")
+    if not isinstance(nets, Mapping):
+        raise ValueError("reference 'nets' must be an object {net: [[ref, pad], ...]}")
+    out: dict[str, set[PadKey]] = {}
+    for name, pads in nets.items():
+        where = f"reference net {name!r}"
+        if not isinstance(pads, list):
+            raise ValueError(f"{where} must be a list of [ref, pad] pairs")
+        keys = {_pad_key(raw, where, allow_empty_ref=True) for raw in pads}
+        if keys:
+            out[name] = keys
+    source = data.get("source")
+    if source is not None and not isinstance(source, Mapping):
+        raise ValueError(f"reference 'source' must be an object, not {source!r}")
+    meta = _meta("reference", REFERENCE_FORMAT, _refs(data.get("duplicate_refs", []),
+                                                      "duplicate_refs"),
+                 _refs(data.get("board_only", []), "board_only"))
+    return out, {**meta, "source": copy.deepcopy(dict(source or {}))}
+
+
+def read_reference(path: str | Path) -> tuple[dict[str, set[PadKey]], dict[str, Any]]:
+    """(pad nets, meta) of a write_reference file; meta as load_pad_nets_meta
+    plus ``source``. Fails loudly (ValueError) on anything else."""
+    p = Path(path)
+    try:
+        return _reference(json.loads(p.read_text(encoding="utf-8")))
+    except ValueError as e:     # json.JSONDecodeError is a ValueError too
+        raise ValueError(f"{p}: {e}") from e
+
+
+# ----------------------------------------------------------------------------
+# Files: load_pad_nets / load_pad_nets_meta
+# ----------------------------------------------------------------------------
+def _meta(kind: str, version: Any, duplicates: Iterable[str] = (),
+          board_only: Iterable[str] = ()) -> dict[str, Any]:
+    return {"kind": kind, "format_version": version, "duplicate_refs": list(duplicates),
+            "board_only_refs": list(board_only)}
+
+
+def _without_refs(nets: Mapping[str, set[PadKey]], refs: Iterable[str]) -> dict[str, set[PadKey]]:
+    drop = set(refs)
+    kept = {name: {k for k in keys if k[0] not in drop} for name, keys in nets.items()}
+    return {name: keys for name, keys in kept.items() if keys}
+
+
+def _json_nets(data: Any, exclude_board_only: bool) -> tuple[dict[str, set[PadKey]], dict]:
+    if isinstance(data, Mapping) and "format" in data:
+        nets, meta = _reference(data)
+        return (_without_refs(nets, meta["board_only_refs"]) if exclude_board_only
+                else nets), meta
+    nets = netlist_pad_nets(data, exclude_board_only=exclude_board_only)
+    parts = [c for c in data.get("components", []) if isinstance(c, Mapping)
+             and isinstance(c.get("ref"), str)]
+    board_only = _refs((c["ref"] for c in parts if c.get("board_only") is True), "board_only")
+    return nets, _meta("netlist", None, _repeated(c["ref"] for c in parts), board_only)
+
+
+def _board_nets(text: str, exclude_board_only: bool) -> tuple[dict[str, set[PadKey]], dict]:
+    footprints = _board_footprints(text)
+    board_only = _refs((ref for ref, flag, _pads in footprints if flag), "board_only")
+    return (_footprint_nets(footprints, exclude_board_only),
+            _meta("board", pcb_format_version(text),
+                  _repeated(ref for ref, _flag, _pads in footprints), board_only))
+
+
+def _netlist_version(text: str) -> str | None:
+    m = _NETLIST_VERSION.search(text, 0, 4096)
+    return (m.group(1) if m.group(1) is not None else m.group(2)) if m else None
+
+
+def load_pad_nets_meta(path: str | Path, *, exclude_board_only: bool = False
+                       ) -> tuple[dict[str, set[PadKey]], dict[str, Any]]:
+    """load_pad_nets plus what was read: ``{"kind": "board" | "xml" | "net" |
+    "netlist" | "reference", "format_version": board header int, netlist
+    export version ("E"), the reference format or None, "duplicate_refs":
+    references several parts share, "board_only_refs": [...]}`` (a reference
+    adds its ``source``). The lists describe the whole file, whatever
+    ``exclude_board_only`` dropped."""
     p = Path(path)
     if p.suffix.lower() == ".kicad_sch":
         raise ValueError(f"{p.name} is a schematic: export its netlist first with "
                          "export_schematic_xml(sch, out_xml, kicad_cli) and load the XML")
-    text = p.read_text(encoding="utf-8").lstrip(_LEADING)
+    text = p.read_text(encoding="utf-8").lstrip(sr.LEADING)
     try:
         if text.startswith("{"):
-            return netlist_pad_nets(json.loads(text), exclude_board_only=exclude_board_only)
+            return _json_nets(json.loads(text), exclude_board_only)
         if text.startswith("<"):
-            return xml_pad_nets(text)
-        head = _head_of(text)
+            return xml_pad_nets(text), _meta("xml", _netlist_version(text))
+        head = sr.head_of(text)
         if head == "kicad_pcb":
-            return pcb_pad_nets(text, exclude_board_only=exclude_board_only)
+            return _board_nets(text, exclude_board_only)
         if head == "export":
-            return sexpr_netlist_pad_nets(text)
+            return sexpr_netlist_pad_nets(text), _meta("net", _netlist_version(text))
         if head == "kicad_sch":
             raise ValueError("this is a schematic: export its netlist first with "
                              "export_schematic_xml(sch, out_xml, kicad_cli)")
     except ValueError as e:     # json.JSONDecodeError is a ValueError too
         raise ValueError(f"{p}: {e}") from e
-    raise ValueError(f"cannot tell what {p} is: expected netlist.json, a KiCad XML or "
-                     "S-expression netlist, or a .kicad_pcb")
+    raise ValueError(f"cannot tell what {p} is: expected netlist.json, a pad-net reference, "
+                     "a KiCad XML or S-expression netlist, or a .kicad_pcb")
+
+
+def load_pad_nets(path: str | Path, *, exclude_board_only: bool = False) -> dict[str, set[PadKey]]:
+    """Read pad nets from a file, choosing the reader from its content:
+    netlist.json, a ``kicad-eda.padnets/1`` reference (a JSON object with a
+    ``format`` key), a KiCad XML or S-expression netlist, or a .kicad_pcb.
+    ``exclude_board_only`` applies to netlist.json, boards and references
+    (through their stored board_only list); a schematic export has no
+    board-only parts. A .kicad_sch must be exported first."""
+    return load_pad_nets_meta(path, exclude_board_only=exclude_board_only)[0]
 
 
 # ----------------------------------------------------------------------------
@@ -557,6 +517,7 @@ class _Side:
     lone: Mapping[PadKey, str]                         # pad alone on a named net -> name
     conflicts: tuple[dict[str, Any], ...]              # pads listed on 2+ nets
     dropped: frozenset[str]                            # ignore_refs actually present
+    partly: tuple[dict[str, Any], ...]                 # pads on a net AND on NO_NET
 
     def name_of(self, key: PadKey) -> str:
         return self.classes[self.owner[key]][0] if key in self.owner else self.lone.get(key, NO_NET)
@@ -586,7 +547,7 @@ def _renamer(ref_map: Mapping[str, str] | None,
     if any(not k or not v for k, v in mapping.items()):
         raise ValueError(f"ref_map: empty reference in {ref_map!r}")
     seen: dict[str, str] = {}
-    for src, dst in sorted(mapping.items(), key=lambda kv: _natural(kv[0])):
+    for src, dst in sorted(mapping.items(), key=lambda kv: sr.natural_key(kv[0])):
         if dst in seen:
             raise ValueError(f"ref_map sends {seen[dst]} and {src} both to {dst}")
         seen[dst] = src
@@ -594,23 +555,12 @@ def _renamer(ref_map: Mapping[str, str] | None,
         if src in refs_a and dst in refs_a and dst not in mapping:
             raise ValueError(f"ref_map renames {src} onto {dst}, which a still uses "
                              f"(map {dst} too)")
-    unused = sorted((k for k in mapping if k not in refs_a), key=_natural)
+    unused = sorted((k for k in mapping if k not in refs_a), key=sr.natural_key)
     return mapping, unused
 
 
-def _build_side(entries: list[tuple[str, PadKey]], rename: Mapping[str, str],
-                ignore: frozenset[str]) -> _Side:
-    present: set[PadKey] = set()
-    member: dict[PadKey, set[str]] = {}
-    dropped: set[str] = set()
-    for name, (ref, pad) in entries:
-        ref = rename.get(ref, ref)
-        if ref in ignore:
-            dropped.add(ref)
-            continue
-        present.add((ref, pad))
-        if name != NO_NET:
-            member.setdefault((ref, pad), set()).add(name)
+def _net_roots(member: Mapping[PadKey, set[str]]) -> dict[str, str]:
+    """net name -> the root of its class (a pad on two nets joins them)."""
     parent: dict[str, str] = {}
 
     def find(n: str) -> str:
@@ -619,31 +569,55 @@ def _build_side(entries: list[tuple[str, PadKey]], rename: Mapping[str, str],
             n = parent[n]
         return n
 
-    for names in member.values():                 # a pad on two nets joins them
+    for names in member.values():
         first, *rest = sorted(names)
         for other in rest:
             parent[find(other)] = find(first)
+        find(first)
+    return {n: find(n) for n in list(parent)}
+
+
+def _build_side(entries: list[tuple[str, PadKey]], rename: Mapping[str, str],
+                ignore: frozenset[str]) -> _Side:
+    present: set[PadKey] = set()
+    loose: set[PadKey] = set()
+    member: dict[PadKey, set[str]] = {}
+    dropped: set[str] = set()
+    for name, (ref, pad) in entries:
+        ref = rename.get(ref, ref)
+        if ref in ignore:
+            dropped.add(ref)
+            continue
+        present.add((ref, pad))
+        if name == NO_NET:
+            loose.add((ref, pad))
+        else:
+            member.setdefault((ref, pad), set()).add(name)
+    root_of = _net_roots(member)
     groups: dict[str, set[PadKey]] = {}
     names_of: dict[str, set[str]] = {}
     for key, names in member.items():
-        root = find(next(iter(names)))
+        root = root_of[next(iter(names))]
         groups.setdefault(root, set()).add(key)
         names_of.setdefault(root, set()).update(names)
     classes: list[tuple[str, frozenset[PadKey]]] = []
     owner: dict[PadKey, int] = {}
     lone: dict[PadKey, str] = {}
-    for root in sorted(groups, key=_natural):
-        name = " + ".join(sorted(names_of[root], key=_natural))
+    for root in sorted(groups, key=sr.natural_key):
+        name = " + ".join(sorted(names_of[root], key=sr.natural_key))
         if len(groups[root]) == 1:
             lone[next(iter(groups[root]))] = name
             continue
         owner.update(dict.fromkeys(groups[root], len(classes)))
         classes.append((name, frozenset(groups[root])))
-    conflicts = tuple({"pad": list(k), "nets": sorted(n, key=_natural)}
-                      for k, n in sorted(member.items(), key=lambda kv: _pad_order(kv[0]))
-                      if len(n) > 1)
+    by_pad = sorted(member.items(), key=lambda kv: sr.pad_order(kv[0]))
+    conflicts = tuple({"pad": list(k), "nets": sorted(n, key=sr.natural_key),
+                       "single_pin": len(groups[root_of[next(iter(n))]]) == 1}
+                      for k, n in by_pad if len(n) > 1)
+    partly = tuple({"pad": list(k), "nets": sorted(n, key=sr.natural_key)}
+                   for k, n in by_pad if k in loose)
     return _Side(frozenset(present), MappingProxyType(owner), tuple(classes),
-                 MappingProxyType(lone), conflicts, frozenset(dropped))
+                 MappingProxyType(lone), conflicts, frozenset(dropped), partly)
 
 
 def _diffs(src: _Side, dst: _Side, universe: frozenset[PadKey]) -> tuple[NetDiff, ...]:
@@ -659,9 +633,9 @@ def _diffs(src: _Side, dst: _Side, universe: frozenset[PadKey]) -> tuple[NetDiff
         if len(groups) < 2:
             continue
         parts = sorted((NetPart(dst.name_of(keys[0]) or None, _sorted_pads(keys))
-                        for keys in groups.values()), key=lambda p: _pad_order(p.pads[0]))
+                        for keys in groups.values()), key=lambda p: sr.pad_order(p.pads[0]))
         out.append(NetDiff(name, _sorted_pads(common), tuple(parts)))
-    return tuple(sorted(out, key=lambda d: _natural(d.net)))
+    return tuple(sorted(out, key=lambda d: sr.natural_key(d.net)))
 
 
 def _name_map(sa: _Side, sb: _Side, universe: frozenset[PadKey]) -> dict[str, str]:
@@ -674,20 +648,20 @@ def _name_map(sa: _Side, sb: _Side, universe: frozenset[PadKey]) -> dict[str, st
         j = targets.pop()
         if {sa.owner.get(k) for k in sb.classes[j][1] & universe} == {i}:
             out[name] = sb.classes[j][0]
-    return dict(sorted(out.items(), key=lambda kv: _natural(kv[0])))
+    return dict(sorted(out.items(), key=lambda kv: sr.natural_key(kv[0])))
 
 
 def _by_net(side: _Side, keys: Iterable[PadKey]) -> dict[str, list[list[str]]]:
     out: dict[str, list[list[str]]] = {}
     for key in _sorted_pads(keys):
         out.setdefault(side.name_of(key), []).append(list(key))
-    return dict(sorted(out.items(), key=lambda kv: _natural(kv[0])))
+    return dict(sorted(out.items(), key=lambda kv: sr.natural_key(kv[0])))
 
 
 def _gone_refs(pins: Iterable[PadKey], other: _Side) -> list[str]:
     """Refs of these pins that the other side does not have at all."""
     there = {ref for ref, _ in other.present}
-    return sorted({ref for ref, _ in pins if ref not in there}, key=_natural)
+    return sorted({ref for ref, _ in pins if ref not in there}, key=sr.natural_key)
 
 
 def compare(a: PadNets, b: PadNets, ref_map: Mapping[str, str] | None = None,
@@ -706,7 +680,10 @@ def compare(a: PadNets, b: PadNets, ref_map: Mapping[str, str] | None = None,
 
     Pads present on both sides are compared as partitions: a net of ``a``
     whose pads land in several nets of ``b`` (an isolated pad counts as its
-    own net) is a split; the reverse is a merge."""
+    own net) is a split; the reverse is a merge. ``details``: a pad on a net
+    AND under NO_NET (one of two same-number pads left unconnected) counts as
+    connected and is listed in ``partly_unconnected_pads_a/_b`` {pad, nets};
+    a pad on 2+ nets in ``pad_conflicts_a/_b`` {pad, nets, single_pin}."""
     entries_a, entries_b = _entries(a, "a"), _entries(b, "b")
     rename, unused = _renamer(ref_map, {ref for _, (ref, _p) in entries_a})
     ignore = frozenset(str(r) for r in ignore_refs)
@@ -727,12 +704,28 @@ def compare(a: PadNets, b: PadNets, ref_map: Mapping[str, str] | None = None,
         "missing_by_net": _by_net(sa, missing), "extra_by_net": _by_net(sb, extra),
         "net_name_map": _name_map(sa, sb, universe),
         "pad_conflicts_a": list(sa.conflicts), "pad_conflicts_b": list(sb.conflicts),
+        "partly_unconnected_pads_a": list(sa.partly),
+        "partly_unconnected_pads_b": list(sb.partly),
         "ref_map_unused": unused,
-        "ignored_refs": sorted(sa.dropped | sb.dropped, key=_natural),
+        "ignored_refs": sorted(sa.dropped | sb.dropped, key=sr.natural_key),
     }
     equal = not (split or merged or missing or extra)
     return EquivalenceResult(equal, split, merged, _sorted_pads(missing), _sorted_pads(extra),
                              MappingProxyType(details))
+
+
+def real_conflicts(details: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """``pad_conflicts_a`` / ``_b`` of compare's details (or of their JSON)
+    without the harmless ones: a pad alone on every net it is listed on, all
+    of them KiCad ``unconnected-(...)`` nets (two copper pads of one number,
+    each left unconnected: the cm5_minima demo's J502/J503 'MP'). New dicts;
+    ``{**details, **real_conflicts(details)}`` is the filtered details."""
+    def real(c: Mapping[str, Any]) -> bool:
+        return not (c.get("single_pin") is True
+                    and all(str(n).startswith(UNCONNECTED_PREFIX) for n in c["nets"]))
+
+    return {key: [copy.deepcopy(dict(c)) for c in details.get(key, ()) if real(c)]
+            for key in ("pad_conflicts_a", "pad_conflicts_b")}
 
 
 # ----------------------------------------------------------------------------
@@ -753,7 +746,10 @@ def _describe(res: EquivalenceResult, limit: int = 20) -> list[str]:
 
 def _load_arg(path: str, args: argparse.Namespace, work: Path) -> dict[str, set[PadKey]]:
     p = Path(path)
-    if p.suffix.lower() == ".kicad_sch" and args.kicad_cli:
+    if p.suffix.lower() == ".kicad_sch":
+        if not args.kicad_cli:
+            raise ValueError(f"{p.name} is a schematic: pass --kicad-cli <path to kicad-cli> "
+                             "to export it")
         p = export_schematic_xml(p, work / f"{p.stem}.xml", args.kicad_cli)
     return load_pad_nets(p, exclude_board_only=args.exclude_board_only)
 
@@ -761,8 +757,9 @@ def _load_arg(path: str, args: argparse.Namespace, work: Path) -> dict[str, set[
 def main(argv: list[str] | None = None) -> int:
     """``net_equivalence.py A B``: exit 0 equivalent, 1 different, 2 error."""
     ap = argparse.ArgumentParser(description="Pad-partition equivalence of two designs: "
-                                 "netlist.json, KiCad XML/S-expression netlist, .kicad_pcb, "
-                                 "or .kicad_sch (with --kicad-cli).")
+                                 "netlist.json, a kicad-eda.padnets/1 reference, KiCad XML/"
+                                 "S-expression netlist, .kicad_pcb, or .kicad_sch (with "
+                                 "--kicad-cli).")
     ap.add_argument("a", help="reference design")
     ap.add_argument("b", help="candidate design")
     ap.add_argument("--ref-map", help="JSON {ref_in_a: ref_in_b}, inline or a file path")
@@ -770,7 +767,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--keep-single-pin", action="store_true",
                     help="isolated pads must exist on both sides too")
     ap.add_argument("--exclude-board-only", action="store_true",
-                    help="drop board_only parts (netlist.json / .kicad_pcb)")
+                    help="drop board_only parts (netlist.json / .kicad_pcb / reference)")
     ap.add_argument("--kicad-cli", help="kicad-cli that exports a .kicad_sch input")
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")
     args = ap.parse_args(argv)

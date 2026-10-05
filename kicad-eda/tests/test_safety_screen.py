@@ -80,6 +80,20 @@ def _kinds(design) -> set[str]:
                            "rationale": "cost", "confidence": "med"}]), "A1"),
     (_design(assumptions=[{"id": "A1", "topic": "isolation", "value": "no isolation from mains",
                            "rationale": "cost", "confidence": "med"}]), "A1"),
+    # ACIN nets are mains inputs like AC_L / AC_N (F5-07)
+    (_design(nets={"ACIN": [["R1", "1"]], "GND": [["R1", "2"]]}), "'ACIN'"),
+    (_design(nets={"ACIN_L": [["R1", "1"]], "ACIN_N": [["R1", "2"]]}), "ACIN_L"),
+    (_design(nets={"AC_IN": [["R1", "1"]], "GND": [["R1", "2"]]}), "'AC_IN'"),
+    # the level-shifter exemption's suffix is a channel or a <= 50 V rail, never HV_400
+    (_design(nets={"HV_400": [["R1", "1"]], "LV_5V": [["R1", "2"]]}), "'HV_400'"),
+    (_design(nets={"HV_60": [["R1", "1"]], "LV": [["R1", "2"]]}), "'HV_60'"),
+    # disc-varistor codes: 14D471K = 47 x 10^1 V; Littelfuse V<volts>LA
+    (_design([_part("RV1", "Device:Varistor", "14D471K", "Varistor:RV_Disc_D15.5mm_W5mm_P7.5mm")]),
+     "470 V"),
+    (_design([_part("RV1", "Device:Varistor", "10D561K", "Varistor:RV_Disc_D12mm_W5mm_P7.5mm")]),
+     "560 V"),
+    (_design([_part("RV1", "Device:Varistor", "MOV", "Varistor:RV_Disc_D12mm_W5mm_P7.5mm",
+                    mpn="V275LA20AP")]), "275 V"),
 ])
 def test_mains_or_high_voltage_is_flagged(design, needle):
     flags = ss.detect_safety(design)
@@ -105,6 +119,17 @@ def _assumed(topic: str, value: str) -> dict:
     # NO before the term that negates the next word, not the mains
     ("isolation", "no mains isolation (capacitive dropper)"),
     ("protection", "without mains fuse"),
+    # F5-07: NO / WITHOUT negate only a term that ends its clause or is followed by
+    # same-thing words; EXTERNALLY / ELSEWHERE only at clause end or before a link word
+    ("protection", "No mains input fuse, relies on upstream breaker"),
+    ("protection", "no mains inlet fuse"),
+    ("protection", "No mains input protection"),
+    ("filter", "no mains EMI filter"),                         # a documented miss before
+    ("input", "mains externally fused 10 A"),
+    ("supply", "no mains power indicator"),
+    # the topic counts when the value does not name the term itself
+    ("mains", "230 VAC through a 1 A fuse"),
+    ("mains", "via an isolating transformer"),
 ])
 def test_mains_assumptions_are_flagged(topic, value):
     assert _kinds(_assumed(topic, value)) == {ss.SAFETY_MAINS}
@@ -147,11 +172,70 @@ def test_li_ion_charger_ics_are_flagged(part):
     # NO before the term that negates the next word
     "Li-ion, no charge LED (status on the MCU)",
     "LiPo pack, no charge timer",
+    # F5-07: an off-board word followed by more than a link is not off-board placement
+    "LiPo charging elsewhere on the board",
+    "LiPo, charging elsewhere on this PCB",
+    "Li-ion charging externally supplied 5 V",
+    # F5-07 vocabulary: Li ion, Li-Poly(mer), LiPoly, 18650 / 21700 cells
+    "1S Li ion cell, charged over USB",
+    "Li-Poly 2000 mAh pouch, USB charging",
+    "LiPoly pouch, charging at 500 mA",
+    "Li-Polymer cell, charge at 0.5C",
+    "LIPOLYMER pack with a charger",
+    "2x 18650 in parallel, charged over USB-C",
+    "single INR21700 cell with USB-C charging",
 ])
 def test_li_ion_charging_assumptions_are_flagged(value):
     design = _design(assumptions=[{"id": "A4", "topic": "battery", "value": value,
                                    "rationale": "concept", "confidence": "med"}])
     assert _kinds(design) == {ss.SAFETY_LIION}
+
+
+def _assumptions(*pairs: tuple[str, str, str]) -> dict:
+    return _design(assumptions=[{"id": i, "topic": t, "value": v, "rationale": "concept",
+                                 "confidence": "med"} for i, t, v in pairs])
+
+
+@pytest.mark.parametrize("pairs, ids", [
+    # D5 assumptions are per topic: napkin agents split cell and charging like this
+    ((("A3", "battery", "1S LiPo 1000 mAh"), ("A4", "charging", "500 mA from USB-C")),
+     ("A3", "A4")),
+    ((("A1", "battery", "2x 18650 in parallel"), ("A2", "input", "USB-C 5 V, charges the pack"),
+      ("A5", "enclosure", "IP54")), ("A1", "A2")),
+    ((("A1", "cells", "Li-ion"), ("A2", "backup", "lithium coin cell"),
+      ("A3", "power", "recharged from a 6 V solar panel")), ("A1", "A2", "A3")),
+])
+def test_lithium_and_charging_in_separate_assumptions_are_one_flag(pairs, ids):
+    (flag,) = ss.detect_safety(_assumptions(*pairs))
+    assert flag.kind == ss.SAFETY_LIION
+    assert all(f"{i} (" in flag.reason for i in ids), flag.reason
+    assert "A5" not in flag.reason
+
+
+def test_an_assumption_with_both_is_flagged_alone():
+    design = _assumptions(("A1", "battery", "LiPo, USB charging"),
+                          ("A2", "backup", "lithium coin cell"))
+    (flag,) = ss.detect_safety(design)
+    assert flag.reason.startswith("assumption A1 (battery)") and "A2" not in flag.reason
+
+
+@pytest.mark.parametrize("pairs", [
+    (("A1", "battery", "1S LiPo"), ("A2", "charging", "off-board, by an external charger")),
+    (("A1", "battery", "1S LiPo 1000 mAh"), ("A2", "charging", "no on-board charging")),
+    (("A1", "battery", "1S LiPo"), ("A2", "charging", "charged externally")),
+    (("A1", "battery", "1S LiPo"), ("A2", "input", "USB-C 5 V sink")),
+    (("A1", "backup", "non-rechargeable lithium coin cell"), ("A2", "input", "USB-C 5 V sink")),
+    (("A1", "battery", "alkaline AA"), ("A2", "charging", "500 mA from USB-C")),
+])
+def test_separate_assumptions_without_both_are_not_flagged(pairs):
+    assert ss.detect_safety(_assumptions(*pairs)) == []
+
+
+def test_the_value_decides_when_it_names_the_term_itself():
+    # the topic's CHARGING is not a second, un-negated mention
+    assert ss.detect_safety(_assumed("Li-ion charging", "none here, charged off-board")) == []
+    assert ss.detect_safety(_assumed("mains input", "no mains")) == []
+    assert _kinds(_assumed("charging", "500 mA, Li-ion pack")) == {ss.SAFETY_LIION}
 
 
 def test_charger_with_battery_net_names_the_net():
@@ -228,10 +312,61 @@ def test_no_example_board_is_flagged(name, load_design):
                           "adapter", "rationale": "concept", "confidence": "high"}]),
     _assumed("input", "12 V from an external mains power adapter"),
     _assumed("input", "battery powered, without mains"),
+    # F5-07: NO / WITHOUT still negate a term followed only by same-thing words
+    _assumed("input", "no mains power supply"),
+    _assumed("input", "no mains input"),
+    _assumed("input", "without mains connection"),
+    _assumed("input", "no mains circuit on board"),
+    _assumed("input", "no mains onboard"),
+    _assumed("battery", "Li-ion pack, no charger IC"),
+    _assumed("battery", "LiPo, no charging circuitry on the board"),
+    _assumed("battery", "lithium primary cell, non-rechargeable"),
+    # ... and EXTERNALLY / ELSEWHERE at clause end or before a link word
+    _assumed("battery", "LiPo pack, charged elsewhere"),
+    _assumed("battery", "Li-ion pack, charged externally by the user"),
+    _assumed("battery", "LiPo; charging elsewhere in the system"),
+    # level shifters keep their exemption for channel numbers and <= 50 V rails
+    _design(nets={"HV_3V3": [["R1", "1"]], "LV_1.8V": [["R1", "2"]], "HV2": [["R1", "1"]]}),
+    _design(nets={"HV_48": [["R1", "1"]], "LV": [["R1", "2"]]}),
+    # disc varistors below the mains class: 82 V, 39 V
+    _design([_part("RV1", "Device:Varistor", "14D820K", "Varistor:RV_Disc_D15.5mm_W5mm_P7.5mm")]),
+    _design([_part("RV1", "Device:Varistor", "07D390K", "Varistor:RV_Disc_D7mm_W3.4mm_P5mm")]),
     {},
 ])
 def test_ordinary_designs_are_not_flagged(design):
     assert ss.detect_safety(design) == []
+
+
+@pytest.mark.parametrize("design", [
+    # the known false positives detect_safety documents: flagging wins over a miss
+    _assumed("mains", "none"),
+    _assumptions(("A1", "battery", "1S LiPo"), ("A2", "charging", "none")),
+    _assumed("battery", "1S LiPo, no Li-ion charging"),
+    _assumed("battery", "LiPo, charging handled off-board"),
+    _assumed("battery", "Li-ion, charging is not done here"),
+    _assumed("input", "no mains present"),
+    _assumed("input", "12 V from a mains adapter"),
+    _design([_part("F1", "Device:Fuse", "T2A 250V", "Fuse:Fuse_1812_4532Metric")],
+            nets={"VIN_12V": [["F1", "1"]], "GND": [["F1", "2"]]}),
+    _design(nets={"ACIN": [["R1", "1"]], "GND": [["R1", "2"]]}),        # a PMIC's 5 V ACIN
+    _design(nets={"HV_EN": [["R1", "1"]], "GND": [["R1", "2"]]}),
+])
+def test_documented_false_positives_are_still_flagged(design):
+    assert ss.detect_safety(design)
+    doc = ss.detect_safety.__doc__
+    assert "Known false positives" in doc and "Known misses" in doc
+
+
+@pytest.mark.parametrize("design, documented", [
+    # the known misses detect_safety documents (a change that closes one updates both)
+    (_assumed("battery", "1S 14500 cell, USB charging"), "14500"),
+    (_design([_part("RV1", "Device:Varistor", "FNR-14K471",
+                    "Varistor:RV_Disc_D15.5mm_W5mm_P7.5mm")]), "MOV codes other"),
+    (_design(nets={"HV_12": [["R1", "1"]], "LV": [["R1", "2"]]}), "suffix of at most 50"),
+])
+def test_documented_misses_are_still_missed(design, documented):
+    assert ss.detect_safety(design) == []
+    assert documented in " ".join(ss.detect_safety.__doc__.split())
 
 
 # --- G5 warning ---------------------------------------------------------------------

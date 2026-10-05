@@ -30,6 +30,7 @@ if str(_TOOLS_DIR) not in sys.path:       # server/tools holds the pure IPC-2221
     sys.path.insert(0, str(_TOOLS_DIR))
 
 import ipc_rules  # noqa: E402
+import route_outline as ro  # noqa: E402  (board edge / cutouts; pure)
 
 Point = Sequence[float]
 Item = Mapping[str, Any]
@@ -218,7 +219,8 @@ def _inside_convex(p: Point, poly: Sequence[tuple[float, float]]) -> bool:
     return True
 
 
-def _segment_polygon(a: Point, b: Point, poly: Sequence[tuple[float, float]]) -> tuple[float, float]:
+def _segment_polygon(a: Point, b: Point,
+                     poly: Sequence[tuple[float, float]]) -> tuple[float, float]:
     """(distance, t on a-b) between segment a-b and a convex polygon; 0 when
     they touch or the segment lies inside."""
     if _inside_convex(a, poly):
@@ -253,7 +255,8 @@ def _oval_gap(a: Point, b: Point, p: Item, angle_deg: float) -> tuple[float, flo
     (ux, uy), (vx, vy) = _axes(angle_deg)
     ax, ay = (ux, uy) if w >= h else (vx, vy)
     half, radius = (max(w, h) - min(w, h)) / 2.0, min(w, h) / 2.0
-    dist, t = _segment_segment(a, b, (cx - ax * half, cy - ay * half), (cx + ax * half, cy + ay * half))
+    dist, t = _segment_segment(a, b, (cx - ax * half, cy - ay * half),
+                               (cx + ax * half, cy + ay * half))
     return dist - radius, t
 
 
@@ -318,7 +321,8 @@ def _via_obstacles(a: Point, b: Point, vias: Iterable[Item], net: str,
 
 
 def obstacles(a: Point, b: Point, layer: str, pads: Sequence[Item], tracks: Sequence[Item],
-              vias: Sequence[Item], net: str, clearance: float, width: float) -> list[dict[str, Any]]:
+              vias: Sequence[Item], net: str, clearance: float,
+              width: float) -> list[dict[str, Any]]:
     """Items of OTHER nets whose copper on `layer` comes within clearance +
     width/2 of the centreline a-b. "distance" is from the centreline to the
     item's copper edge — negative means the item sits on the line; "t" is
@@ -336,12 +340,19 @@ def obstacles(a: Point, b: Point, layer: str, pads: Sequence[Item], tracks: Sequ
 
 def corridor(connection: Item, layers: Sequence[str] = DEFAULT_LAYERS, *,
              pads: Sequence[Item] = (), tracks: Sequence[Item] = (), vias: Sequence[Item] = (),
-             clearance: float = 0.0, width: float = 0.0) -> dict[str, list[dict[str, Any]]]:
+             clearance: float = 0.0, width: float = 0.0, outline: Any = None,
+             origin: Point = (0, 0), edge_clearance: float = 0.0
+             ) -> dict[str, list[dict[str, Any]]]:
     """{layer: obstacles(...)} along the straight line of one connection, per
-    requested layer (default F.Cu and B.Cu) — the tool's per-connection view."""
+    requested layer (default F.Cu and B.Cu) — the tool's per-connection view.
+    With an outline (route_outline.outline_from_geometry: outline, origin) the
+    board edge and each cutout, grown by edge_clearance, join as "edge" items."""
     a, b = _xy(connection["from"]), _xy(connection["to"])
     net = str(connection["net"])
-    return {layer: obstacles(a, b, layer, pads, tracks, vias, net, clearance, width)
+    edges = ({} if outline is None else
+             ro.edge_obstacles(outline, origin, edge_clearance, layers, a, b, width))
+    return {layer: sorted(obstacles(a, b, layer, pads, tracks, vias, net, clearance, width)
+                          + edges.get(layer, []), key=lambda o: (o["t"], o["kind"], o["id"]))
             for layer in layers}
 
 
@@ -506,7 +517,7 @@ def _build_segments(elements: Sequence[Mapping[str, Any]], net_class: Mapping[st
         pts = poly["points"]
         segments.extend({"layer": poly["layer"], "start": [_r(s[0]), _r(s[1])],
                          "end": [_r(e[0]), _r(e[1])], "width": _r(w)}
-                        for s, e in zip(pts, pts[1:]))
+                        for s, e in zip(pts, pts[1:], strict=False))
         warnings.extend(_bend_warnings(poly))
     return segments, warnings
 
@@ -537,9 +548,26 @@ def _resolve_via(v: Mapping[str, Any], via_diameter: float, via_drill: float,
     return {"x": _r(v["x"]), "y": _r(v["y"]), "diameter": _r(d), "drill": _r(h)}
 
 
+def _outline_errors(elements: Sequence[Mapping[str, Any]], plan: Mapping[str, Any], outline: Any,
+                    origin: Point, clear: float) -> list[str]:
+    """route_outline.path_outline_errors per element: polylines at their width, vias as pads."""
+    vias, first, out = iter(plan["vias"]), 0, []    # first: this polyline's 1st plan segment
+    for e in elements:
+        if e["kind"] == "via":
+            v = next(vias)
+            pts, w, where = [(v["x"], v["y"])], v["diameter"], "via"
+        else:                       # one segment per point pair, all at the polyline's width
+            pts, w, where = e["points"], plan["segments"][first]["width"], f"on {e['layer']}"
+            first += len(pts) - 1
+        errors = ro.path_outline_errors(outline, origin, pts, w, clear)
+        out += [f"path[{e['index']}] {where}: {m}" for m in errors]
+    return out
+
+
 def validate_path(path: Sequence[Mapping[str, Any]], net_class: Mapping[str, Any],
                   rules: Mapping[str, Any], width: float = 0.0, allow_narrow: bool = False,
-                  via_diameter: float = 0.0, via_drill: float = 0.0) -> dict[str, Any]:
+                  via_diameter: float = 0.0, via_drill: float = 0.0, outline: Any = None,
+                  origin: Point = (0, 0), edge_clearance: float | None = None) -> dict[str, Any]:
     """Check an agent's path against the path contract and expand it into the
     segments and vias BoardApi.add_tracks / add_vias take.
 
@@ -550,13 +578,21 @@ def validate_path(path: Sequence[Mapping[str, Any]], net_class: Mapping[str, Any
     rules are errors, below the class an error unless allow_narrow. Returns
     {"segments": [{"layer", "start", "end", "width"}], "vias": [{"x", "y",
     "diameter", "drill"}], "warnings": [...]} — non-45 bends, acute turns and
-    same-layer vias warn. Raises ValueError naming the element to fix."""
+    same-layer vias warn. With an outline (route_outline.outline_from_geometry), copper
+    off the board or nearer an edge than edge_clearance (None: the rules'
+    copper_edge_clearance) is an error. Raises ValueError naming the element to fix."""
     elements = _parse_path(path)
     join_warnings = _check_joins(elements)
     segments, bend_warnings = _build_segments(elements, net_class, rules, width, allow_narrow)
     vias = [_resolve_via(e, via_diameter, via_drill, net_class, rules)
             for e in elements if e["kind"] == "via"]
-    return {"segments": segments, "vias": vias, "warnings": join_warnings + bend_warnings}
+    plan = {"segments": segments, "vias": vias, "warnings": join_warnings + bend_warnings}
+    if outline is not None:
+        clear = rules.get("copper_edge_clearance") if edge_clearance is None else edge_clearance
+        errors = _outline_errors(elements, plan, outline, origin, float(clear or 0.0))
+        if errors:
+            raise ValueError("copper must stay on the board: " + "; ".join(errors))
+    return plan
 
 
 def route_length(segments: Iterable[Item]) -> float:
@@ -573,7 +609,7 @@ def _fat_length(pre: Item, fat_width: float) -> float:
     preroute's width) - the SWIG gate's "authored fat length"."""
     points = [p for p in (pre.get("path") or []) if isinstance(p, (list, tuple)) and p]
     total = 0.0
-    for a, b in zip(points, points[1:]):
+    for a, b in zip(points, points[1:], strict=False):
         width = float(a[3]) if len(a) > 3 and a[3] is not None else float(pre["width"])
         if a[0] == "xy" and b[0] == "xy" and width + WIDTH_TOL_MM >= fat_width:
             total += math.hypot(float(b[1]) - float(a[1]), float(b[2]) - float(a[2]))

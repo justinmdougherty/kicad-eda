@@ -325,11 +325,106 @@ def test_rotated_page_marks_and_words_follow_the_rotation(tmp_path: Path) -> Non
     assert x0 < height_pt - 100 < x1                            # baseline 100 pt -> x = H - 100
 
 
+def _make_rotated_sheet(path: Path, rotation: int) -> Path:
+    """One A3 landscape page with the MARKS and a text line, saved with
+    /Rotate ``rotation``."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=A3_LANDSCAPE[0], height=A3_LANDSCAPE[1])
+    for rect in MARKS.values():
+        page.draw_rect(pymupdf.Rect(rect), color=BLACK, fill=BLACK)
+    page.insert_text((200, 500), "R1 10k U3", fontsize=14)
+    page.set_rotation(rotation)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+@requires_pymupdf
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_tiled_rotated_page_marks_and_words_follow_the_rotation(tmp_path: Path,
+                                                                rotation: int) -> None:
+    """A /Rotate page that needs tiling: every tile is cut from the page AS
+    DISPLAYED, so marks and words land where PyMuPDF's rotation puts them."""
+    src = _make_rotated_sheet(tmp_path / "rot.pdf", rotation)
+    dpi, tile, overlap = 100, 700, 64
+    man = rz.rasterize(src, tmp_path / "o", dpi=dpi, tile_px=tile, overlap_px=overlap)
+    (page,) = man["pages"]
+    assert page["rotation"] == rotation
+    with pymupdf.open(str(src)) as doc:                        # PyMuPDF's own transform
+        rot = doc[0].rotation_matrix
+        word_rects = {w[4]: pymupdf.Rect(w[:4]) * rot for w in doc[0].get_text("words")}
+    long_px, short_px = 1654, 1170                              # A3 at 100 dpi
+    w, h = page["width_px"], page["height_px"]
+    assert (w, h) == ((short_px, long_px) if rotation in (90, 270) else (long_px, short_px))
+    grid = rz.tile_grid(w, h, tile, overlap)
+    assert len(grid) > 1 and page["image"] is None
+    assert [t["box_px"] for t in page["tiles"]] == [b.as_list() for b in grid]
+    assert page["grid"] == [grid[-1].row + 1, grid[-1].col + 1]
+    for t in page["tiles"]:
+        pix = _pix(t["path"])
+        x0, y0, x1, y1 = t["box_px"]
+        assert (pix.width, pix.height) == (x1 - x0, y1 - y0)
+        assert t["box_pt"] == [round(v * 72 / dpi, 2) for v in t["box_px"]]
+
+    for name, (x0, y0, x1, y1) in MARKS.items():
+        centre = pymupdf.Point((x0 + x1) / 2, (y0 + y1) / 2) * rot
+        cx, cy = _px(centre.x, dpi), _px(centre.y, dpi)
+        holders = _tiles_holding(page, cx, cy)
+        assert holders, name
+        for t in holders:
+            tx, ty = t["box_px"][:2]
+            assert _rgb(_pix(t["path"]), cx - tx, cy - ty) == BLACK, (name, t["path"])
+    ux = uy = _px(115, dpi)                     # the 'left' mark's centre BEFORE rotation
+    for t in _tiles_holding(page, ux, uy):      # is blank once the page is turned
+        assert _rgb(_pix(t["path"]), ux - t["box_px"][0], uy - t["box_px"][1]) == WHITE
+
+    overview = _pix(page["overview"])
+    assert max(overview.width, overview.height) == tile
+    words = json.loads(Path(page["words"]).read_text(encoding="utf-8"))
+    assert {wd[4] for wd in words} == {"R1", "10k", "U3"}
+    for x0, y0, x1, y1, text in words:
+        expected = word_rects[text] * pymupdf.Matrix(dpi / 72, dpi / 72)
+        assert [x0, y0, x1, y1] == pytest.approx(list(expected), abs=0.11), text
+
+
 @requires_pymupdf
 def test_tile_limit_guard(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="tiles.*dpi"):
         rz.rasterize(_make_pdf(tmp_path / "s.pdf"), tmp_path / "o", dpi=1200, tile_px=256,
                      overlap_px=0)
+
+
+@requires_pymupdf
+def test_untiled_size_guard(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="too large to render untiled"):
+        rz.rasterize(_make_pdf(tmp_path / "s.pdf"), tmp_path / "o", dpi=1200, tile_px=0)
+    assert not (tmp_path / "o").exists()                # every page is planned first
+
+
+@requires_pymupdf
+@pytest.mark.parametrize("pages, message", [([0], "1-based"), ([True], "1-based"),
+                                            ([], "no pages selected")])
+def test_bad_page_selection(tmp_path: Path, pages: list, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        rz.rasterize(_make_pdf(tmp_path / "s.pdf"), tmp_path / "o", pages=pages)
+
+
+@requires_pymupdf
+def test_image_named_pdf_is_rejected(tmp_path: Path) -> None:
+    png = tmp_path / "a.png"
+    _pattern_image(png, 40, 30)
+    fake = tmp_path / "fake.pdf"
+    fake.write_bytes(png.read_bytes())
+    with pytest.raises(rz.RasterizeError, match="fake.pdf"):
+        rz.rasterize(fake, tmp_path / "o")
+
+
+@requires_pymupdf
+def test_unwritable_output_is_a_rasterize_error(tmp_path: Path) -> None:
+    out = tmp_path / "o"
+    (out / "s_p2.png").mkdir(parents=True)              # a directory where the PNG goes
+    with pytest.raises(rz.RasterizeError, match="cannot render s_p2.png"):
+        rz.rasterize(_make_pdf(tmp_path / "s.pdf"), out, dpi=72, pages=[2])
 
 
 @requires_pymupdf
@@ -392,6 +487,21 @@ def test_large_image_tiles_are_exact_crops(tmp_path: Path, dpi: int) -> None:
 
 
 @requires_pymupdf
+def test_image_tiles_ignore_the_dpi(tmp_path: Path) -> None:
+    """What the reader prompt relies on: re-rendering an image at a higher
+    dpi gives the same native pixels (only a PDF gets sharper)."""
+    src = tmp_path / "scan.png"
+    _pattern_image(src, 900, 500)
+    low = rz.rasterize(src, tmp_path / "lo", dpi=300, tile_px=400, overlap_px=50)
+    high = rz.rasterize(src, tmp_path / "hi", dpi=600, tile_px=400, overlap_px=50)
+    assert low["dpi"] is None and high["dpi"] is None
+    pairs = zip(low["pages"][0]["tiles"], high["pages"][0]["tiles"], strict=True)
+    for lo, hi in pairs:
+        assert lo["box_px"] == hi["box_px"]
+        assert _pix(lo["path"]).samples == _pix(hi["path"]).samples
+
+
+@requires_pymupdf
 def test_small_image_passes_through_unchanged(tmp_path: Path) -> None:
     src = tmp_path / "photo.png"
     original = _pattern_image(src, 320, 200)
@@ -443,6 +553,57 @@ def test_cli_bad_settings_exit_2(tmp_path: Path, capsys: pytest.CaptureFixture[s
     src.write_bytes(b"%PDF-1.4\n%%EOF\n")
     assert rz.main([str(src), str(tmp_path / "o"), "--tile", "100"]) == 2
     assert "tile" in capsys.readouterr().err
+
+
+# ----------------------------------------------------------------------------
+# The reader prompt (agents/schematic-reader.md) uses rasterize as it works
+# ----------------------------------------------------------------------------
+READER = rz.SERVER_DIR.parent / "agents" / "schematic-reader.md"
+
+
+def _reader() -> tuple[list[str], str]:
+    text = READER.read_text(encoding="utf-8")
+    _, front, body = text.split("---\n", 2)
+    return front.strip().splitlines(), body
+
+
+def _method_step(body: str, n: int) -> list[str]:
+    """The lines of numbered method step ``n`` (its sub-bullets included)."""
+    lines = body.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith(f"{n}. "))
+    end = next(i for i in range(start + 1, len(lines)) if re.match(r"\d+\. |#", lines[i]))
+    return lines[start:end]
+
+
+def test_reader_frontmatter_is_kept() -> None:
+    front, _ = _reader()
+    fields = dict(line.split(": ", 1) for line in front)
+    assert list(fields) == ["name", "description", "effort", "maxTurns"]   # no model
+    assert (fields["name"], fields["effort"], fields["maxTurns"]) == (
+        "schematic-reader", "high", "100")
+
+
+def test_reader_rerenders_pdf_sources_only() -> None:
+    """Review regression 5: a 600 dpi re-render helps a PDF only; an image's
+    tiles are already its native pixels (test_image_tiles_ignore_the_dpi)."""
+    _, body = _reader()
+    step = _method_step(body, 4)
+    rerender = [ln for ln in step if "--dpi 600" in ln]
+    assert rerender and all("PDF" in ln for ln in rerender), rerender
+    (image,) = [ln for ln in step if "Image source" in ln]
+    assert "--dpi 600" not in image
+    for text in ("scan", "photo", "screenshot", "native pixels", "VIS-<n>", "low",
+                 "better scan"):
+        assert text in image, text
+    assert all("PDF" in ln for ln in body.splitlines() if "600 dpi" in ln)
+
+
+def test_reader_logs_judgements_when_record_decision_exists() -> None:
+    _, body = _reader()
+    (line,) = [ln for ln in body.splitlines() if "MCP tool named `record_decision`" in ln]
+    for text in ("when an MCP tool named `record_decision` is available", "stage=\"requirements\"",
+                 "`med`", "`low`"):
+        assert text in line, text
 
 
 # ----------------------------------------------------------------------------

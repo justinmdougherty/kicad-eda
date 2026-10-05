@@ -64,7 +64,7 @@ def _placements(text: str) -> list[tuple[str, int]]:
     """(lib_id, unit) of every placed symbol, in file order."""
     lib_ids, units = LIB_ID_RE.findall(text), [int(u) for u in UNIT_RE.findall(text)]
     assert len(lib_ids) == len(units) == len(PLACEMENT_RE.findall(text))
-    return list(zip(lib_ids, units))
+    return list(zip(lib_ids, units, strict=True))
 
 
 def _labels(text: str) -> list[tuple[str, float, float, bool]]:
@@ -123,8 +123,10 @@ def test_one_placement_symbol_per_unit_cell(lm358_build: Build):
     placed = _placements(lm358_build.text)
     parts = [p for p in placed if p[0] != PWR_FLAG]
     # U1 is a dual op-amp (2 amp units + power unit); the other 3 parts are single-unit
-    assert sorted(parts) == [("Amplifier_Operational:LM358", 1), ("Amplifier_Operational:LM358", 2),
-                             ("Amplifier_Operational:LM358", 3), ("Connector_Generic:Conn_01x06", 1),
+    assert sorted(parts) == [("Amplifier_Operational:LM358", 1),
+                             ("Amplifier_Operational:LM358", 2),
+                             ("Amplifier_Operational:LM358", 3),
+                             ("Connector_Generic:Conn_01x06", 1),
                              ("Device:C", 1), ("Device:C", 1)]
     # P5V and GND each land on a power_in pin with no driver -> one PWR_FLAG each
     assert placed.count((PWR_FLAG, 1)) == 2
@@ -185,7 +187,7 @@ def test_sidecar_overrides_derived_offset(lm358_work: Path):
     before = sorted(set(_labels(base.text)) - set(_labels(over.text)))
     after = sorted(set(_labels(over.text)) - set(_labels(base.text)))
     assert len(before) == len(after) == 2                          # C1.1 and C2.1, both P5V
-    for (net_b, x_b, y_b, _), (net_a, x_a, y_a, _) in zip(before, after):
+    for (net_b, x_b, y_b, _), (net_a, x_a, y_a, _) in zip(before, after, strict=True):
         assert net_b == net_a == "P5V" and x_a == x_b
         assert y_a - y_b == pytest.approx(-8.89)
 
@@ -406,5 +408,59 @@ def test_build_in_process_has_the_subprocess_contract(tmp_path: Path):
     design = {**_synthetic_design(), "no_connect": [["R1", "9"]]}
     missing = sch_build.build(str(_write_netlist(tmp_path / "m.json", design)),
                               str(tmp_path / "m.kicad_sch"), str(FIXTURE_SYMBOLS))
-    assert missing == {"ok": False, "error": "1 pins have no coordinates", "missing_pins": [["R1", "9"]]}
+    assert missing == {"ok": False, "error": "1 pins have no coordinates",
+                       "missing_pins": [["R1", "9"]]}
     assert not (tmp_path / "m.kicad_sch").exists()
+
+
+def test_pwr_flag_comes_from_the_power_library_nickname():
+    import libtable
+    import sch_build
+    assert sch_build.PWR_FLAG_LIB_ID == f"{libtable.POWER_LIBRARY}:PWR_FLAG" == PWR_FLAG
+
+
+# --- q(): exactly sexpdata's escapes, NUL refused ------------------------------
+
+# what sexpdata.dumps (String.quote) escapes, and nothing else
+Q_ESCAPES = {BS: BS + BS, '"': BS + '"', "\b": BS + "b", "\f": BS + "f",
+             "\n": BS + "n", "\r": BS + "r", "\t": BS + "t"}
+
+
+def test_q_escapes_exactly_what_sexpdata_escapes():
+    import sexpdata
+    import sch_build
+    assert dict(sexpdata.String._lisp_quoted_specials) == Q_ESCAPES   # the pinned sexpdata
+    for raw, esc in Q_ESCAPES.items():
+        assert sch_build.q(f"a{raw}b") == f'"a{esc}b"', repr(raw)
+    others = [chr(c) for c in range(1, 0x80) if chr(c) not in Q_ESCAPES] + ["µ", "Ω"]
+    for ch in others:                                 # incl. other control characters
+        assert sch_build.q(ch) == f'"{ch}"', repr(ch)
+    assert sch_build.q(4.7) == '"4.7"'                # str(value)
+
+
+def test_q_docstring_lists_exactly_those_escapes():
+    import sch_build
+    doc = sch_build.q.__doc__
+    for name, esc in [("backslash", BS + BS), ("double quote", BS + '"'), ("backspace", BS + "b"),
+                      ("form feed", BS + "f"), ("newline", BS + "n"),
+                      ("carriage return", BS + "r"), ("tab", BS + "t")]:
+        assert f"{name} -> {esc}" in doc, name
+    assert doc.count(" -> ") == len(Q_ESCAPES)
+    assert "NUL" in doc and "ValueError" in doc
+
+
+def test_q_refuses_nul():
+    import sch_build
+    with pytest.raises(ValueError, match=r"NUL character .* KiCad would read 'A' back"):
+        sch_build.q("A\x00B")
+
+
+def test_a_nul_in_the_netlist_is_a_json_error_and_writes_nothing(tmp_path: Path):
+    design = _synthetic_design()
+    design["components"][1]["value"] = "10k\x00ohm"
+    out = tmp_path / "nul.kicad_sch"
+    build = run_sch_build(_write_netlist(tmp_path / "nul.json", design), out, FIXTURE_SYMBOLS)
+    assert build.proc.returncode == 1
+    assert build.result["ok"] is False
+    assert build.result["error"].startswith("ValueError: NUL character")
+    assert not out.exists()

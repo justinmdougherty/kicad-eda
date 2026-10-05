@@ -4,15 +4,42 @@ test_foreign_import.py; docs/ROADMAP_DECISIONS.md D4, F6).
 * FAKE_CLI: a fake kicad-cli (a Python script behind a .cmd / shell launcher,
   so every call is a REAL subprocess) in three flavours that answer `--help`
   the way KiCad 9.0.4, 10.0.5 and the 10.99 nightly do, and import / convert
-  by writing small KiCad-shaped files, JSON reports and console lines. FAKE_*
-  markers inside an input file steer it (crash, rc=0 with no output, console
-  Error: lines, report errors, a report count that disagrees with the file).
-  Every call is appended to $FAKE_KICAD_LOG as a JSON list.
+  by writing small KiCad-shaped files, JSON reports and console lines (only
+  the nightly flavour writes <stem>-import-fps.pretty and an fp-lib-table, as
+  the real 10.0.5 `pcb import` writes neither; like 10.0.5, the k10 flavour
+  writes <stem>.kicad_dru beside an Eagle input). FAKE_* markers inside an
+  input file steer it: FAKE_CRASH, FAKE_UNKNOWN, FAKE_NO_OUTPUT,
+  FAKE_ERRORS=n (console Error: lines), FAKE_REPORT_ERROR, FAKE_BAD_REPORT
+  (a report that is not JSON), FAKE_BAD_TABLE (an unreadable fp-lib-table),
+  FAKE_FOOTPRINTS=n / FAKE_CLAIM=n (a report count that disagrees with the
+  file), FAKE_SYMBOLS=n, FAKE_FP_EMPTY=n / FAKE_FP_BARE=n (schematic
+  Footprint fields left empty / unqualified), FAKE_ITEMS=n. Every call is
+  appended to $FAKE_KICAD_LOG as a JSON list.
 * STUB_PCBNEW: a stub pcbnew for running swig_load_foreign.py under the venv
-  Python (it records whether kicad_quiet was imported first).
+  Python. It records whether kicad_quiet was imported first, and
+  $STUB_PCBNEW_CFG (JSON: version, copper, footprints, zones=[{layers, net,
+  rule_area}]) makes it a 9.x or 10.x pcbnew with the zones the
+  inner_plane_loss / zones_on_disabled_layers diagnostics read. fake_swig
+  instead replaces the whole swig_load_foreign child by a result line with
+  chosen F46-03a diagnostics (e.g. the exact inner_plane_loss of a real
+  KiCad 9 Altium import).
 * Sample writers for Eagle / Altium / EasyEDA Std / EasyEDA Pro / .PrjPcb
   inputs, and the live-tier fixtures: discovered installs and the real sample
-  files under $KICAD_EDA_FOREIGN_SAMPLES (never downloaded; missing -> skip).
+  files.
+
+Live samples come ONLY from $KICAD_EDA_FOREIGN_SAMPLES (unset or a file
+missing -> the test skips; samples are never downloaded and, being
+third-party CC-BY-SA designs, never committed). Expected layout below it:
+
+    eagle/Qwiic_Button.brd, eagle/Qwiic_Button.sch
+    foreign/altium/eDP_adapter_dvt1.PcbDoc, foreign/altium/power.SchDoc,
+    foreign/altium/it6251_core.SchDoc, foreign/altium/eDP_adapter_dvt1.PrjPcb
+    foreign/easyeda/pcb_watch.json, foreign/easyeda/sch_watch.json
+    foreign/eepro/yuzuki.epro                      (EasyEDA Pro project)
+    foreign/Qwiic_Button-Panel.*                   (Gerbers of the panel)
+    adafruit/Adafruit Feather M0 RFMxx.brd, adafruit/Adafruit Feather M0 RFMxx.sch
+    libs/SparkFun-IC-Memory.lbr, libs/ESP32-WROOM-32.PcbLib,
+    libs/Sensor_Distance.lib, libs/LS2K0300_Footprint.elibz2
 
 Plain factories (not pytest fixtures): each test module wraps the ones it
 needs in its own small fixtures.
@@ -30,12 +57,19 @@ from typing import Callable
 
 import pytest
 
+import foreign_formats as ff
 import kicad_env as env
 
-SAMPLES = Path(os.environ.get(
-    "KICAD_EDA_FOREIGN_SAMPLES",
-    r"C:\Users\justi\AppData\Local\Temp\claude\C--Development-Code-KiCAD-EDA"
-    r"\d91b7fe5-d8bc-48a9-9a21-5c14e63de781\scratchpad\understand"))
+SAMPLES_ENV = "KICAD_EDA_FOREIGN_SAMPLES"
+
+
+def samples_dir() -> Path | None:
+    """$KICAD_EDA_FOREIGN_SAMPLES as a Path; None when it is unset or blank."""
+    root = os.environ.get(SAMPLES_ENV, "").strip()
+    return Path(root) if root else None
+
+
+SAMPLES = samples_dir()          # snapshot at import; sample() re-reads the variable
 
 # ---------------------------------------------------------------------------
 # A fake kicad-cli: flavour k9 | k10 | k11, behaviour driven by FAKE_* markers
@@ -117,9 +151,23 @@ def markers(path):
     return text, dict(re.findall(r"FAKE_(\w+)=(\w+)", text))
 
 
-def report(path, data):
+def report(path, data, text=""):
     if opt("--report-format") == "json":
-        Path(opt("--report-file")).write_text(json.dumps(data), encoding="utf-8")
+        body = "{not json" if "FAKE_BAD_REPORT" in text else json.dumps(data)
+        Path(opt("--report-file")).write_text(body, encoding="utf-8")
+
+
+def import_library(dst, nick, text):
+    """The nightly's library-form footprint library + project fp-lib-table
+    (kicad-cli 10.0.5 `pcb import` writes neither)."""
+    lib = dst.parent / (nick + ".pretty")
+    lib.mkdir(exist_ok=True)
+    (lib / "R_0.kicad_mod").write_text('(footprint "R_0"\n\t(version %d)\n)\n' % FP_VER)
+    table = ("(fp_lib_table (lib (name broken" if "FAKE_BAD_TABLE" in text else
+             '(fp_lib_table\n\t(version 7)\n\t(lib (name "%s") (type "KiCad") (uri '
+             '"${KIPRJMOD}/%s.pretty") (options "kicad_import_cache=1") (descr ""))\n)\n'
+             % (nick, nick))
+    (dst.parent / "fp-lib-table").write_text(table, encoding="utf-8")
 
 
 def pcb_import():
@@ -132,6 +180,8 @@ def pcb_import():
         out("No PCB importer recognizes the file format of '%s'" % src, 3)
     n = int(m.get("FOOTPRINTS", 3))
     nick = src.stem + "-import-fps"
+    if FLAVOR == "k10" and opt("--format") == "eagle":     # 10.0.5: <stem>.kicad_dru by the source
+        src.with_suffix(".kicad_dru").write_text("(version 1)\n", encoding="utf-8")
     for i in range(int(m.get("ERRORS", 0))):
         print("18:00:%02d: Error: Unknown layer %d in footprint" % (i, i), file=sys.stderr)
     if "FAKE_NO_OUTPUT" not in text:
@@ -140,13 +190,8 @@ def pcb_import():
         dst.write_text('(kicad_pcb\n\t(version %d)\n\t(generator "pcbnew")\n'
                        '\t(generator_version "%s")\n%s)\n' % (BOARD_VER, GEN_VER, fps),
                        encoding="utf-8")
-        lib = dst.parent / (nick + ".pretty")
-        lib.mkdir(exist_ok=True)
-        (lib / "R_0.kicad_mod").write_text('(footprint "R_0"\n\t(version %d)\n)\n' % FP_VER)
-        (dst.parent / "fp-lib-table").write_text(
-            '(fp_lib_table\n\t(version 7)\n\t(lib (name "%s") (type "KiCad") (uri '
-            '"${KIPRJMOD}/%s.pretty") (options "kicad_import_cache=1") (descr ""))\n)\n'
-            % (nick, nick), encoding="utf-8")
+        if FLAVOR == "k11":
+            import_library(dst, nick, text)
         print("Successfully saved imported board to '%s'" % dst)
     claimed = int(m.get("CLAIM", n))
     report(dst, {"errors": ["report error"] if "FAKE_REPORT_ERROR" in text else [],
@@ -155,8 +200,16 @@ def pcb_import():
                  "statistics": {"footprints": claimed, "tracks": 7, "vias": 2, "zones": 1},
                  "layer_mapping": {"Top": {"kicad_layer": "F.Cu", "method": "auto"},
                                    "Bottom": {"kicad_layer": "B.Cu", "method": "auto"},
-                                   "tKeepout": {"kicad_layer": "F.CrtYd", "method": "auto"}}})
+                                   "tKeepout": {"kicad_layer": "F.CrtYd", "method": "auto"}}},
+           text)
     sys.exit(0)
+
+
+def footprint_field(i, m, stem):
+    """Footprint field of placed symbol i: FAKE_FP_EMPTY empty ones first, then
+    FAKE_FP_BARE unqualified ones, then '<stem>:R_0603'."""
+    empty, bare = int(m.get("FP_EMPTY", 0)), int(m.get("FP_BARE", 0))
+    return "" if i < empty else "R_0603" if i < empty + bare else stem + ":R_0603"
 
 
 def sch_import():
@@ -169,10 +222,14 @@ def sch_import():
               file=sys.stderr)
     print("16:58:58: Setting schematic symbol 'R1 10k' library identifier to 'x:R'.",
           file=sys.stderr)
+    lib_symbols = ('\t(lib_symbols\n\t\t(symbol "%s-import:R"\n\t\t\t(property "Footprint" "")'
+                   '\n\t\t\t(property "Description" "a (paren) in a string")\n\t\t)\n\t)\n'
+                   % dst.stem)
     syms = "".join('\t(symbol\n\t\t(lib_id "%s-import:R")\n\t\t(property "Footprint" '
-                   '"%s:R_0603")\n\t)\n' % (dst.stem, dst.stem) for _ in range(n))
-    dst.write_text('(kicad_sch\n\t(version 20260830)\n\t(generator "eeschema")\n%s)\n' % syms,
-                   encoding="utf-8")
+                   '"%s")\n\t)\n' % (dst.stem, footprint_field(i, m, dst.stem))
+                   for i in range(n))
+    dst.write_text('(kicad_sch\n\t(version 20260830)\n\t(generator "eeschema")\n%s%s)\n'
+                   % (lib_symbols, syms), encoding="utf-8")
     sheets = 1
     if opt("--format") == "easyedapro":
         (dst.parent / "1_POWER.kicad_sch").write_text(
@@ -231,11 +288,21 @@ VERSIONS = {"k9": ("9.0.4", (9, 0, 4)), "k10": ("10.0.5", (10, 0, 5)),
             "k11": ("10.99.0-4025-gfake", (10, 99, 0))}
 
 STUB_PCBNEW = '''\
+import json
 import os
 import sys
 
 QUIET_FIRST = "kicad_quiet" in sys.modules
 CALLS = os.environ.get("STUB_PCBNEW_CALLS")
+CFG = json.loads(os.environ.get("STUB_PCBNEW_CFG") or "{}")
+VERSION = CFG.get("version", "9.0.4")
+K10 = not VERSION.startswith("9.")
+F_Cu, B_Cu, Eco1_User = 0, 2, 21
+NAMES = {0: "F.Cu", 2: "B.Cu", 21: "Eco1.User"}
+for _k in range(1, 31):
+    globals()["In%d_Cu" % _k] = 2 * _k + 2
+    NAMES[2 * _k + 2] = "In%d.Cu" % _k
+IDS = {name: layer for layer, name in NAMES.items()}
 
 
 def _log(*parts):
@@ -244,8 +311,17 @@ def _log(*parts):
             f.write(" ".join(str(p) for p in parts) + "\\n")
 
 
-class PCB_IO_MGR:
-    KICAD_SEXP, ALTIUM_DESIGNER, EAGLE, EASYEDA, EASYEDAPRO = 1, 5, 7, 8, 9
+class PCB_IO_MGR:                       # 10.0 inserted ALLEGRO=3 and shifted the rest
+    KICAD_SEXP = 1
+    ALTIUM_DESIGNER, EAGLE, EASYEDA, EASYEDAPRO = (6, 8, 9, 10) if K10 else (5, 7, 8, 9)
+
+
+def Version():
+    return VERSION
+
+
+def IsCopperLayer(layer):
+    return layer in (0, 2) or (4 <= layer <= 62 and layer % 2 == 0)
 
 
 class _Item:
@@ -256,9 +332,35 @@ class _Item:
         return self._cls
 
 
-class _Board:
+class _LSet:
+    def __init__(self, layers):
+        self._layers = layers
+
+    def Seq(self):
+        return tuple(self._layers)
+
+
+class _Zone:
+    def __init__(self, spec):
+        self._spec = spec
+
+    def GetIsRuleArea(self):
+        return bool(self._spec.get("rule_area"))
+
+    def GetLayerSet(self):
+        return _LSet([IDS[name] for name in self._spec["layers"]])
+
+    def GetNetname(self):
+        return self._spec.get("net", "")
+
+
+class BOARD:
     def __init__(self, n):
         self.n = n
+
+    @staticmethod
+    def GetStandardLayerName(layer):
+        return NAMES[layer]
 
     def GetFootprints(self):
         return [object()] * self.n
@@ -270,14 +372,13 @@ class _Board:
         return 7
 
     def GetAreaCount(self):
-        return 1
+        return len(CFG.get("zones", []))
 
     def GetCopperLayerCount(self):
-        return 2
+        return CFG.get("copper", 2)
 
-
-def Version():
-    return "9.0.4"
+    def Zones(self):
+        return [_Zone(z) for z in CFG.get("zones", [])]
 
 
 def LoadBoard(path, kind=None):
@@ -288,15 +389,16 @@ def LoadBoard(path, kind=None):
     if "FAKE_RAISE" in text:
         raise OSError("Error: cannot read the board file")
     print("12:00:00: Altium layer Internal Plane 1 has no KiCad equivalent.", file=sys.stderr)
-    return _Board(5)
+    return BOARD(CFG.get("footprints", 5))
 
 
 def SaveBoard(path, board):
     _log("SaveBoard", os.path.basename(path))
     fps = "".join('\\t(footprint "lib:F%d"\\n\\t)\\n' % i for i in range(board.n))
+    version, generator = ("20260206", "10.0") if K10 else ("20241229", "9.0")
     with open(path, "w", encoding="utf-8") as f:
-        f.write('(kicad_pcb\\n\\t(version 20241229)\\n\\t(generator "pcbnew")\\n'
-                '\\t(generator_version "9.0")\\n' + fps + ')\\n')
+        f.write('(kicad_pcb\\n\\t(version %s)\\n\\t(generator "pcbnew")\\n'
+                '\\t(generator_version "%s")\\n' % (version, generator) + fps + ')\\n')
     with open(path[:-len(".kicad_pcb")] + ".kicad_pro", "w", encoding="utf-8") as f:
         f.write("{}")
     return True
@@ -338,14 +440,50 @@ def work_calls(log: Path, *words: str) -> list[list[str]]:
 
 def stub_pcbnew_python(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     """(python, calls log): the venv Python with a stub pcbnew on PYTHONPATH
-    (children inherit it); the stub appends its LoadBoard/SaveBoard calls."""
+    (children inherit it); the stub appends its LoadBoard/SaveBoard calls.
+    It is a pcbnew 9.0.4 with a 2-layer board and no zones until
+    configure_stub() says otherwise."""
     stub = tmp_path / "stub_pcbnew"
     stub.mkdir()
     (stub / "pcbnew.py").write_text(STUB_PCBNEW, encoding="utf-8")
     calls = tmp_path / "pcbnew_calls.txt"
     monkeypatch.setenv("PYTHONPATH", str(stub))
     monkeypatch.setenv("STUB_PCBNEW_CALLS", str(calls))
+    monkeypatch.delenv("STUB_PCBNEW_CFG", raising=False)
     return Path(sys.executable), calls
+
+
+def configure_stub(monkeypatch: pytest.MonkeyPatch, **cfg: object) -> None:
+    """Steer the stub pcbnew of the next children: version ("9.0.4" | "10.0.5"),
+    copper (layer count), footprints, zones ([{layers, net, rule_area}])."""
+    monkeypatch.setenv("STUB_PCBNEW_CFG", json.dumps(cfg))
+
+
+def read_stub_calls(calls: Path) -> str:
+    return calls.read_text(encoding="utf-8") if calls.is_file() else ""
+
+
+def fake_swig(monkeypatch: pytest.MonkeyPatch, write_board: bool = True,
+              **result: object) -> None:
+    """Replace the swig_load_foreign.py child (foreign_formats.run_child) by
+    one that prints the script's result line with `result` (the F46-03a
+    fields, e.g. inner_plane_loss) and writes a D0 board unless told not to;
+    every other child still runs for real."""
+    real_run = ff.run_child
+
+    def run(argv, timeout_s, cwd=None):
+        if not str(argv[1]).endswith("swig_load_foreign.py"):
+            return real_run(argv, timeout_s, cwd)
+        if write_board:
+            Path(argv[3]).write_text('(kicad_pcb\n\t(version 20241229)\n\t(generator "pcbnew")\n'
+                                     '\t(generator_version "9.0")\n)\n', encoding="utf-8")
+        line = {"ok": True, "plugin": argv[4], "input": argv[2], "output": argv[3],
+                "pcbnew": "9.0.4", "footprints": 0, "tracks": 0, "vias": 0, "nets": 0,
+                "zones": 0, "copper_layers": 4, "importer_side_files": [],
+                "zones_on_disabled_layers": {}, "inner_plane_loss": None, **result}
+        return env.ProbeResult(0, json.dumps(line) + "\n", "")
+
+    monkeypatch.setattr(ff, "run_child", run)
 
 
 def fake_installer(tmp_path: Path) -> Callable[..., env.KiCadInstall]:
@@ -436,7 +574,12 @@ def kicad9_install(installs: list[env.KiCadInstall]) -> env.KiCadInstall:
 
 
 def sample(*parts: str) -> Path:
-    path = SAMPLES.joinpath(*parts)
+    """A sample file under $KICAD_EDA_FOREIGN_SAMPLES (layout: module docstring);
+    skips when the variable is unset or the file is missing."""
+    root = samples_dir()
+    if root is None:
+        pytest.skip(f"${SAMPLES_ENV} is not set (sample files are never downloaded by tests)")
+    path = root.joinpath(*parts)
     if not path.is_file():
         pytest.skip(f"sample file missing (never downloaded by tests): {path}")
     return path

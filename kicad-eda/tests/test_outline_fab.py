@@ -225,6 +225,7 @@ def test_validate_fab_narrow_slot_is_an_error():
     slot = next(p for p in probs if p["rule"] == "slot_width")
     assert slot["severity"] == "error" and math.isclose(slot["value"], 0.8, abs_tol=1e-6)
     assert slot["limit"] == 1.0 and "1 mm minimum non-plated slot" in slot["message"]
+    assert "NPTH" not in slot["message"]           # two arcs on different centres: a slot
     corners = [p for p in probs if p["rule"] == "internal_corner_radius"]
     assert all(math.isclose(p["value"], 0.4) for p in corners)
 
@@ -233,6 +234,146 @@ def test_validate_fab_tiny_round_cutout_should_be_a_drill():
     o = ol.from_board_block({"w": 40, "h": 30, "cutouts": [{"circle": [20, 15, 0.4]}]})
     (p,) = ol.validate_fab(o)
     assert p["rule"] == "slot_width" and math.isclose(p["value"], 0.8) and "NPTH" in p["message"]
+
+
+def board_with(cutout: dict) -> ol.Outline:
+    return ol.from_board_block({"w": 40, "h": 30, "cutouts": [cutout]})
+
+
+def summary(probs: list[dict]) -> list[tuple]:
+    return [(p["rule"], p["severity"], round(p["value"], 3)) for p in probs]
+
+
+TAN30 = math.tan(math.pi / 6)                       # bulge of a 120 degree arc
+
+
+@pytest.mark.parametrize("loop", [
+    [[19.6, 15, 1.0], [20.4, 15, 1.0]],             # the DXF LWPOLYLINE circle: two halves
+    [[20, 15.4, -1.0], [20, 14.6, -1.0]],           # the same, drawn the other way round
+    [[20.4, 15, TAN30], [19.8, 15 + 0.4 * math.sin(math.pi / 3), TAN30],
+     [19.8, 15 - 0.4 * math.sin(math.pi / 3), TAN30]],
+])
+def test_validate_fab_round_hole_drawn_as_arcs_is_judged_as_a_circle(loop: list) -> None:
+    # a ring of arcs on one centre and radius is a round hole, however it is
+    # split: the NPTH hint, and no 'internal arc tighter than the bit' warnings
+    circle = ol.validate_fab(board_with({"circle": [20, 15, 0.4]}))
+    assert ol.validate_fab(board_with({"loop": loop})) == circle
+    assert summary(circle) == [("slot_width", "error", 0.8)]
+
+
+def test_validate_fab_web_beside_a_round_hole_drawn_as_arcs() -> None:
+    circle = ol.validate_fab(board_with({"circle": [5, 15, 4.5]}))
+    arcs = ol.validate_fab(board_with({"loop": [[0.5, 15, 1.0], [9.5, 15, 1.0]]}))
+    assert summary(arcs) == summary(circle) == [("feature_width", "warning", 0.5)]
+    assert arcs[0]["at"] == pytest.approx(circle[0]["at"], abs=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# zero-angle cusps: a vertex where the ring doubles back on itself (the turn
+# there is +-180 degrees, its sign float noise). One error each, and the
+# vertex takes no part in the corner, cone and ray-width math.
+# ---------------------------------------------------------------------------
+def bitten_slot(cx: float, cy: float, a: float, length: float = 4.0,
+                width: float = 0.8) -> ol.Loop:
+    """A length x width slot along angle `a` whose two ends are material bumps
+    of diameter `width` (bulge -1 halves): its 4 corners are void cusps."""
+    ux, uy = math.cos(a), math.sin(a)
+    nx, ny = -uy, ux
+    corners = [(cx + su * ux * length / 2 + sn * nx * width / 2,
+                cy + su * uy * length / 2 + sn * ny * width / 2)
+               for su, sn in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+    return ol.Loop(tuple((x, y, b) for (x, y), b in zip(corners, (0.0, -1.0, 0.0, -1.0),
+                                                         strict=True)))
+
+
+def assert_sane(o: ol.Outline, probs: list[dict]) -> None:
+    """No infinite value or 'inf' text; a void width is measured in the void,
+    a material width on the board."""
+    for p in probs:
+        assert math.isfinite(p["value"]) and "inf" not in p["message"], p
+        if p["rule"] == "slot_width":
+            assert not ol.contains(o, tuple(p["at"])), p
+        if p["rule"] == "feature_width":
+            assert ol.contains(o, tuple(p["at"])), p
+
+
+def test_validate_fab_cusps_are_one_error_each_at_any_rotation() -> None:
+    frame = ol.Loop(((0, 0), (40, 0), (40, 30), (0, 30)))
+    cases = [((20, 15), a) for a in (0.0, 0.19, 0.5, 1.0, math.pi / 2)]
+    cases += [((20, 2), a) for a in (0.0, 0.19)]          # the review's repro, near the edge
+    reports = []
+    for (cx, cy), a in cases:
+        o = ol.check(ol.Outline(frame, (bitten_slot(cx, cy, a),)))
+        probs = ol.validate_fab(o)
+        assert_sane(o, probs)
+        assert not [p for p in probs if p["rule"] == "slot_width" and "outline" in p["message"]]
+        reports.append(summary(probs))
+    assert all(r == reports[0] for r in reports), dict(zip(cases, reports, strict=True))
+    assert reports[0] == [("cusp", "error", 0.0)] * 4 + [("slot_width", "error", 0.8)]
+
+
+def rotated(loop: list[tuple], a: float, c: tuple = (20.0, 15.0)) -> ol.Loop:
+    ca, sa = math.cos(a), math.sin(a)
+    return ol.Loop(tuple((c[0] + (x - c[0]) * ca - (y - c[1]) * sa,
+                          c[1] + (x - c[0]) * sa + (y - c[1]) * ca, b) for x, y, b in loop))
+
+
+@pytest.mark.parametrize("bump, expected", [
+    (1.0, [("cusp", "error", 0.0)] * 2 + [("slot_width", "error", 0.8)]),     # bitten end
+    (-1.0, [("internal_corner_radius", "warning", 0.4), ("slot_width", "error", 0.8)]),
+])
+def test_validate_fab_notch_end_cusps_on_the_outline_at_any_rotation(
+        bump: float, expected: list) -> None:
+    # a 0.8 mm notch from the board edge; its end a material bump (two cusps)
+    # or a round void end (an R0.4 internal arc)
+    notch = [(0, 0, 0), (19.6, 0, 0), (19.6, 4, bump), (20.4, 4, 0), (20.4, 0, 0), (40, 0, 0),
+             (40, 30, 0), (0, 30, 0)]
+    for a in (0.0, 0.19, 0.5, 1.0, math.pi / 2):
+        o = ol.check(ol.Outline(rotated(notch, a)))
+        probs = ol.validate_fab(o)
+        assert_sane(o, probs)
+        assert summary(probs) == expected, a
+
+
+def test_validate_fab_cusp_problem_names_the_vertex_like_inset_does() -> None:
+    o = ol.check(ol.Outline(ol.Loop(((0, 0), (40, 0), (40, 30), (0, 30))),
+                            (bitten_slot(20, 15, 0.0),)))
+    cusps = [p for p in ol.validate_fab(o) if p["rule"] == "cusp"]
+    assert {tuple(p["at"]) for p in cusps} == {(18, 14.6), (22, 14.6), (22, 15.4), (18, 15.4)}
+    for p in cusps:
+        assert p["message"].startswith("cutout 1 doubles back on itself at (")
+        assert "zero-angle" in p["message"] and p["source"] and not p["assumption"]
+    with pytest.raises(ol.OutlineError, match="doubles back on itself"):
+        ol.inset(o, 0.3)
+
+
+# fuzz case 36 of the wave-1 review: cutout 4 is a bitten slot; the old cone
+# test measured a 'slot' across the material between it and the outline
+CASE_36 = {
+    "outer": [[21.287561011832413, 8.199016006961639, 0.0],
+              [25.952001499895623, 25.59087382080922, 0.7287032658050812],
+              [18.930325872772844, 29.600262185349706, 0.75703575146486]],
+    "cutouts": [[23.089685373842656, 24.004615287810708, 1.5566712880945586],
+                [[15.852376614097496, 22.568531278000545, 0.0],
+                 [17.976864686770863, 21.55809766363708, -1.0],
+                 [17.698004839336445, 20.97178064943606, 0.0],
+                 [15.573516766663081, 21.982214263799523, -1.0]],
+                [15.634462654347727, 16.876710826923407, 0.9445290675693143],
+                [[14.183740803848888, 24.52445072989637, 0.0],
+                 [17.87492756335723, 25.226063514067707, 1.0],
+                 [18.026082209664896, 24.430838510082072, 0.0],
+                 [14.334895450156555, 23.729225725910734, 1.0]]]}
+
+
+def test_validate_fab_fuzz_case_36_measures_no_slot_across_material() -> None:
+    cuts = tuple(ol.Loop(tuple(map(tuple, c))) if isinstance(c[0], list) else ol.Circle(*c)
+                 for c in CASE_36["cutouts"])
+    o = ol.check(ol.Outline(ol.Loop(tuple(map(tuple, CASE_36["outer"]))), cuts))
+    probs = ol.validate_fab(o)
+    assert_sane(o, probs)
+    assert not [p for p in probs if p["rule"] == "slot_width" and "outline" in p["message"]]
+    cusps = [p for p in probs if p["rule"] == "cusp"]
+    assert len(cusps) == 4 and all(p["message"].startswith("cutout 4 ") for p in cusps)
 
 
 def test_validate_fab_notch_from_the_edge():

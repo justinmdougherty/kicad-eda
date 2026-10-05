@@ -15,6 +15,9 @@ Invariants an ``Outline`` keeps (``__post_init__`` enforces the orientation):
     ``Circle``. Rings are stored as given (after orientation); validity
     (simple rings, cutouts inside and disjoint) is checked by ``check()``,
     which every public constructor in outline.py calls.
+  * every primitive's bbox is computed once per Outline (``Outline.boxes``)
+    and shared by bbox(), PrimIndex and the validity checks, which test only
+    nearby primitive pairs (DXF outlines carry thousands of segments).
 """
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ import math
 import sys
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 
 _HERE = str(Path(__file__).resolve().parent)
@@ -35,8 +39,10 @@ from outline_geom import (BULGE_EPS, EPS, TAU, Arc, Line, Point, Prim, add,  # n
 
 CHORD_ERROR_MM = 0.05      # max chord error when an arc is flattened for math
 TOUCH_TOL_MM = 1e-6        # a point this close to an edge is ON the edge
+_BOX_TOL_MM = 1e-7         # bboxes this close count as touching (validity checks)
 
 Vertex = tuple[float, float, float]
+Box = tuple[float, float, float, float]          # x0, y0, x1, y1
 
 
 class OutlineError(ValueError):
@@ -136,7 +142,8 @@ def _oriented(ring: Ring, ccw: bool, what: str) -> Ring:
         return ring
     a = ring_signed_area(ring)
     if abs(a) <= 1e-12:
-        crossings = _self_crossings(ring_prims(ring))
+        prims = ring_prims(ring)
+        crossings = _self_crossings(_Ring(prims, tuple(prim_bbox(p) for p in prims)))
         why = "".join(f"; edges {i} and {j} intersect at {_fmt(x)}" for i, j, x in crossings[:3])
         raise OutlineError(f"{what} encloses no area{why}")
     return ring if (a > 0) == ccw else ring.reversed()
@@ -166,6 +173,12 @@ class Outline:
         object.__setattr__(self, "rings", (ring_prims(outer, True),)
                            + tuple(ring_prims(c, False) for c in cutouts))
 
+    @cached_property
+    def boxes(self) -> tuple[tuple[Box, ...], ...]:
+        """prim_bbox of every primitive, ring by ring like `rings`; computed on
+        first use, once per Outline."""
+        return tuple(tuple(prim_bbox(p) for p in prims) for prims in self.rings)
+
 
 def ring_name(k: int) -> str:
     return "outline" if k == 0 else f"cutout {k}"
@@ -185,11 +198,14 @@ def all_prims(o: Outline) -> Iterator[tuple[int, int, Prim]]:
             yield k, i, p
 
 
-def bbox(o: Outline) -> tuple[float, float, float, float]:
-    """(x0, y0, x1, y1) of the outer ring, arcs exact."""
-    boxes = [prim_bbox(p) for p in o.rings[0]]
+def _union(boxes: Sequence[Box]) -> Box:
     return (min(b[0] for b in boxes), min(b[1] for b in boxes),
             max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def bbox(o: Outline) -> tuple[float, float, float, float]:
+    """(x0, y0, x1, y1) of the outer ring, arcs exact."""
+    return _union(o.boxes[0])
 
 
 def area(o: Outline) -> float:
@@ -201,11 +217,19 @@ class PrimIndex:
     """Uniform-grid bucket index of primitives (by bbox), so a query near a
     point or along a short ray looks at a few primitives instead of all of
     them (DXF outlines can carry thousands of segments). `source` is an
-    Outline (items (ring, index, prim)) or any iterable of (key, key, prim)."""
+    Outline (items (ring, index, prim), its cached bboxes; `boxes` is ignored)
+    or any iterable of (key, key, prim) with, optionally, their `boxes`."""
 
-    def __init__(self, source: Outline | Iterable[tuple[int, int, Prim]]) -> None:
-        items = list(all_prims(source) if isinstance(source, Outline) else source)
-        boxes = [prim_bbox(p) for _k, _i, p in items]
+    def __init__(self, source: Outline | Iterable[tuple[int, int, Prim]],
+                 boxes: Sequence[Box] | None = None) -> None:
+        if isinstance(source, Outline):
+            items = list(all_prims(source))
+            boxes = [b for ring in source.boxes for b in ring]
+        else:
+            items = list(source)
+            boxes = [prim_bbox(p) for _k, _i, p in items] if boxes is None else list(boxes)
+        if len(boxes) != len(items):
+            raise ValueError(f"{len(items)} primitives but {len(boxes)} bboxes")
         x0 = min((b[0] for b in boxes), default=0.0)
         y0 = min((b[1] for b in boxes), default=0.0)
         x1 = max((b[2] for b in boxes), default=0.0)
@@ -214,7 +238,7 @@ class PrimIndex:
         self.cell = max(x1 - x0, y1 - y0, 1e-6) / self.per_axis
         self.x0, self.y0 = x0, y0
         self.buckets: dict[tuple[int, int], list[tuple[int, int, Prim]]] = {}
-        for item, box in zip(items, boxes):
+        for item, box in zip(items, boxes, strict=True):
             for key in self._cells(box):
                 self.buckets.setdefault(key, []).append(item)
 
@@ -300,7 +324,7 @@ def _edge_stays_inside(o: Outline, seg: Line) -> bool:
             ts.add(closest_point(seg, x)[2])
     ts_sorted = sorted(ts)
     return all(contains(o, seg.point_at((t0 + t1) / 2.0))
-               for t0, t1 in zip(ts_sorted, ts_sorted[1:]) if t1 - t0 > 1e-12)
+               for t0, t1 in zip(ts_sorted, ts_sorted[1:], strict=False) if t1 - t0 > 1e-12)
 
 
 def contains_polygon(o: Outline, points: Sequence[Sequence[float]],
@@ -413,66 +437,132 @@ def ray_to_edge(o: Outline, p: Point, direction: Point, skip: float = 0.0) -> Ed
 
 
 # --- validity ----------------------------------------------------------------------
-def _boxes_touch(a: tuple, b: tuple, tol: float = 1e-7) -> bool:
+def _boxes_touch(a: tuple, b: tuple, tol: float = _BOX_TOL_MM) -> bool:
     return a[0] <= b[2] + tol and b[0] <= a[2] + tol and a[1] <= b[3] + tol and b[1] <= a[3] + tol
 
 
-def _self_crossings(prims: Sequence[Prim]) -> list[tuple[int, int, Point]]:
-    n = len(prims)
-    boxes = [prim_bbox(p) for p in prims]
-    order = sorted(range(n), key=lambda i: boxes[i][0])
+def _padded(box: Sequence[float], t: float = _BOX_TOL_MM) -> Box:
+    return (box[0] - t, box[1] - t, box[2] + t, box[3] + t)
+
+
+@dataclass(frozen=True, eq=False)
+class _Ring:
+    """A ring for the validity checks: its primitives and their bboxes (the
+    Outline's), and on first use its bbox and a PrimIndex of its primitives,
+    so every query below looks at nearby primitives only."""
+    prims: tuple[Prim, ...]
+    boxes: tuple[Box, ...]
+
+    @cached_property
+    def box(self) -> Box:
+        return _union(self.boxes)
+
+    @cached_property
+    def index(self) -> PrimIndex:
+        return PrimIndex(((0, i, p) for i, p in enumerate(self.prims)), self.boxes)
+
+    def near(self, box: Box) -> list[int]:
+        """Indices, ascending, of the primitives whose bbox touches `box`."""
+        return sorted(i for _k, i, _p in self.index.near(_padded(box))
+                      if _boxes_touch(self.boxes[i], box))
+
+    def contains(self, q: Point) -> bool:
+        """_ring_contains(prims, q), summed over the primitives whose bbox
+        meets the ray from q towards +X: no other primitive can cross it."""
+        ray = _padded((q[0], q[1], max(q[0], self.box[2]), q[1]))
+        return sum(crossings_right(p, q) for _k, _i, p in self.index.near(ray)) % 2 == 1
+
+
+def _self_crossings(ring: _Ring) -> list[tuple[int, int, Point]]:
+    """(i, j, point) for each pair of the ring's primitives that meet other
+    than at their shared vertex, in the order of a sweep by bbox x0. The
+    candidate pairs (bboxes touching) come from the ring's PrimIndex, so a
+    long run of segments at one x (a split vertical edge) costs no more than
+    any other."""
+    prims, boxes, n = ring.prims, ring.boxes, len(ring.prims)
+    rank = {i: pos for pos, i in enumerate(sorted(range(n), key=lambda i: boxes[i][0]))}
+    pairs = sorted((rank[i], rank[j], i, j) for i in range(n) for j in ring.near(boxes[i])
+                   if rank[j] > rank[i])
     found = []
-    for a_pos, i in enumerate(order):
-        for j in order[a_pos + 1:]:
-            if boxes[j][0] > boxes[i][2] + 1e-7:
-                break
-            if not _boxes_touch(boxes[i], boxes[j]):
-                continue
-            lo, hi = min(i, j), max(i, j)
-            shared = []
-            if hi == lo + 1:
-                shared.append(prims[lo].end)
-            if lo == 0 and hi == n - 1:
-                shared.append(prims[hi].end)
-            for x in intersections(prims[lo], prims[hi]):
-                if all(dist(x, s) > 1e-6 for s in shared):
-                    found.append((lo, hi, x))
-                    break
+    for _ri, _rj, i, j in pairs:
+        lo, hi = min(i, j), max(i, j)
+        shared = [prims[lo].end] if hi == lo + 1 else []
+        if lo == 0 and hi == n - 1:
+            shared.append(prims[hi].end)
+        x = next((x for x in intersections(prims[lo], prims[hi])
+                  if all(dist(x, s) > 1e-6 for s in shared)), None)
+        if x is not None:
+            found.append((lo, hi, x))
     return found
 
 
-def _rings_cross(a: Sequence[Prim], b: Sequence[Prim]) -> Point | None:
-    for p in a:
-        bp = prim_bbox(p)
-        for q in b:
-            if _boxes_touch(bp, prim_bbox(q)):
-                xs = intersections(p, q)
-                if xs:
-                    return xs[0]
+def _pair_crossing(p: Prim, bp: Box, q: Prim, bq: Box) -> Point | None:
+    """The first point where p and q (primitives of two different rings, with
+    their bboxes bp / bq) meet, None when they do not: one pair test."""
+    if not _boxes_touch(bp, bq):
+        return None
+    xs = intersections(p, q)
+    return xs[0] if xs else None
+
+
+def _rings_cross(a: _Ring, b: _Ring) -> Point | None:
+    """The first point where rings a and b meet, in the order an all-pairs
+    scan (a's primitives outside, b's inside) finds it; None when they do not.
+    Only the primitive pairs whose bboxes touch are tested, found through the
+    rings' PrimIndexes, so far-apart rings cost no pair test at all."""
+    for i in a.near(b.box):
+        for j in b.near(a.boxes[i]):
+            x = _pair_crossing(a.prims[i], a.boxes[i], b.prims[j], b.boxes[j])
+            if x is not None:
+                return x
     return None
+
+
+def _touching_cutouts(rings: Sequence[_Ring]) -> list[list[int]]:
+    """For each ring k, the cutouts m > k whose bbox touches k's, ascending.
+    The cutout bboxes are indexed like primitives: cutouts that are apart
+    are never paired, and nothing else about them is compared."""
+    index = PrimIndex(((k, 0, r.prims[0]) for k, r in enumerate(rings) if k),
+                      [r.box for r in rings[1:]])
+    return [[] if k == 0 else
+            sorted(m for m, _i, _p in index.near(_padded(r.box))
+                   if m > k and _boxes_touch(r.box, rings[m].box))
+            for k, r in enumerate(rings)]
+
+
+def _cutout_vs_outline(outer: _Ring, ring: _Ring, k: int) -> list[str]:
+    start = ring.prims[0].start
+    if _boxes_touch(outer.box, ring.box):
+        x = _rings_cross(outer, ring)
+        if x is not None:
+            return [f"{ring_name(k)} crosses the outline at {_fmt(x)}"]
+        if outer.contains(start):
+            return []
+    return [f"{ring_name(k)} lies outside the outline (at {_fmt(start)})"]
+
+
+def _cutouts_overlap(a: _Ring, b: _Ring, k: int, m: int) -> list[str]:
+    """Cutouts k and m (rings a, b, whose bboxes touch) cross or nest."""
+    x = _rings_cross(a, b)
+    if x is None and not (a.contains(b.prims[0].start) or b.contains(a.prims[0].start)):
+        return []
+    where = _fmt(x) if x is not None else "one inside the other"
+    return [f"{ring_name(k)} and {ring_name(m)} overlap ({where})"]
 
 
 def geometry_problems(o: Outline) -> list[str]:
     """Why the outline is not a valid board (empty when it is): a ring crosses
-    itself, a cutout crosses or lies outside the outline, cutouts overlap."""
-    problems = []
-    for k, prims in enumerate(o.rings):
-        for i, j, x in _self_crossings(prims):
-            problems.append(f"{ring_name(k)}: edges {i} and {j} intersect at {_fmt(x)}")
-    for k in range(1, len(o.rings)):
-        ring = o.rings[k]
-        x = _rings_cross(o.rings[0], ring)
-        if x is not None:
-            problems.append(f"{ring_name(k)} crosses the outline at {_fmt(x)}")
-        elif not _ring_contains(o.rings[0], ring[0].start):
-            problems.append(f"{ring_name(k)} lies outside the outline (at {_fmt(ring[0].start)})")
-        for m in range(k + 1, len(o.rings)):
-            x = _rings_cross(ring, o.rings[m])
-            nested = (_ring_contains(ring, o.rings[m][0].start)
-                      or _ring_contains(o.rings[m], ring[0].start))
-            if x is not None or nested:
-                where = _fmt(x) if x is not None else "one inside the other"
-                problems.append(f"{ring_name(k)} and {ring_name(m)} overlap ({where})")
+    itself, a cutout crosses or lies outside the outline, cutouts overlap.
+    Every comparison goes through bboxes and PrimIndexes: rings whose bboxes
+    are apart are never compared, and primitives only with their neighbours."""
+    rings = [_Ring(prims, boxes) for prims, boxes in zip(o.rings, o.boxes, strict=True)]
+    problems = [f"{ring_name(k)}: edges {i} and {j} intersect at {_fmt(x)}"
+                for k, r in enumerate(rings) for i, j, x in _self_crossings(r)]
+    touching = _touching_cutouts(rings)
+    for k in range(1, len(rings)):
+        problems += _cutout_vs_outline(rings[0], rings[k], k)
+        for m in touching[k]:
+            problems += _cutouts_overlap(rings[k], rings[m], k, m)
     return problems
 
 

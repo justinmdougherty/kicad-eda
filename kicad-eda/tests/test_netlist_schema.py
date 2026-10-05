@@ -1,13 +1,16 @@
 """netlist_schema — the netlist.json JSON Schema contract and validate().
 
 Covers: every example netlist (and the regression-suite variants derived from
-them) validates clean; every roadmap key of docs/ROADMAP_DECISIONS.md D1-D5 has
-positive and negative cases; error strings carry the JSON path.
+them) validates clean; every roadmap key of docs/ROADMAP_DECISIONS.md D1-D5 (and
+the F3/F4 additions: edge, panel_cutouts, dnp, in_bom, source provenance files,
+variant, blocks) has positive and negative cases; error strings carry the JSON
+path; the docs/PIPELINE.md section-2 examples validate literally.
 """
 from __future__ import annotations
 
 import copy
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +24,8 @@ EXAMPLES = ROOT / "examples"
 EXAMPLE_NAMES = sorted(p.parent.name for p in EXAMPLES.glob("*/netlist.json"))
 
 SHA = "0123456789abcdef" * 4
+# source keys naming a file next to the netlist (D1 path rule)
+SOURCE_PATHS = ("reference", "erc_baseline", "drc_baseline", "import_report", "via", "board")
 
 
 def _full_design() -> dict:
@@ -37,28 +42,38 @@ def _full_design() -> dict:
             "outline": {"loop": [[0, 0], [60, 0], [60, 40, 0.4142], [0, 40]]},
             "cutouts": [{"loop": [[20, 10], [30, 10, 1.0], [30, 20], [20, 20, 1.0]]},
                         {"circle": [45.0, 20.0, 1.6]}],
-            "datum": [30.0, 20.0],
+            "datum": [30.0, 20.0], "panel_cutouts": True,
             "auto_x": 4.0, "auto_y": 4.0, "auto_w": 30.0, "auto_h": 30.0},
         "components": [
             {"ref": "U1", "lib_id": "SPS_parts:LG290P", "value": "LG290P",
              "footprint": "SPS_parts:LGA-79_12.2x16.0mm", "at": [30.0, 20.0, 90]},
             {"ref": "C1", "lib_id": "Device:C", "value": "100nF",
              "footprint": "Capacitor_SMD:C_0603_1608Metric", "side": "B",
-             "at": [25.0, 20.0, 180.0]},
+             "at": [25.0, 20.0, 180.0], "dnp": True},
             {"ref": "H1", "footprint": "MountingHole:MountingHole_3.2mm_M3",
              "board_only": True, "at": [3.5, 3.5, 0]},
             {"ref": "R1", "lib_id": "Device:R", "value": "10k",
-             "footprint": "Resistor_SMD:R_0603_1608Metric"},
+             "footprint": "Resistor_SMD:R_0603_1608Metric", "in_bom": False},
             {"ref": "J1", "lib_id": "Connector:USB_C_Receptacle", "value": "USB-C",
              "footprint": "Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A",
-             "x": 10.0, "y": 2.0, "rot": 0},
+             "x": 10.0, "y": 2.0, "rot": 0, "edge": "left"},
         ],
         "nets": {"GND": [["U1", "10"], ["C1", "2"], ["R1", 2]],
                  "+3V3": [["U1", "1"], ["C1", "1"], ["R1", "1"]]},
         "no_connect": [["U1", "5"]],
         "source": {"kind": "kicad", "path": "orig/sps_node.kicad_pcb",
-                   "sha256": SHA, "tool": "kicad-cli 10.99.0-4025"},
+                   "sha256": SHA, "tool": "kicad-cli 10.99.0-4025",
+                   "reference": "reference_padnets.json", "erc_baseline": "source_erc.json",
+                   "drc_baseline": "source_drc.json", "import_report": "import_report.json",
+                   "via": "_foreign/sps_node.kicad_pro", "files": {"sps_node.brd": SHA},
+                   "board": "orig/sps_node.kicad_pcb", "copper": "carry"},
         "rebuild": "keep",
+        "variant": {"mode": "keep", "from": "../import/netlist.json",
+                    "dropped_refs": ["LOGO1"], "holes": "source"},
+        "blocks": [{"name": "GNSS", "rebuild": "reflow",
+                    "source": {"kind": "kicad", "path": "blocks/gnss.kicad_pcb"},
+                    "ref_map": {"U1": "U1", "C1": "C1"}, "net_map": {"VCC": "+3V3"},
+                    "drop_refs": ["J2"]}],
         "assumptions": [
             {"id": "A1", "topic": "input supply", "value": "5 V USB-C",
              "rationale": "the napkin says USB powered", "confidence": "med",
@@ -95,7 +110,7 @@ def test_component_schema_types_every_known_key():
     props = ns.SCHEMA["$defs"]["component"]["properties"]
     consumed = {"ref", "lib_id", "value", "footprint", "x", "y", "rot", "side",
                 "interior", "edge_row", "overhang", "height", "thermal",
-                "rds_mohm", "lcsc", "mpn", "at", "board_only"}
+                "rds_mohm", "lcsc", "mpn", "at", "board_only", "dnp", "in_bom", "edge"}
     assert consumed <= set(props), consumed - set(props)
 
 
@@ -105,7 +120,7 @@ def test_top_level_schema_types_every_known_key():
              "nets", "no_connect", "power_flags", "net_specs", "preroutes",
              "planes", "antenna_keepout", "emc", "height_zones", "thermal",
              "stackup", "require_sourcing", "libraries", "copper_layers",
-             "source", "rebuild", "mode", "assumptions"}
+             "source", "rebuild", "mode", "assumptions", "variant", "blocks"}
     assert known <= set(props), known - set(props)
 
 
@@ -115,15 +130,66 @@ def _pipeline_section_2() -> str:
     return text[start:text.index("\n## 3.", start)]
 
 
+def _strip_jsonc(text: str) -> str:
+    """The text without its // comments (string-aware: a URL keeps its //)."""
+    out, i, in_str = [], 0, False
+    while i < len(text):
+        ch = text[i]
+        if in_str and ch == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if in_str or ch == '"':
+            in_str = (ch != '"') if in_str else True
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _no_duplicate_keys(pairs: list) -> dict:
+    keys = [k for k, _v in pairs]
+    dup = sorted({k for k in keys if keys.count(k) > 1})
+    assert not dup, f"duplicate keys {dup} (json.loads would keep only the last)"
+    return dict(pairs)
+
+
+def _section_2_examples() -> list[dict]:
+    blocks = re.findall(r"```jsonc\n(.*?)```", _pipeline_section_2(), re.DOTALL)
+    return [json.loads(_strip_jsonc(b), object_pairs_hook=_no_duplicate_keys) for b in blocks]
+
+
+def test_strip_jsonc_keeps_slashes_inside_strings():
+    text = '{"a": "https://x/y", // note\n "b": "q\\"//"} // end'
+    assert json.loads(_strip_jsonc(text)) == {"a": "https://x/y", "b": 'q"//'}
+
+
+def test_pipeline_doc_section_2_examples_validate_literally():
+    """The jsonc examples are real designs: comments stripped, no '...'
+    placeholders, no duplicate keys, schema-valid as written."""
+    examples = _section_2_examples()
+    assert len(examples) >= 2, "section 2 lost its netlist / imported-design examples"
+    for i, design in enumerate(examples):
+        assert ns.validate(design) == [], f"section-2 example {i}"
+    imported = examples[1]
+    assert set(SOURCE_PATHS) | {"files", "copper"} <= set(imported["source"])
+    assert imported["variant"]["dropped_refs"] and imported["blocks"][0]["drop_refs"]
+
+
 def test_pipeline_doc_section_2_documents_every_schema_key():
     """docs/PIPELINE.md section 2 is the human side of this contract: every
-    top-level, board, outline, cutout and component key appears there."""
+    top-level, board, outline, cutout, component, source, variant and block
+    key appears there."""
     doc = _pipeline_section_2()
     defs = ns.SCHEMA["$defs"]
     keys = (set(ns.SCHEMA["properties"]) | set(defs["component"]["properties"])
             | set(defs["board"]["properties"]) | set(defs["outline"]["properties"])
             | set(defs["cutout"]["properties"]) | set(defs["assumption"]["properties"])
-            | set(defs["source"]["properties"]))
+            | set(defs["source"]["properties"]) | set(defs["variant"]["properties"])
+            | set(defs["block"]["properties"]))
     missing = sorted(k for k in keys if f'"{k}"' not in doc)
     assert not missing, f"PIPELINE.md section 2 does not document {missing}"
 
@@ -131,23 +197,50 @@ def test_pipeline_doc_section_2_documents_every_schema_key():
 def test_pipeline_doc_section_2_names_every_roadmap_value():
     doc = _pipeline_section_2()
     words = (*ns.SOURCE_KINDS, *ns.REBUILD_MODES, *ns.MODES, *ns.CONFIDENCE_LEVELS,
-             *ns.DXF_UNITS, "${KIPRJMOD}", "bulge")
+             *ns.DXF_UNITS, *ns.COPPER_MODES, *ns.VARIANT_HOLES, *ns.BOARD_EDGES,
+             "${KIPRJMOD}", "bulge")
     missing = [w for w in words if w not in doc]
     assert not missing, f"PIPELINE.md section 2 does not name {missing}"
     assert "netlist_schema.py" in doc
 
 
+def test_pipeline_doc_section_2_states_the_board_block_contracts(tmp_path):
+    """The documented board-block contracts hold where they are enforced."""
+    import outline as ol
+    doc = _pipeline_section_2()
+    for phrase in ("bbox starts at (0, 0)", "corner_radius only with w/h",
+                   "bbox bottom-left", "board block is rejected on purpose"):
+        assert phrase in doc, f"section 2 does not state {phrase!r}"
+    dxf_io = pytest.importorskip("dxf_io")      # default datum = bbox bottom-left (0, h)
+    dxf = dxf_io.write_outline_dxf(tmp_path / "board.dxf", {"w": 10.0, "h": 20.0})
+    assert dxf_io.read_board_outline(dxf).datum == pytest.approx((0.0, 20.0))
+    square = [[1, 1], [11, 1], [11, 11], [1, 11]]
+    with pytest.raises(ol.OutlineError, match="bbox starts at"):
+        ol.from_board_block({"outline": {"loop": square}})
+    with pytest.raises(ol.OutlineError, match="corner_radius only rounds"):
+        ol.from_board_block({"corner_radius": 2.0,
+                             "outline": {"loop": [[x - 1, y - 1] for x, y in square]}})
+    errors = ns.validate({"components": [{"ref": "H1", "footprint": "M:H", "board_only": True}],
+                          "board": {"auto_x": 3.0, "auto_w": 20.0}})
+    _assert_error(errors, "$.board", "needs 'w' and 'h'")
+
+
 def test_enum_constants_match_the_decisions():
-    assert ns.SOURCE_KINDS == ("kicad", "eagle", "altium", "easyeda", "vision")
+    assert ns.SOURCE_KINDS == ("kicad", "eagle", "altium", "easyeda", "vision", "gerber")
     assert ns.REBUILD_MODES == ("keep", "reflow")
     assert ns.MODES == ("napkin",)
     assert ns.CONFIDENCE_LEVELS == ("high", "med", "low")
     assert ns.COPPER_LAYER_COUNTS == (2, 4, 6)
+    assert ns.COPPER_MODES == ("carry", "reroute")
+    assert ns.VARIANT_HOLES == ("source", "corners", "none")
+    assert ns.BOARD_EDGES == ("top", "bottom", "left", "right")
 
 
 # --- today's designs stay valid ---------------------------------------------
-def test_all_ten_examples_are_present():
-    assert len(EXAMPLE_NAMES) == 10, EXAMPLE_NAMES
+def test_examples_are_present():
+    """>= 10: later waves add examples (F2-19, F3-21, D7-29a/b); every one
+    of them must validate (below)."""
+    assert len(EXAMPLE_NAMES) >= 10, EXAMPLE_NAMES
 
 
 @pytest.mark.parametrize("name", EXAMPLE_NAMES)
@@ -207,118 +300,7 @@ def test_validate_does_not_mutate_the_design():
     assert d == before
 
 
-# --- positive variants of every roadmap key ----------------------------------
-def _rect_board(d: dict) -> None:
-    d["board"] = {"w": 60, "h": 40, "corner_radius": 3.0,
-                  "cutouts": [{"circle": [30, 20, 2]}], "datum": [0, 40]}
-
-
-def _dxf_outline(d: dict) -> None:
-    d["board"]["outline"] = {"dxf": "mech/outline.dxf", "layer": "OUTLINE",
-                             "units": "mm"}
-
-
-def _dxf_outline_bare(d: dict) -> None:
-    d["board"]["outline"] = {"dxf": "C:/mech/outline.dxf"}
-
-
-def _two_vertex_circle_loop(d: dict) -> None:
-    d["board"]["cutouts"] = [{"loop": [[10, 10, 1], [20, 10, 1]]}]
-
-
-def _negative_bulge(d: dict) -> None:
-    d["board"]["outline"]["loop"][2] = [60, 40, -2.5]
-
-
-def _empty_cutouts(d: dict) -> None:
-    d["board"]["cutouts"] = []
-
-
-def _two_layers(d: dict) -> None:
-    d["copper_layers"] = 2
-
-
-def _six_layers(d: dict) -> None:
-    d["copper_layers"] = 6
-
-
-def _reflow(d: dict) -> None:
-    d["rebuild"] = "reflow"
-    for c in d["components"]:
-        c.pop("at", None)
-
-
-def _vision_source_minimal(d: dict) -> None:
-    d["source"] = {"kind": "vision", "path": "scans/sheet1.pdf"}
-
-
-def _board_only_with_lib_id(d: dict) -> None:
-    _comp(d, "H1")["lib_id"] = "Mechanical:MountingHole"
-
-
-def _board_only_false_with_lib_id(d: dict) -> None:
-    _comp(d, "R1")["board_only"] = False
-
-
-def _override_null(d: dict) -> None:
-    d["assumptions"][0]["override"] = None
-
-
-def _assumption_value_object(d: dict) -> None:
-    d["assumptions"][0]["value"] = {"v": 5.0, "i": 3.0}
-
-
-def _empty_assumptions(d: dict) -> None:
-    d["assumptions"] = []
-
-
-def _libraries_symbols_only(d: dict) -> None:
-    d["libraries"] = {"symbols": {"SPS_parts": "/abs/SPS_parts.kicad_sym"}}
-
-
-def _nullable_blocks(d: dict) -> None:
-    d.update({"mounting_holes": None, "planes": None, "antenna_keepout": None,
-              "emc": None, "thermal": None, "height_zones": None,
-              "stackup": None, "require_sourcing": None})
-
-
-def _board_null(d: dict) -> None:
-    d["board"] = None
-    for c in d["components"]:
-        c.pop("at", None)
-
-
-def _board_empty(d: dict) -> None:
-    d["board"] = {}
-
-
-def _mounting_holes_false(d: dict) -> None:
-    d["mounting_holes"] = False
-
-
-def _lowercase_side(d: dict) -> None:
-    _comp(d, "C1")["side"] = "b"
-
-
-def _integer_pads(d: dict) -> None:
-    d["nets"]["GND"] = [["U1", 10], ["C1", 2]]
-
-
-@pytest.mark.parametrize("mutate", [
-    _rect_board, _dxf_outline, _dxf_outline_bare, _two_vertex_circle_loop,
-    _negative_bulge, _empty_cutouts, _two_layers, _six_layers, _reflow,
-    _vision_source_minimal, _board_only_with_lib_id, _board_only_false_with_lib_id,
-    _override_null, _assumption_value_object, _empty_assumptions,
-    _libraries_symbols_only, _nullable_blocks, _board_null, _board_empty,
-    _mounting_holes_false, _lowercase_side, _integer_pads,
-], ids=lambda f: f.__name__.lstrip("_"))
-def test_roadmap_key_positive_variants(mutate):
-    d = _full_design()
-    mutate(d)
-    assert ns.validate(d) == []
-
-
-# --- negative cases: (mutation, JSON path, message fragment) -----------------
+# --- mutators ----------------------------------------------------------------
 def _set(path: str, value):
     """Mutator that sets a dotted path (ints index lists) to ``value``."""
     def mutate(d: dict) -> None:
@@ -342,6 +324,68 @@ def _drop(path: str):
     return mutate
 
 
+# --- positive variants of every roadmap key ----------------------------------
+def _reflow(d: dict) -> None:
+    d["rebuild"] = "reflow"
+    for c in d["components"]:
+        c.pop("at", None)
+
+
+def _nullable_blocks(d: dict) -> None:
+    d.update({"mounting_holes": None, "planes": None, "antenna_keepout": None,
+              "emc": None, "thermal": None, "height_zones": None,
+              "stackup": None, "require_sourcing": None})
+
+
+def _board_null(d: dict) -> None:
+    d["board"] = None
+    for c in d["components"]:
+        c.pop("at", None)
+
+
+POSITIVE = [
+    _set("board", {"w": 60, "h": 40, "corner_radius": 3.0,
+                   "cutouts": [{"circle": [30, 20, 2]}], "datum": [0, 40]}),
+    _set("board.outline", {"dxf": "mech/outline.dxf", "layer": "OUTLINE", "units": "mm"}),
+    _set("board.outline", {"dxf": "C:/mech/outline.dxf"}),
+    _set("board.cutouts", [{"loop": [[10, 10, 1], [20, 10, 1]]}]),   # 2-vertex circle loop
+    _set("board.outline.loop.2", [60, 40, -2.5]), _set("board.cutouts", []),
+    _set("copper_layers", 2), _set("copper_layers", 6), _reflow,
+    _set("source", {"kind": "vision", "path": "scans/sheet1.pdf"}),
+    _set("components.2.lib_id", "Mechanical:MountingHole"),   # board_only with a lib_id
+    _set("components.3.board_only", False),
+    _set("assumptions.0.override", None), _set("assumptions.0.value", {"v": 5.0, "i": 3.0}),
+    _set("assumptions", []),
+    _set("libraries", {"symbols": {"SPS_parts": "/abs/SPS_parts.kicad_sym"}}),
+    _nullable_blocks, _board_null, _set("board", {}), _set("mounting_holes", False),
+    _set("components.1.side", "b"), _set("nets.GND", [["U1", 10], ["C1", 2]]),
+    # F3 / F4 additions (X-02)
+    _set("source.kind", "gerber"), _set("source.copper", "reroute"),
+    _set("source", {"kind": "gerber", "path": "fab/board_gerbers.zip"}),
+    _set("source.files", {}), _drop("source.board"), _drop("source.copper"),
+    _set("thermal", {"ep_vias_min": 4.0}), _set("thermal", {"ep_vias_min": 4}),
+    _set("components.4.edge", None), _set("components.4.edge", "bottom"),
+    _set("components.1.dnp", False), _set("components.3.in_bom", True),
+    _set("board.panel_cutouts", False), _set("board", {"w": 0.5, "h": 40}),
+    _set("variant", {"mode": "reflow"}),
+    _set("variant", {"mode": "reflow", "from": "../feather/netlist.json",
+                     "dropped_refs": [], "holes": "corners"}),
+    _set("variant.holes", "none"),
+    _set("blocks", [{"name": "BLE", "ref_map": {"U1": "U9"}}]),
+    _set("blocks.0.source", None), _set("blocks.0.rebuild", None),
+    _set("blocks.0.drop_refs", []), _drop("blocks.0.drop_refs"), _set("blocks", []),
+    _set("blocks.0.note", "extra keys pass on a provenance entry"),
+]
+
+
+@pytest.mark.parametrize("mutate", POSITIVE, ids=lambda m: m.__name__.lstrip("_"))
+def test_roadmap_key_positive_variants(mutate):
+    d = _full_design()
+    mutate(d)
+    assert ns.validate(d) == []
+
+
+# --- negative cases: (mutation, JSON path, message fragment) -----------------
 def _with(**kw):
     """Mutator that merges keys into component 0 (U1, which carries ``at``)."""
     def mutate(d: dict) -> None:
@@ -512,10 +556,59 @@ NEGATIVE = [
      "$.height_zones[0].side", "must be one of"),
     (_set("height_zones", [{"x": 0, "y": 0, "w": 1, "h": 1}]),
      "$.height_zones[0]", "'max_height' is a required property"),
-    (_set("thermal", {"ep_vias_min": 4.5}), "$.thermal.ep_vias_min",
-     "expected integer"),
+    (_set("thermal", {"ep_vias_min": 4.5}), "$.thermal.ep_vias_min", "whole number"),
+    (_set("thermal", {"ep_vias_min": "4"}), "$.thermal.ep_vias_min", "expected number"),
     (_set("stackup", {"er": "4.2"}), "$.stackup.er", "expected number"),
     (_set("require_sourcing", "yes"), "$.require_sourcing", "expected boolean"),
+    # T04 review minors: empty net name, positive board / auto-field sizes
+    (_set("nets.", [["U1", "3"], ["C1", "1"]]), "$.nets", "a net name must not be empty"),
+    (_set("board", {"w": 0, "h": 40}), "$.board.w", "must be > 0"),
+    (_set("board", {"w": 60, "h": -2.5}), "$.board.h", "must be > 0"),
+    (_set("board.auto_w", 0), "$.board.auto_w", "must be > 0"),
+    (_set("board.auto_h", -1.0), "$.board.auto_h", "must be > 0"),
+    (_set("board.auto_b", {"x": 1, "y": 1, "w": 0, "h": 4}), "$.board.auto_b.w",
+     "must be > 0"),
+    # F3: connector edges and panel-mount cutouts
+    (_set("board.panel_cutouts", "yes"), "$.board.panel_cutouts", "expected boolean"),
+    (_set("components.4.edge", "north"), "$.components[4].edge", "must be one of"),
+    (_set("components.4.edge", 1), "$.components[4].edge", "must be one of"),
+    # D4 assembly flags and provenance (F4/F6)
+    (_set("components.1.dnp", 1), "$.components[1].dnp", "expected boolean"),
+    (_set("components.3.in_bom", "no"), "$.components[3].in_bom", "expected boolean"),
+    (_set("source.files", ["sps_node.brd"]), "$.source.files", "expected object"),
+    (_set("source.files", {"sps_node.brd": "abc"}), "$.source.files['sps_node.brd']",
+     "64 hex"),
+    (_set("source.files", {"": SHA}), "$.source.files", "file name must not be empty"),
+    (_set("source.board", ["a.kicad_pcb"]), "$.source.board", "expected string"),
+    (_set("source.copper", "keep"), "$.source.copper", "must be one of"),
+    (_set("source.copper", True), "$.source.copper", "must be one of"),
+    *[(_set(f"source.{k}", ""), f"$.source.{k}", "must not be empty") for k in SOURCE_PATHS],
+    *[(_set(f"source.{k}", 5), f"$.source.{k}", "expected string") for k in SOURCE_PATHS],
+    (_set("variant", "reflow"), "$.variant", "expected object"),
+    (_drop("variant.mode"), "$.variant", "'mode' is a required property"),
+    (_set("variant.mode", "copy"), "$.variant.mode", "must be one of"),
+    (_set("variant.holes", "drill"), "$.variant.holes", "must be one of"),
+    (_set("variant.dropped_refs", "LOGO1"), "$.variant.dropped_refs", "expected array"),
+    (_set("variant.dropped_refs", [""]), "$.variant.dropped_refs[0]", "must not be empty"),
+    (_set("variant.from", ""), "$.variant.from", "must not be empty"),
+    (_set("blocks", {"name": "GNSS"}), "$.blocks", "expected array"),
+    (_drop("blocks.0.name"), "$.blocks[0]", "'name' is a required property"),
+    (_drop("blocks.0.ref_map"), "$.blocks[0]", "'ref_map' is a required property"),
+    (_set("blocks.0.ref_map", {}), "$.blocks[0].ref_map", "every block ref"),
+    (_set("blocks.0.ref_map", ["U1"]), "$.blocks[0].ref_map", "expected object"),
+    (_set("blocks.0.ref_map", {"U1": 7}), "$.blocks[0].ref_map.U1", "expected string"),
+    (_set("blocks.0.ref_map.U1", ""), "$.blocks[0].ref_map.U1", "must not be empty"),
+    (_set("blocks.0.ref_map.", "U7"), "$.blocks[0].ref_map", "reference must not be empty"),
+    (_set("blocks.0.net_map", ["GND"]), "$.blocks[0].net_map", "expected object"),
+    (_set("blocks.0.net_map.", "GND"), "$.blocks[0].net_map", "net name must not be empty"),
+    (_set("blocks.0.drop_refs", "J2"), "$.blocks[0].drop_refs", "expected array"),
+    (_set("blocks.0.drop_refs", ["J2", ""]), "$.blocks[0].drop_refs[1]",
+     "must not be empty"),
+    (_set("blocks.0.drop_refs", [2]), "$.blocks[0].drop_refs[0]", "expected string"),
+    (_set("blocks.0.source", "gnss.json"), "$.blocks[0].source", "expected object or null"),
+    (_set("blocks.0.source.kind", "orcad"), "$.blocks[0].source.kind", "must be one of"),
+    (_drop("blocks.0.source.path"), "$.blocks[0].source", "'path' is a required property"),
+    (_set("blocks.0.rebuild", "copy"), "$.blocks[0].rebuild", "must be one of"),
 ]
 
 
@@ -525,6 +618,20 @@ def test_negative_cases_report_the_path(mutate, path, fragment):
     d = _full_design()
     mutate(d)
     _assert_error(ns.validate(d), path, fragment)
+
+
+def test_zero_width_board_message_is_exact():
+    d = _full_design()
+    d["board"] = {"w": 0, "h": 40}
+    errors = ns.validate(d)
+    assert [e for e in errors if e.startswith("$.board.w: must be > 0")], errors
+
+
+def test_empty_net_name_is_reported_on_the_nets_block():
+    d = _full_design()
+    d["nets"][""] = [["U1", "3"], ["C1", "1"]]
+    assert _errors_at(ns.validate(d), "$.nets") == \
+        ['$.nets: a net name must not be empty (got "")']
 
 
 # --- error strings -----------------------------------------------------------

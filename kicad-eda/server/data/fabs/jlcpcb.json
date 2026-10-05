@@ -1,0 +1,52 @@
+{
+  "schema": "kicad-eda/fabs@1",
+  "id": "jlcpcb",
+  "name": "JLCPCB",
+  "retrieved": "2026-10-04",
+  "sources": [
+    {"title": "JLCPCB PCB capabilities (fetched 2026-10-04)", "url": "https://jlcpcb.com/capabilities/pcb-capabilities"},
+    {"title": "JLCPCB impedance: prepreg/core Dk, solder mask C1/C2/C3 (fetched 2026-10-04)", "url": "https://jlcpcb.com/impedance"},
+    {"title": "JLCPCB high-frequency PCB: Rogers / PTFE, 2 layers (fetched 2026-10-04)", "url": "https://jlcpcb.com/pcb-fabrication/high-frequency-pcb"},
+    {"title": "JLCPCB user guide to the impedance calculator (NP-155F 4-8L, S1000-2M 10L+)", "url": "https://jlcpcb.com/help/article/User-Guide-to-the-JLCPCB-Impedance-Calculator"},
+    {"title": "JLCPCB help: RF PCB stackup question (hybrid RO4350B/FR-4, no JLC answer, 2025-11-30)", "url": "https://jlcpcb.com/help/answers/detail/907-RF-PCB-Stackup"}
+  ],
+  "capabilities": {
+    "layer_counts": [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32],
+    "impedance_layer_counts": [4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32],
+    "impedance_tolerance_pct": 10,
+    "thicknesses_mm": [0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0],
+    "thickness_note": "FR-4 thicknesses; 0.4-4.5 mm overall, 2.5 mm and above for 12+ layer PCBs only",
+    "thickness_tolerance": [{"from_mm": 1.0, "pct": 10}, {"from_mm": 0.0, "abs_mm": 0.1}],
+    "outer_cu_oz": {"2": [1, 2, 2.5, 3.5, 4.5], "multi": [1, 2]},
+    "inner_cu_oz": [0.5, 1, 2],
+    "min_track_mm": {"1-2": 0.1, "multi": 0.09},
+    "min_clearance_mm": {"1-2": 0.1, "multi": 0.09},
+    "materials": ["nanya.np155f", "shengyi.s1000-2m", "generic.fr4"],
+    "materials_note": "FR-4 grade A laminates (Nan Ya, KB, Shengyi); impedance results assume NP-155F for 4-8 layers and S1000-2M for 10+ layers; select FR-4 TG155 when ordering 4/6-layer impedance builds (gsuberland README, unverified)",
+    "rf": {
+      "materials": ["rogers.ro4350b", "zyf.zyf255da", "zyf.zyf265d", "zyf.zyf300ca-c", "zyf.zyf300ca-p"],
+      "layer_counts": [2],
+      "finished_thickness_mm": [0.65, 0.9, 1.65],
+      "cu_oz": [1],
+      "finish": "ENIG",
+      "min_track_mm": 0.1,
+      "note": "1 oz, 2-layer RF PCBs with Rogers and PTFE cores; the finished thicknesses are not mapped to core thicknesses by JLC (unverified)"
+    },
+    "hybrid": false,
+    "hybrid_note": "no RO4350B/FR-4 hybrid is offered (a 2025-11-30 user question has no JLC answer)",
+    "ptfe_multilayer": false
+  },
+  "soldermask": {
+    "material": "lpi", "over_substrate": 0.0305, "over_trace": 0.0152, "between_traces": 0.0305, "dk": 3.8,
+    "published": "C1 1.2 mil over substrate, C2 0.6 mil over trace, C3 1.2 mil between traces, CEr 3.8 (0.03048 / 0.01524 / 0.03048 mm, rounded as in ADR D7.1)",
+    "source": "https://jlcpcb.com/impedance"
+  },
+  "dk_basis": "fab",
+  "default_templates": {
+    "by_count": {"1": "generic:2L-1.6", "2": "generic:2L-1.6", "4": "JLC04161H-7628", "6": "JLC06161H-2116"},
+    "fallback": "NOREQ",
+    "note": "ADR D7.2.4: 1-2 layers generic:2L-1.6; 4L JLC04161H-7628; 6L JLC06161H-2116; otherwise the snapshot's no-requirement (NOREQ) template of that count, nearest thickness, 1 oz outer / 0.5 oz inner preferred"
+  },
+  "bulk_templates": {"file": "jlcpcb_templates.json"},
+  "templates": {}
+}

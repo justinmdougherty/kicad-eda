@@ -1,0 +1,25 @@
+{
+  "description": "ADR D7.2.4 default for copper_layers 10: the snapshot NOREQ 10L 1.6 mm 1 oz / 0.5 oz template, roles S G S P G S G S G S (M7)",
+  "design": {
+    "name": "default_10l",
+    "copper_layers": 10,
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]], "SIG": [["J1", "3"]]}
+  },
+  "expect": {
+    "source": "default",
+    "fab": "jlcpcb",
+    "copper_layers": 10,
+    "kicad_copper_count": 10,
+    "thickness": 1.6496,
+    "gbrjob_rows": 21,
+    "roles": [["F.Cu", "signal", null], ["In1.Cu", "plane", "GND"], ["In2.Cu", "signal", null],
+              ["In3.Cu", "plane", "+3V3"], ["In4.Cu", "plane", "GND"], ["In5.Cu", "signal", null],
+              ["In6.Cu", "plane", "GND"], ["In7.Cu", "signal", null], ["In8.Cu", "plane", "GND"],
+              ["B.Cu", "signal", null]],
+    "mask_source": "fab",
+    "issues": [],
+    "drafts": 5
+  }
+}

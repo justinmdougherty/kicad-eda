@@ -15,9 +15,17 @@ at import or collection time (the installs are looked up in module fixtures).
   pcbnew extracts. Its KiCad 9 demo comes from a 9.x install or from
   ``$KICAD9_DEMOS`` (set it in the KiCad 10 image to a mounted KiCad 9
   share/kicad/demos, so pcbnew 10 runs it).
-* A large board (vme-wren, 1508 footprints) extracts in seconds.
-* A board newer than KiCad 9's format (the newest install's demo) records
-  that the KiCad 11 path is required.
+* A large board (vme-wren, 1508 footprints) extracts in seconds, without
+  variants (footprint_identity ignores the Datasheet / Description noise).
+* A board newer than KiCad 9's format (the newest install's demo): with a
+  pcbnew >= 10 that reads it (the KiCad 10 image) the footprints come out
+  in KiCad 9's dialect through route 'pcbnew10+downgrade'; else the report
+  records that the KiCad 11 path is required.
+* KiCad 11 projects made by the 10.99 nightly's ``kicad-cli import`` from the
+  Eagle samples under ``$KICAD_EDA_FOREIGN_SAMPLES`` (Qwiic_Button, the
+  Adafruit Feather M0 RFM; tests/fixtures/fake_kicad.py has the layout)
+  convert through route 'importer_library': KiCad 9 footprints and symbols,
+  proven by KiCad 9 (k9_verified), every check passing.
 """
 from __future__ import annotations
 
@@ -35,11 +43,15 @@ import kicad_import as ki
 import kicad_import_checks as kchk
 import kicad_import_fplib as kf
 import kicad_import_pcb as kp
+import kicad_import_sch as ks
 import net_equivalence as ne
+from fixtures import fake_kicad
 
 FIX = Path(__file__).resolve().parent / "fixtures" / "kicad" / "kimport"
 PCB = FIX / "kimport.kicad_pcb"
 LARGE_BOARD_LIMIT_S = 60.0
+IMPORT_TIMEOUT_S = 600.0
+_ERROR = re.compile(r"(^|\s)Error:", re.M)
 
 
 def _text(path: Path) -> str:
@@ -103,16 +115,25 @@ def kicad9_demos(installs: list) -> Path:
     return install.share / "demos"
 
 
-_INSTANCE_ITEM = re.compile(r'^\t\((sheetname|sheetfile|path)\b|^\t\(property\s+("?)([^"\s()]+)\2',
-                            re.M)
+# a top-level instance item, or a property: its name quoted (spaces allowed) or bare
+_INSTANCE_ITEM = re.compile(r'^\t\((sheetname|sheetfile|path)\b'
+                            r'|^\t\(\s*property\s+(?:"((?:[^"\\]|\\.)*)"|([^\s()"]+))', re.M)
 
 
 def instance_data(text: str) -> list[str]:
     """What a library footprint saved by pcbnew still carries of the board
     instance it came from: top-level path / sheetname / sheetfile items and
     properties outside KEEP_FIELDS (pcbnew writes top-level items one tab in)."""
-    return [m.group(1) or m.group(3) for m in _INSTANCE_ITEM.finditer(text)
-            if m.group(1) or m.group(3) not in kf.KEEP_FIELDS]
+    found = [m.group(1) or m.group(2) or m.group(3) for m in _INSTANCE_ITEM.finditer(text)]
+    return [name for name in found
+            if name in ("sheetname", "sheetfile", "path") or name not in kf.KEEP_FIELDS]
+
+
+def test_instance_data_names_quoted_fields_with_spaces() -> None:
+    text = ('(footprint "X"\n\t(property "Reference" "REF**")\n'
+            '\t(property "Manufacturer Part Number" "RC0603")\n\t(property ki_fp_filters "R_*")\n'
+            '\t(sheetname "/a/")\n)')
+    assert instance_data(text) == ["Manufacturer Part Number", "ki_fp_filters", "sheetname"]
 
 
 _COMP_XML = re.compile(r'<comp ref="([^"]+)">.*?</comp>', re.S)
@@ -207,8 +228,9 @@ def test_live_fixture_converts_with_its_own_footprints(tmp_path: Path, installs:
     assert f"(version {info['format']})" in text and '"REF**"' in text and "(net " not in text
     assert "dnp" not in text                     # C2's DNP flag stays on the instance
     assert info["d0_dialect"] is (info["format"] == kf.K9_PCB_FORMAT)
-    if swig.version_tuple[0] == 9:               # D0: KiCad 9 writes 20241229
-        assert info["format"] == kf.K9_PCB_FORMAT
+    assert info["route"] == "pcbnew9" and info["routes_tried"] == []
+    if swig.version_tuple[0] == 9:               # D0: KiCad 9 writes 20241229, and loads it
+        assert info["format"] == kf.K9_PCB_FORMAT and info["k9_verified"] is True
     else:                                        # KiCad 10 only (Docker): reported
         assert any("KiCad 9 cannot load" in w for w in info["warnings"])
     saved = sorted(pretty.glob("*.kicad_mod"))
@@ -226,20 +248,25 @@ _EXTRA_FIELDS = ('(property "MPN" "RC0603FR-071KL" (at 0 0 0) (layer "F.Fab") (h
                  '(uuid "6f1c1d6e-1111-4222-8333-944455566601") (effects (font (size 1 1) '
                  '(thickness 0.15))))\n\t\t(property "LCSC" "C21190" (at 0 0 0) (layer "F.Fab") '
                  '(hide yes) (uuid "6f1c1d6e-1111-4222-8333-944455566602") (effects (font '
-                 '(size 1 1) (thickness 0.15))))\n\t\t')
+                 '(size 1 1) (thickness 0.15))))\n\t\t(property "Manufacturer Part Number" '
+                 '"RC0603FR-071KL" (at 0 0 0) (layer "F.Fab") (hide yes) '
+                 '(uuid "6f1c1d6e-1111-4222-8333-944455566603") (effects (font (size 1 1) '
+                 '(thickness 0.15))))\n\t\t')
 
 
 def test_live_instance_fields_are_dropped_from_library_copies(tmp_path: Path, swig) -> None:
     """Parts on different sheets, two of them carrying schematic fields (MPN,
-    LCSC): pcbnew keeps every field in its library copy (kicad_import_swig
-    removes none, pcbnew 10 cannot do it safely) and pcbnew 10 the sheet too;
-    kicad_import_fplib.strip_instance_fields drops them from the text, so
-    each pair of one footprint is still one library footprint."""
+    LCSC, 'Manufacturer Part Number'): pcbnew keeps every field in its
+    library copy (kicad_import_swig removes none, pcbnew 10 cannot do it
+    safely) and pcbnew 10 the sheet too; kicad_import_fplib.strip_instance_fields
+    drops them from the text, so each pair of one footprint is still one
+    library footprint."""
     sheets = {"R1": ("/amp_a/", "amp.kicad_sch"), "C1": ("/supply/", "supply.kicad_sch")}
     text = link_like_kicad(_text(PCB), _text(FIX / "kimport.xml"), sheets)
     for ref in ("R1", "C1"):                          # C1: the B-side, 45 degree part
         anchor = f'(property "Reference" "{ref}"'
         text = text.replace(anchor, _EXTRA_FIELDS + anchor, 1)
+    assert text.count('(property "Manufacturer Part Number"') == 2
     pcb = tmp_path / "fields.kicad_pcb"
     pcb.write_text(text, encoding="utf-8")
     board = kp.read_board(text)
@@ -268,14 +295,20 @@ def test_live_extracted_libraries_parse_with_kicad_cli(tmp_path: Path, swig) -> 
 # ----------------------------------------------------------------------------
 # KiCad 9 demos
 # ----------------------------------------------------------------------------
-@pytest.mark.parametrize("demo, project, footprints", [
-    ("stickhub", "StickHub.kicad_pro", True),              # B side at 45 deg, project libraries
-    ("complex_hierarchy", "complex_hierarchy.kicad_pro", True),   # one sheet used twice
-    ("multichannel", "multichannel_mixer.kicad_pro", False),      # one sheet used four times
-    ("tiny_tapeout", "tinytapeout-demo.kicad_pro", True),         # board-only STITCH1 x 130
+@pytest.mark.parametrize("demo, project, footprints, variants", [
+    # B side at 45 deg, project libraries; reversed lines and B.Fab fields were 4 variants
+    ("stickhub", "StickHub.kicad_pro", True, []),
+    ("complex_hierarchy", "complex_hierarchy.kicad_pro", True, []),   # one sheet used twice
+    ("multichannel", "multichannel_mixer.kicad_pro", False, None),    # one sheet used 4 times
+    # board-only STITCH1 x 130; real differences stay variants (7 before F46-11): a 3D
+    # model on one switch only, a moved LED mark, logos, a longer silk line, pad thermals
+    ("tiny_tapeout", "tinytapeout-demo.kicad_pro", True,
+     ["434121025816_2", "LED_0603_1608Metric_2", "LOGO_2", "PinHeader_1x03_P2.54mm_Vertical_2",
+      "TT_BREAKOUT_PINHEADER_PLACEHOLDER_WITHPAD_2"]),
 ])
 def test_live_kicad9_demos_convert_and_round_trip(tmp_path: Path, kicad9, demo: str,
-                                                  project: str, footprints: bool) -> None:
+                                                  project: str, footprints: bool,
+                                                  variants: list[str] | None) -> None:
     src = _demo(kicad9, demo, project)
     board_text = _text(src.with_suffix(".kicad_pcb"))
     assert (ne.pcb_format_version(board_text) or 0) <= kf.K9_PCB_FORMAT
@@ -294,8 +327,10 @@ def test_live_kicad9_demos_convert_and_round_trip(tmp_path: Path, kicad9, demo: 
     assert len(checked["renamed_parts"]) == len(report["renamed_refs"])
     info = report["libraries"]["footprints"]
     assert info["extracted"] is footprints
-    if footprints:                               # KiCad 9 present: picked, D0 dialect
+    if footprints:                               # KiCad 9 present: picked, D0 dialect, loads
         assert info["pcbnew"].startswith("9.") and info["d0_dialect"]
+        assert info["route"] == "pcbnew9" and info["k9_verified"] is True
+        assert sorted(v["name"] for v in info["variants"]) == variants
     assert all(c["footprint"].startswith(f"{design['name']}_imported:") == footprints
                for c in design["components"])
 
@@ -349,20 +384,105 @@ def test_live_large_board_extracts_in_seconds(tmp_path: Path, kicad9) -> None:
     assert elapsed < LARGE_BOARD_LIMIT_S, f"{elapsed:.0f} s for {len(board.footprints)} footprints"
     assert set(lib.names) == {fp.index for fp in board.footprints}
     assert lib.format == kf.K9_PCB_FORMAT and len(lib.files) == len(set(lib.names.values()))
+    # its 23 variants of 102 were Datasheet / Description noise and reversed lines
+    assert lib.variants == () and len(lib.files) == len({fp.lib_id for fp in board.footprints})
 
 
 # ----------------------------------------------------------------------------
 # A board newer than KiCad 9's format
 # ----------------------------------------------------------------------------
-def test_live_newer_format_board_records_the_kicad11_path(tmp_path: Path, installs: list) -> None:
+def test_live_newer_format_board_is_downgraded_or_records_the_kicad11_path(
+        tmp_path: Path, installs: list) -> None:
+    """The newest install's pic_programmer: KiCad 10.0's (20260206) comes
+    out in KiCad 9's dialect through pcbnew 10 + kicad_dialect (the KiCad 10
+    image); without a pcbnew that reads the board (the 10.99 nightly here has
+    none) no route works and the KiCad 11 path is required."""
+    import kicad_import_d0 as kd0
     newest = max(installs, key=lambda i: i.version_tuple)
     if newest.share is None:
         pytest.skip(f"KiCad {newest.version} ships no share/kicad")
     pcb = _demo(newest, "pic_programmer", "pic_programmer.kicad_pcb")
-    if (ne.pcb_format_version(_text(pcb)) or 0) <= kf.K9_PCB_FORMAT:
+    fmt = ne.pcb_format_version(_text(pcb)) or 0
+    if fmt <= kf.K9_PCB_FORMAT:
         pytest.skip(f"KiCad {newest.version}'s pic_programmer board is KiCad 9 format")
     res = ki.convert(pcb.with_suffix(".kicad_pro"), tmp_path / "out")
     _check(res)
     info = res["report"]["libraries"]["footprints"]
-    assert info["extracted"] is False and info["kicad11_path_required"] is True
     assert res["report"]["source"]["tool"] == f"kicad-cli {newest.version}"
+    symbols = res["report"]["libraries"]["symbols"]
+    assert symbols["format"] == ks.K9_SYM_FORMAT and symbols["d0_dialect"] is True, symbols
+    pcbnew = kd0.choose_newer_install(fmt, installs)
+    if pcbnew is None:
+        assert info["extracted"] is False and info["kicad11_path_required"] is True
+        return
+    assert info["route"] == "pcbnew10+downgrade" and info["format"] == kf.K9_PCB_FORMAT, info
+    assert info["d0_dialect"] is True and info["pcbnew"].startswith("10.")
+    pretty = tmp_path / "out" / "libs" / "pic_programmer_imported.pretty"
+    texts = [_text(p) for p in pretty.glob("*.kicad_mod")]
+    assert len(texts) == info["footprints"] > 0
+    assert all("(version 20241229)" in t for t in texts)
+    assert all(c["footprint"].startswith("pic_programmer_imported:")
+               for c in res["design"]["components"])
+    print(json.dumps({k: info.get(k) for k in ("route", "format", "footprints", "pcbnew",
+                                               "k9_verified", "models_dropped")}))
+
+
+# ----------------------------------------------------------------------------
+# KiCad 11 projects imported from Eagle by the 10.99 nightly
+# ----------------------------------------------------------------------------
+EAGLE = {   # stem: the sample's board and schematic under $KICAD_EDA_FOREIGN_SAMPLES
+    "Qwiic_Button": (("eagle", "Qwiic_Button.brd"), ("eagle", "Qwiic_Button.sch")),
+    "Feather": (("adafruit", "Adafruit Feather M0 RFMxx.brd"),
+                ("adafruit", "Adafruit Feather M0 RFMxx.sch")),
+}
+
+
+def _kicad11_project(nightly, sample: str, tmp_path: Path) -> Path:
+    """The sample imported by the nightly's ``kicad-cli import`` into a new
+    KiCad 11 project <tmp>/k11/<sample>.kicad_pro (with its
+    <sample>-import-fps.pretty), from copies of the sample files."""
+    brd, sch = (fake_kicad.sample(*parts) for parts in EAGLE[sample])
+    inputs = []
+    for src, ext in ((brd, ".brd"), (sch, ".sch")):
+        inputs.append(tmp_path / f"{sample}{ext}")
+        shutil.copyfile(src, inputs[-1])
+    project = tmp_path / "k11"
+    project.mkdir()
+    r = subprocess.run([str(nightly.kicad_cli), "import", "-o", str(project / sample),
+                        *map(str, inputs)], capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", stdin=subprocess.DEVNULL, timeout=IMPORT_TIMEOUT_S)
+    log = r.stdout + r.stderr
+    assert r.returncode == 0 and not _ERROR.search(log), log[-1500:]
+    return project
+
+
+@pytest.mark.parametrize("sample", list(EAGLE))
+def test_live_kicad11_eagle_project_takes_the_importer_library_route(
+        tmp_path: Path, installs: list, kicad9, sample: str) -> None:
+    nightly = fake_kicad.nightly_install(installs)
+    project = _kicad11_project(nightly, sample, tmp_path)
+    fps = project / f"{sample}-import-fps.pretty"
+    res = ki.convert(project, tmp_path / "out", footprint_sources=[fps])
+    _check(res)
+    report = res["report"]
+    assert report["board_format"] > kf.K9_PCB_FORMAT
+    info, symbols = report["libraries"]["footprints"], report["libraries"]["symbols"]
+    assert info["route"] == "importer_library" and info["sources"] == [str(fps)], info
+    assert (info["format"], info["d0_dialect"], info["k9_verified"]) == (
+        kf.K9_PCB_FORMAT, True, True), info.get("k9_check")
+    assert (symbols["format"], symbols["d0_dialect"], symbols["k9_verified"]) == (
+        ks.K9_SYM_FORMAT, True, True), symbols
+    assert "kicad11_path_required" not in info and "kicad11_path_required" not in symbols
+    pretty = tmp_path / "out" / "libs" / f"{sample}_imported.pretty"
+    loaded = _load_with_pcbnew(kicad9.python, pretty, tmp_path)
+    source = kp.read_board(_text(project / f"{sample}.kicad_pcb")).footprints
+    board = {fp.ref: fp for fp in reversed(source)} | {      # a reference's first footprint
+        r["ref"]: source[r["index"]] for r in report["renamed_refs"]}
+    for comp in res["design"]["components"]:
+        name = comp["footprint"].split(":", 1)[1] + ".kicad_mod"
+        assert loaded[name] is not None, f"KiCad 9 cannot load {name}"
+        assert sorted(n for n in loaded[name] if n) == sorted(p.number
+                                                             for p in board[comp["ref"]].pads)
+    print(json.dumps({"sample": sample, "counts": report["counts"],
+                      "footprints": info["footprints"], "symbols": symbols["symbols"],
+                      "netlist_vs_pcb": report["checks"]["netlist_vs_pcb"]["summary"]}))

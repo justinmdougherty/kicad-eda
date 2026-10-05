@@ -1,0 +1,44 @@
+{
+  "description": "The D7 K10 splice-probe spec s6L_hybrid (ADR D7.1 [K10]) in the D7.2.2 layers form, with 0.01 mm masks: 6 Cu + 7 plies + 2 masks = 15 gbrjob rows, 1.6284 mm (ADR D7.1 [K10]); RO4350B on top, FR-4 below: ST-W2",
+  "design": {
+    "name": "s6L_hybrid",
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]], "SIG": [["J1", "3"]]},
+    "planes": {"In1.Cu": "GND", "In4.Cu": "GND"},
+    "stackup": {"finish": "ENIG", "impedance_control": {"required": true},
+      "rationale": "6L RO4350B/FR-4 hybrid (K10 splice probe)",
+      "mask": {"material": "lpi", "dk": 3.8, "df": 0.025, "color": "Green",
+               "over_substrate": 0.01, "over_trace": 0.01, "between_traces": 0.01},
+      "layers": [
+        {"type": "copper", "name": "F.Cu", "thickness": 0.035, "role": "signal"},
+        {"type": "dielectric", "kind": "core", "thickness": 0.254, "material": "rogers.ro4350b", "label": "RO4350B",
+         "dk": 3.66, "df": 0.0037, "dk_freq_hz": 1e10, "locked": true},
+        {"type": "copper", "name": "In1.Cu", "thickness": 0.035, "role": "plane"},
+        {"type": "dielectric", "kind": "prepreg", "plies": [
+          {"thickness": 0.12, "material": "2116", "dk": 4.16, "df": 0.02},
+          {"thickness": 0.12, "material": "2116", "dk": 4.16, "df": 0.02}]},
+        {"type": "copper", "name": "In2.Cu", "thickness": 0.0152, "role": "signal"},
+        {"type": "dielectric", "kind": "core", "thickness": 0.45, "material": "FR4 core", "dk": 4.6, "df": 0.02},
+        {"type": "copper", "name": "In3.Cu", "thickness": 0.0152, "role": "signal"},
+        {"type": "dielectric", "kind": "prepreg", "plies": [
+          {"thickness": 0.12, "material": "2116", "dk": 4.16, "df": 0.02},
+          {"thickness": 0.12, "material": "2116", "dk": 4.16, "df": 0.02}]},
+        {"type": "copper", "name": "In4.Cu", "thickness": 0.035, "role": "plane"},
+        {"type": "dielectric", "kind": "core", "thickness": 0.254, "material": "FR4 core", "dk": 4.6, "df": 0.02},
+        {"type": "copper", "name": "B.Cu", "thickness": 0.035, "role": "signal"}]}
+  },
+  "expect": {
+    "source": "layers",
+    "fab": null,
+    "copper_layers": 6,
+    "kicad_copper_count": 6,
+    "thickness": 1.6284,
+    "gbrjob_rows": 15,
+    "roles": [["F.Cu", "signal", null], ["In1.Cu", "plane", "GND"], ["In2.Cu", "signal", null],
+              ["In3.Cu", "signal", null], ["In4.Cu", "plane", "GND"], ["B.Cu", "signal", null]],
+    "mask_source": "declared",
+    "issues": ["ST-W2"],
+    "drafts": 0
+  }
+}

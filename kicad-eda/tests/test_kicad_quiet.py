@@ -14,8 +14,10 @@ Live tier (skipped without a KiCad 9 bundled Python that imports pcbnew):
   a child that imports kicad_quiet, then trips SHAPE_POLY_SET::SquaredDistance
   (p, True) (a wx assert dialog on 9.0) and an EAGLE FootprintEnumerate of a
   missing .lbr (a wxLogError "can't open file" message box) exits 0 within
-  60 s (stdin=DEVNULL) with the error text on stderr; create_pcb builds a real
-  board through the same child-code path.
+  60 s (stdin=DEVNULL) with the error text on stderr; after its first
+  LoadBoard (KiCad's lazy initialisation) wx's active log target is still
+  kicad_quiet.log_target() and a second SquaredDistance(p, True) still shows
+  no dialog; create_pcb builds a real board through the same child-code path.
 """
 from __future__ import annotations
 
@@ -189,7 +191,8 @@ def quiet_violation(source: str) -> str | None:
     quiet_at = sorted((n.lineno, n.col_offset, i) for n in tree.body
                       for i in _is_import_of(n, "kicad_quiet"))
     if not quiet_at:
-        return f"imports pcbnew (line {pcbnew_at[0][0]}) without a module-level `import kicad_quiet`"
+        return (f"imports pcbnew (line {pcbnew_at[0][0]}) without a module-level "
+                "`import kicad_quiet`")
     if quiet_at[0] > pcbnew_at[0]:
         return (f"imports pcbnew at line {pcbnew_at[0][0]} before kicad_quiet "
                 f"(line {quiet_at[0][0]})")
@@ -320,8 +323,16 @@ eagle = pcbnew.PCB_IO_MGR.PluginFind(pcbnew.PCB_IO_MGR.EAGLE)
 names = list(eagle.FootprintEnumerate(sys.argv[2]))     # wxLogError message box
 pcbnew.SaveBoard(sys.argv[3], pcbnew.CreateEmptyBoard())
 loaded = pcbnew.LoadBoard(sys.argv[3])    # the first load logs wxLogDebug chatter
+# KiCad initialises lazily on the first LoadBoard: the quiet state must outlive
+# it (same log target, asserts still off), not just hold before it.
+import wx  # noqa: E402
+target_kept = wx.Log.GetActiveTarget() is kicad_quiet.log_target()
+print("assert-path-after-load", flush=True)
+outline_after_load = poly.SquaredDistance(inside, True)  # the 9.0 assert again
 print(json.dumps({"version": pcbnew.Version(), "outline_only": int(outline_only),
-                  "names": names, "loaded": loaded is not None}), flush=True)
+                  "names": names, "loaded": loaded is not None,
+                  "target_kept": target_kept,
+                  "outline_after_load": int(outline_after_load)}), flush=True)
 '''
 
 
@@ -349,9 +360,13 @@ def test_live_kicad9_child_with_kicad_quiet_never_shows_a_dialog(kicad9_python, 
                     f"stdout={e.stdout!r} stderr={e.stderr!r}")
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     assert "assert-path" in proc.stdout and "log-path" in proc.stdout
+    assert "assert-path-after-load" in proc.stdout, proc.stdout
     result = json.loads(proc.stdout.strip().splitlines()[-1])
     assert result["version"].startswith("9."), result
     assert result["names"] == [] and result["loaded"]
+    # the quiet state survived KiCad's lazy initialisation in the first LoadBoard
+    assert result["target_kept"] is True, result
+    assert result["outline_after_load"] == result["outline_only"], result
     assert "can't open file" in proc.stderr and "missing.lbr" in proc.stderr, proc.stderr
     # the first LoadBoard logs a dozen wxLogDebug lines; below Info they stay out
     assert "Adding duplicate image handler" not in proc.stderr, proc.stderr

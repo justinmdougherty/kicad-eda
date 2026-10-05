@@ -1,0 +1,24 @@
+{
+  "description": "ADR D7.2.4 default for copper_layers 8: the snapshot NOREQ 8L 1.6 mm 1 oz / 0.5 oz template, roles S G S P G S G S (M7): plane nets GND, first rail, then GND",
+  "design": {
+    "name": "default_8l",
+    "copper_layers": 8,
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]], "SIG": [["J1", "3"]]}
+  },
+  "expect": {
+    "source": "default",
+    "fab": "jlcpcb",
+    "copper_layers": 8,
+    "kicad_copper_count": 8,
+    "thickness": 1.6606,
+    "gbrjob_rows": 19,
+    "roles": [["F.Cu", "signal", null], ["In1.Cu", "plane", "GND"], ["In2.Cu", "signal", null],
+              ["In3.Cu", "plane", "+3V3"], ["In4.Cu", "plane", "GND"], ["In5.Cu", "signal", null],
+              ["In6.Cu", "plane", "GND"], ["B.Cu", "signal", null]],
+    "mask_source": "fab",
+    "issues": [],
+    "drafts": 4
+  }
+}

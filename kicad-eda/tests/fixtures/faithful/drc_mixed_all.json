@@ -1,0 +1,256 @@
+{
+    "$schema": "https://schemas.kicad.org/drc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-10-05T03:14:49-0400",
+    "kicad_version": "9.0.4",
+    "schematic_parity": [],
+    "source": "mixed.kicad_pcb",
+    "unconnected_items": [
+        {
+            "description": "Missing connection between items",
+            "items": [
+                {
+                    "description": "Pad 1 [N1] of R1 on F.Cu",
+                    "pos": {
+                        "x": 119.175,
+                        "y": 88.0
+                    },
+                    "uuid": "ad7b14e9-e521-422e-a1c6-1c993ca540fa"
+                },
+                {
+                    "description": "Pad 1 [N1] of R2 on F.Cu",
+                    "pos": {
+                        "x": 119.175,
+                        "y": 89.3
+                    },
+                    "uuid": "cc7252da-42bb-43eb-9983-85004054c15d"
+                }
+            ],
+            "severity": "error",
+            "type": "unconnected_items"
+        }
+    ],
+    "violations": [
+        {
+            "description": "Track has unconnected end",
+            "items": [
+                {
+                    "description": "Track [SIG] on F.Cu, length 8.0000 mm",
+                    "pos": {
+                        "x": 126.0,
+                        "y": 99.35
+                    },
+                    "uuid": "de62b835-9286-479e-a652-47a41a070a50"
+                }
+            ],
+            "severity": "warning",
+            "type": "track_dangling"
+        },
+        {
+            "description": "Clearance violation (netclass 'Default' clearance 0.2000 mm; actual 0.0500 mm)",
+            "items": [
+                {
+                    "description": "Track [SIG] on F.Cu, length 8.0000 mm",
+                    "pos": {
+                        "x": 126.0,
+                        "y": 99.35
+                    },
+                    "uuid": "de62b835-9286-479e-a652-47a41a070a50"
+                },
+                {
+                    "description": "Pad 1 [OTHER] of R3 on F.Cu",
+                    "pos": {
+                        "x": 129.175,
+                        "y": 100.0
+                    },
+                    "uuid": "ee9c63a3-ae2e-4687-ae14-60c1b80d7b2f"
+                }
+            ],
+            "severity": "error",
+            "type": "clearance"
+        },
+        {
+            "description": "Clearance violation (netclass 'Default' clearance 0.2000 mm; actual 0.0000 mm)",
+            "items": [
+                {
+                    "description": "Pad 1 [A] of JP1 on F.Cu",
+                    "pos": {
+                        "x": 107.35,
+                        "y": 88.0
+                    },
+                    "uuid": "53146a9d-4bb9-47e3-866e-639e3d29d5f9"
+                },
+                {
+                    "description": "Segment [<no net>] of JP1 on F.Cu",
+                    "pos": {
+                        "x": 107.35,
+                        "y": 88.0
+                    },
+                    "uuid": "e1fd87b7-cef2-4e2f-9139-3ad5e28eac33"
+                }
+            ],
+            "severity": "error",
+            "type": "clearance"
+        },
+        {
+            "description": "Clearance violation (netclass 'Default' clearance 0.2000 mm; actual 0.0000 mm)",
+            "items": [
+                {
+                    "description": "Pad 2 [B] of JP1 on F.Cu",
+                    "pos": {
+                        "x": 108.65,
+                        "y": 88.0
+                    },
+                    "uuid": "21e558c6-a480-453c-826b-c905064e162e"
+                },
+                {
+                    "description": "Segment [<no net>] of JP1 on F.Cu",
+                    "pos": {
+                        "x": 107.35,
+                        "y": 88.0
+                    },
+                    "uuid": "e1fd87b7-cef2-4e2f-9139-3ad5e28eac33"
+                }
+            ],
+            "severity": "error",
+            "type": "clearance"
+        },
+        {
+            "description": "Courtyards overlap",
+            "items": [
+                {
+                    "description": "Footprint R1",
+                    "pos": {
+                        "x": 120.0,
+                        "y": 88.0
+                    },
+                    "uuid": "d572c52c-eced-4a02-a7e2-86a327fe4bff"
+                },
+                {
+                    "description": "Footprint R2",
+                    "pos": {
+                        "x": 120.0,
+                        "y": 89.3
+                    },
+                    "uuid": "e5963379-e0f9-49a3-8ae8-7e3dd41ae5cd"
+                }
+            ],
+            "severity": "error",
+            "type": "courtyards_overlap"
+        },
+        {
+            "description": "The current configuration does not include the footprint library 'Fixture'.",
+            "items": [
+                {
+                    "description": "Footprint JP1",
+                    "pos": {
+                        "x": 108.0,
+                        "y": 88.0
+                    },
+                    "uuid": "7432cc53-93b5-4cde-b22c-d59b893f9f53"
+                }
+            ],
+            "severity": "warning",
+            "type": "lib_footprint_issues"
+        },
+        {
+            "description": "Silkscreen clipped by solder mask",
+            "items": [
+                {
+                    "description": "Reference field of JP1",
+                    "pos": {
+                        "x": 108.0,
+                        "y": 88.0
+                    },
+                    "uuid": "ff040d7d-feac-43ec-b84b-a45634be49f9"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_over_copper"
+        },
+        {
+            "description": "Silkscreen clipped by solder mask",
+            "items": [
+                {
+                    "description": "Reference field of R2",
+                    "pos": {
+                        "x": 120.0,
+                        "y": 87.87
+                    },
+                    "uuid": "aceb83d9-add9-49fe-8d21-b813a362b190"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_over_copper"
+        },
+        {
+            "description": "Front solder mask aperture bridges items with different nets",
+            "items": [
+                {
+                    "description": "Segment [<no net>] of JP1 on F.Cu",
+                    "pos": {
+                        "x": 107.35,
+                        "y": 88.0
+                    },
+                    "uuid": "e1fd87b7-cef2-4e2f-9139-3ad5e28eac33"
+                },
+                {
+                    "description": "Pad 1 [A] of JP1 on F.Cu",
+                    "pos": {
+                        "x": 107.35,
+                        "y": 88.0
+                    },
+                    "uuid": "53146a9d-4bb9-47e3-866e-639e3d29d5f9"
+                }
+            ],
+            "severity": "error",
+            "type": "solder_mask_bridge"
+        },
+        {
+            "description": "Front solder mask aperture bridges items with different nets",
+            "items": [
+                {
+                    "description": "Segment [<no net>] of JP1 on F.Cu",
+                    "pos": {
+                        "x": 107.35,
+                        "y": 88.0
+                    },
+                    "uuid": "e1fd87b7-cef2-4e2f-9139-3ad5e28eac33"
+                },
+                {
+                    "description": "Pad 2 [B] of JP1 on F.Cu",
+                    "pos": {
+                        "x": 108.65,
+                        "y": 88.0
+                    },
+                    "uuid": "21e558c6-a480-453c-826b-c905064e162e"
+                }
+            ],
+            "severity": "error",
+            "type": "solder_mask_bridge"
+        },
+        {
+            "description": "Silkscreen overlap",
+            "items": [
+                {
+                    "description": "Segment of R1 on F.Silkscreen",
+                    "pos": {
+                        "x": 119.762742,
+                        "y": 87.4775
+                    },
+                    "uuid": "157fc457-e885-4803-8b3e-8ec5312f4f00"
+                },
+                {
+                    "description": "Reference field of R2",
+                    "pos": {
+                        "x": 120.0,
+                        "y": 87.87
+                    },
+                    "uuid": "aceb83d9-add9-49fe-8d21-b813a362b190"
+                }
+            ],
+            "severity": "warning",
+            "type": "silk_overlap"
+        }
+    ]
+}

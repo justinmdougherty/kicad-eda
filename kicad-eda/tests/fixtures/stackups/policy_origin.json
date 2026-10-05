@@ -1,0 +1,26 @@
+{
+  "description": "What the napkin layer default (D7.11) writes into the netlist: preset + origin layer_policy + rationale; stackup_model reports source 'policy' whenever origin is layer_policy",
+  "design": {
+    "name": "policy_origin",
+    "mode": "napkin",
+    "copper_layers": 4,
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]], "SIG": [["J1", "3"]]},
+    "stackup": {"preset": "jlcpcb:JLC04161H-7628", "origin": "layer_policy",
+                "rationale": "napkin default: 4 layers (no impedance or RF nets)"}
+  },
+  "expect": {
+    "source": "policy",
+    "fab": "jlcpcb",
+    "copper_layers": 4,
+    "kicad_copper_count": 4,
+    "thickness": 1.6472,
+    "gbrjob_rows": 9,
+    "roles": [["F.Cu", "signal", null], ["In1.Cu", "plane", "GND"], ["In2.Cu", "plane", "+3V3"],
+              ["B.Cu", "signal", null]],
+    "mask_source": "fab",
+    "issues": [],
+    "drafts": 2
+  }
+}

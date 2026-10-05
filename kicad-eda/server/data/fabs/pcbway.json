@@ -1,0 +1,39 @@
+{
+  "schema": "kicad-eda/fabs@1",
+  "id": "pcbway",
+  "name": "PCBWay",
+  "retrieved": "2026-10-04",
+  "sources": [
+    {"title": "PCBWay PCB capabilities (fetched 2026-10-04)", "url": "https://www.pcbway.com/capabilities.html"},
+    {"title": "PCBWay high-frequency PCB capabilities (fetched 2026-10-05)", "url": "https://www.pcbway.com/pcb_prototype/What_is_High_Frequency__HF__PCB_.html"},
+    {"title": "PCBWay multi-layer laminated structures (298 standard stackups, not machine-readable)", "url": "https://www.pcbway.com/multi-layer-laminated-structure.html"}
+  ],
+  "capabilities": {
+    "layer_counts": [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],
+    "layer_counts_note": "standard 1-14 layers; up to 16 normal multilayer, 18-24 non-standard review, above 24 not made",
+    "impedance_layer_counts": null,
+    "impedance_tolerance_pct": 10,
+    "impedance_note": "impedance control tolerance +/-10 %, 50 ohm and below +/-5 ohm (capabilities page); no layer-count restriction stated",
+    "thicknesses_mm": [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0, 2.4, 2.6, 2.8, 3.0, 3.2],
+    "thickness_tolerance": [{"from_mm": 1.0, "pct": 10}, {"from_mm": 0.0, "abs_mm": 0.1}],
+    "outer_cu_oz": [1, 2, 3, 4, 5, 6, 7, 8],
+    "inner_cu_oz": [1, 1.5, 2, 3, 4],
+    "min_track_mm": 0.1,
+    "min_clearance_mm": 0.1,
+    "materials": ["category:fr4"],
+    "materials_note": "FR-4, CEM-3, LianMao IT158/IT180A; high-Tg and halogen-free as advanced PCB",
+    "rf": {
+      "materials": ["rogers.ro4003c", "rogers.ro4350b", "rogers.ro3003", "rogers.ro3010", "rogers.rt5880", "rogers.ro4450f"],
+      "layer_counts": null,
+      "thickness_range_mm": [0.2, 3.2],
+      "cu_oz": [1, 2],
+      "note": "HF page: RO4003C, RO4350B, RO3003, RO3010, RT5880; RO4450F as the prepreg of pure RO4000 multilayers"
+    },
+    "hybrid": true,
+    "hybrid_note": "Rogers4 series + FR-4 mixed (prepreg ShengYi and ROGERS4403 series); PTFE+FR4; pure RO4000 multilayer with 4450F prepreg",
+    "ptfe_multilayer": false,
+    "ptfe_note": "pure PTFE multilayer cannot be made (lamination temperature; Rogers copper foil cannot be laminated directly)"
+  },
+  "dk_basis": "design",
+  "templates": {}
+}

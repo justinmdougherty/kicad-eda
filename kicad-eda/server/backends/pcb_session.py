@@ -29,26 +29,48 @@ open-document lists:
 * ``headless`` always launches a private server (needs KiCad 11);
 * ``gui`` requires a reachable KiCad GUI whose PCB editor has the board open;
 * ``auto`` uses the GUI when the board is open there, else headless.
+
+LIBRARIES (ROADMAP D0/D1, verified on kicad-cli 10.99.0-4025): a headless
+api-server loads no library on its own, so PlaceFootprintFromLibrary answers
+"footprint '<lib_id>' not found" until ``load_libraries`` ran (once per bound
+board; a GUI preloads its own). KiCad reads the PROJECT ``fp-lib-table``
+(``${KIPRJMOD}`` = the board's directory) when the board is opened, never
+later: write it (``libtable.LibraryResolver.materialize``) before opening.
+``footprint_library_hint`` says what the last load reported for a nickname.
 """
 from __future__ import annotations
 
 import os
+import sys
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import Any
 
 import kicad_env as env
 from backends import kipy_bridge as kb
 from backends.errors import BoardApiError
-from backends.sch_session import NO_HANDLER, norm_path
+from backends.sch_session import LIB_TABLE_HINT, NO_HANDLER, norm_path
+
+if str(env.TOOLS_DIR) not in sys.path:      # server/tools holds libtable (stdlib-only)
+    sys.path.insert(0, str(env.TOOLS_DIR))
+import libtable  # noqa: E402
 
 MODES = ("auto", "gui", "headless")
 HEADLESS_TIMEOUT_MS = 60_000        # zone refills on a dense board take a while
 GUI_TIMEOUT_MS = 2_000
+LIBRARY_TIMEOUT_S = 120.0           # ~8 s for the 155 stock footprint libraries
 PCB_SUFFIX = ".kicad_pcb"
+FP_TABLE = libtable.TABLE_FILES[libtable.FOOTPRINT]          # "fp-lib-table"
 NO_API_HINT = ("no KiCad with `kicad-cli api-server` found (needs a KiCad 11 nightly, "
                "10.99+)")
+# Leads the hint once a load showed zero global footprint libraries (empty config dir).
+GLOBAL_FP_TABLES_MISSING = "KiCad 11 has no global footprint library table"
+_KIND_NAMES = {kb.LT_SYMBOL: "symbol", kb.LT_FOOTPRINT: "footprint"}
 
 __all__ = ["MODES", "BoardSession", "connect", "select_mode", "resolve_auto", "doc_pcb_path",
-           "open_boards", "open_board_paths", "no_api_reason", "norm_path"]
+           "open_boards", "open_board_paths", "no_api_reason", "norm_path", "FP_TABLE",
+           "GLOBAL_FP_TABLES_MISSING", "footprint_library_hint", "footprint_library_state",
+           "footprint_statuses"]
 
 
 def doc_pcb_path(doc) -> str:
@@ -130,6 +152,68 @@ def no_api_reason() -> str:
     return f"{NO_API_HINT}; installs seen: {seen}"
 
 
+# --- footprint libraries ------------------------------------------------------
+def footprint_library_hint(project_dir: str | os.PathLike | None,
+                           global_tables_missing: bool = False) -> str:
+    """Where a footprint library must be for KiCad to place from it: a row of
+    ``<project_dir>/fp-lib-table`` (marked absent when there is no such file)
+    present when the board was opened; led by GLOBAL_FP_TABLES_MISSING when a
+    load saw zero global footprint libraries."""
+    if project_dir:
+        table = Path(project_dir) / FP_TABLE
+        where = str(table) if table.is_file() else f"{table} (absent)"
+    else:
+        where = f"the project's {FP_TABLE}"
+    project = (f"a project footprint library must be a row of {where} (URI ${{KIPRJMOD}}/...) "
+               "written before the board was opened: KiCad reads that table when it opens "
+               "the board, never later (write it, then open the board again)")
+    if global_tables_missing:
+        return (f"{GLOBAL_FP_TABLES_MISSING} (0 global footprint libraries loaded): "
+                f"{LIB_TABLE_HINT}; {project}")
+    return (f"{project}; stock footprints come from the global {FP_TABLE} in KiCad 11's "
+            f"config dir (a copy of <install>/share/kicad/template/{FP_TABLE})")
+
+
+def footprint_statuses(statuses: Iterable) -> dict[str, Any]:
+    """{nickname: library status} of the footprint rows of a library-status
+    list; a project row shadows a global row of the same nickname (as KiCad
+    resolves a nickname)."""
+    rows = [s for s in statuses if s.type == kb.LT_FOOTPRINT]
+    ordered = ([s for s in rows if s.scope != kb.LTS_PROJECT]
+               + [s for s in rows if s.scope == kb.LTS_PROJECT])
+    return {s.nickname: s for s in ordered}
+
+
+def footprint_library_state(nickname: str, statuses: Mapping[str, Any], loaded: bool) -> str:
+    """What the last load said about footprint library ``nickname`` ('' when
+    nothing was loaded: a GUI session, or before the first load)."""
+    if not loaded:
+        return ""
+    status = statuses.get(nickname)
+    if status is None:
+        return (f"KiCad has no footprint library {nickname!r} (no row of that name in the "
+                f"project or the global {FP_TABLE})")
+    where = f"{'project' if status.scope == kb.LTS_PROJECT else 'global'} {FP_TABLE}"
+    if status.status == kb.LLS_LOADED:
+        return f"footprint library {nickname!r} ({where}) is loaded: check the footprint name"
+    reason = status.error_message or "no error message"
+    return (f"footprint library {nickname!r} ({where}) did not load: "
+            f"{kb.library_status_name(status.status)}: {reason}")
+
+
+def _library_kinds(kinds: int | Iterable[int]) -> list[int]:
+    """Unique kipy LibraryType values, in order, from one value or several."""
+    try:
+        values = [kinds] if isinstance(kinds, int) else list(kinds)
+    except TypeError:
+        values = []
+    if not values or any(isinstance(k, bool) or not isinstance(k, int) or k <= 0
+                         for k in values):
+        raise BoardApiError("kinds must be kipy LibraryType values (kb.LT_FOOTPRINT, "
+                            f"kb.LT_SYMBOL), got {kinds!r}")
+    return list(dict.fromkeys(values))
+
+
 def _version_string(kicad) -> str:
     """The connected KiCad's version: the FIRST request on a new connection
     (kipy dials lazily, so an absent socket surfaces here)."""
@@ -151,7 +235,8 @@ def _probe_gui(kicad) -> str | None:
 
 
 class BoardSession:
-    """A KiCad connection that can hand out the kipy Board for a path."""
+    """A KiCad connection that can hand out the kipy Board for a path, plus
+    the footprint-library state of the board it serves (see LIBRARIES)."""
 
     def __init__(self, kicad, mode: str, install: env.KiCadInstall | None = None,
                  kicad_version: str | None = None) -> None:
@@ -159,6 +244,12 @@ class BoardSession:
         self.mode = mode
         self.install = install
         self.kicad_version = kicad_version or _version_string(kicad)
+        self.project_dir: Path | None = None             # the bound board's directory
+        self.library_errors: list[str] = []
+        self.global_footprint_libraries: int | None = None   # None = not loaded / GUI
+        self._footprint_libraries: dict[str, Any] = {}
+        self._loaded_kinds: frozenset[int] = frozenset()
+        self._bound: str | None = None
         self._closed = False
 
     # --- construction -------------------------------------------------------
@@ -201,14 +292,20 @@ class BoardSession:
     def board(self, path: str | os.PathLike) -> kb.Board:
         """The kipy Board bound to ``path``: the preloaded board of a headless
         server (which holds exactly one, so a single open board is it), or the
-        matching PCB-editor document of a GUI."""
+        matching PCB-editor document of a GUI. Binding another board than
+        before (a new open/create) drops the library state."""
+        doc = self._document(path)
+        self._bind(path)
+        return kb.Board(self.kicad._client, doc)  # noqa: SLF001 (mirrors kipy.get_board)
+
+    def _document(self, path: str | os.PathLike) -> Any:
         docs = open_boards(self.kicad)
         wanted = norm_path(path)
         for doc in docs:
             if norm_path(doc_pcb_path(doc)) == wanted:
-                return kb.Board(self.kicad._client, doc)  # noqa: SLF001 (mirrors kipy.get_board)
+                return doc
         if self.mode == "headless" and len(docs) == 1:
-            return kb.Board(self.kicad._client, docs[0])  # noqa: SLF001
+            return docs[0]
         open_now = [doc_pcb_path(d) for d in docs] or ["none"]
         if self.mode == "headless":
             raise BoardApiError(
@@ -217,6 +314,70 @@ class BoardSession:
         raise BoardApiError(
             f"{path} is not open in the running KiCad PCB editor (open: {open_now}); open it "
             "there or use mode='headless'")
+
+    def _bind(self, path: str | os.PathLike) -> None:
+        """Serve the board at ``path``. Another board means another project
+        whose fp-lib-table KiCad read when it opened that board: every library
+        cache is dropped, so the next use loads again."""
+        key = norm_path(path)
+        if key == self._bound:
+            return
+        self._bound = key
+        self.project_dir = Path(os.path.abspath(str(path))).parent
+        self.library_errors = []
+        self.global_footprint_libraries = None
+        self._footprint_libraries = {}
+        self._loaded_kinds = frozenset()
+
+    # --- libraries ----------------------------------------------------------
+    @property
+    def project_table(self) -> Path | None:
+        """``<project>/fp-lib-table`` of the bound board (None before one)."""
+        return None if self.project_dir is None else self.project_dir / FP_TABLE
+
+    @property
+    def global_footprint_tables_missing(self) -> bool:
+        """True once a load showed KiCad has zero global footprint libraries."""
+        return self.global_footprint_libraries == 0
+
+    def load_libraries(self, kinds: int | Iterable[int] = (kb.LT_FOOTPRINT,),
+                       timeout_s: float = LIBRARY_TIMEOUT_S) -> None:
+        """Load the library tables of ``kinds`` (kipy LibraryType values,
+        footprints by default) once per bound board: a headless KiCad 11 has
+        none loaded and cannot place from a library before this. A no-op for a
+        GUI session (the GUI preloads). A failed load raises BoardApiError
+        naming the project fp-lib-table and is not cached."""
+        wanted = _library_kinds(kinds)
+        missing = [kind for kind in wanted if kind not in self._loaded_kinds]
+        if self.mode != "headless" or not missing:
+            return
+        what = " and ".join(_KIND_NAMES.get(kind, f"type-{kind}") for kind in missing)
+        try:
+            self.kicad.load_all_libraries(missing)
+            statuses = self.kicad.wait_for_libraries(types=missing, timeout_s=timeout_s)
+        except kb.KIPY_EXCEPTIONS as exc:
+            raise BoardApiError(f"loading KiCad {what} libraries failed: {exc}; "
+                                f"{self.footprint_library_hint()}") from exc
+        self._record(list(statuses), missing)
+        self._loaded_kinds = self._loaded_kinds | frozenset(missing)
+
+    def _record(self, statuses: list, kinds: list[int]) -> None:
+        failed = [f"{s.nickname}: {s.error_message}" for s in statuses
+                  if s.status != kb.LLS_LOADED and s.error_message]
+        self.library_errors = [*self.library_errors, *failed]
+        if kb.LT_FOOTPRINT in kinds:
+            self._footprint_libraries = footprint_statuses(statuses)
+            self.global_footprint_libraries = sum(
+                1 for s in statuses if s.type == kb.LT_FOOTPRINT and s.scope == kb.LTS_GLOBAL)
+
+    def footprint_library_hint(self, nickname: str = "") -> str:
+        """What the last load said about ``nickname`` (when given and known),
+        then where the project's footprint libraries must be."""
+        loaded = kb.LT_FOOTPRINT in self._loaded_kinds
+        state = (footprint_library_state(nickname, self._footprint_libraries, loaded)
+                 if nickname else "")
+        hint = footprint_library_hint(self.project_dir, self.global_footprint_tables_missing)
+        return f"{state}; {hint}" if state else hint
 
     # --- lifecycle ----------------------------------------------------------
     def close(self) -> None:

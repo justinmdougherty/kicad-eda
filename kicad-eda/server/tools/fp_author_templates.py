@@ -18,10 +18,14 @@ spans, pitches) into a spec:
   * pin_header      - through-hole rows x cols; pin 1 square, zig-zag numbering;
   * lg290p          - Quectel LG290P(03), LGA-79: the first authoring target.
 
-Units are mm, in the KiCad footprint frame (+Y down). Stdlib-only.
+Also the helpers fp_author, fp_reader and fp_compare share: has_copper,
+pad_bbox, natural_key, r6. Units are mm, in the KiCad footprint frame (+Y
+down). Stdlib-only (Python 3.11: KiCad-python code may import it).
 """
 from __future__ import annotations
 
+import math
+import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
@@ -43,6 +47,25 @@ _BAD_NAME_CHARS = set('/\\:*?"<>|')
 def has_copper(pad: Any) -> bool:
     """True when a pad (spec or parsed) has a copper layer."""
     return any(layer.endswith(".Cu") for layer in pad.pad_layers)
+
+
+def pad_bbox(pad: Any) -> tuple[float, float, float, float]:
+    """Axis-aligned extent (x0, y0, x1, y1) of a pad (spec or parsed), any rotation."""
+    a = math.radians(pad.rotation)
+    c, s = abs(math.cos(a)), abs(math.sin(a))
+    hw, hh = (pad.w * c + pad.h * s) / 2, (pad.w * s + pad.h * c) / 2
+    return (pad.x - hw, pad.y - hh, pad.x + hw, pad.y + hh)
+
+
+def natural_key(name: str) -> list[tuple[int, int, str]]:
+    """Sort key for pad names: digit runs compare as numbers, so "2" < "10"
+    and "A2" < "A10" < "B2"."""
+    return [(0, int(t), "") if t.isdigit() else (1, 0, t) for t in re.findall(r"\d+|\D+", name)]
+
+
+def r6(v: float) -> float:
+    """``v`` rounded to 1 nm (6 decimals in mm); -0.0 becomes 0.0."""
+    return round(v, 6) + 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +166,9 @@ class Model:
 class FootprintSpec:
     """Everything fp_author.render() needs. ``pin1`` is the pad number the fab
     chamfer and silk marker point at (None: neither); ``pin1_side`` puts the
-    marker beyond that body side of the pad ("auto" = the nearest side)."""
+    marker beyond that side of the pad ("auto": the sides pin 1 faces, the
+    nearest body edge first; "none": no marker). The marker stays inside the
+    courtyard when it fits there (see fp_author.place_pin1_marker)."""
     name: str
     pads: tuple[Pad, ...]
     body: Body
@@ -378,8 +403,8 @@ def lcc_castellated(name: str, *, body: Body, pitch: float, pins: tuple[int, int
     centred on the edge), numbered like a QFN."""
     x0, y0, x1, y1 = body.rect(edge_offset)
     at = {"L": x0, "R": x1, "T": y0, "B": y1}
-    pads = perimeter_pads(dict(zip(("L", "B", "R", "T"), pins)), at, pitch, pad_w, pad_l, shape,
-                          centre=(body.x, body.y))
+    pads = perimeter_pads(dict(zip(("L", "B", "R", "T"), pins, strict=True)), at, pitch, pad_w,
+                          pad_l, shape, centre=(body.x, body.y))
     return _spec(name, _with_ep(pads, ep), body, {"pin1_side": "L"}, spec_kw)
 
 
@@ -432,7 +457,7 @@ def lg290p_numbering(col: int, row: int) -> str:
     return str(25 + 11 * col + row)
 
 
-def lg290p(model: Model | None = None) -> FootprintSpec:
+def lg290p(**spec_kw: Any) -> FootprintSpec:
     """Quectel LG290P(03), LGA-79, exactly per Hardware Design V1.0 Fig. 18.
 
     24 edge pads 1.5 x 0.8 mm at 1.1 mm pitch, x = +/-5.05 (1.05 mm from the
@@ -442,24 +467,30 @@ def lg290p(model: Model | None = None) -> FootprintSpec:
     (x = -2.8 .. 2.8, y = -7.0 .. 7.0); pad 25 (top left) is a 1.0 mm round
     pad. Body 12.2 (+0.3/-0.15) x 16.0 (+0.3/-0.15) x 2.6 +/- 0.2 mm; the
     courtyard uses the max body (12.5 x 16.3) and the height the max (2.8).
+
+    Keyword arguments go to the FootprintSpec (descr, tags, datasheet, model,
+    pin1, pin1_side, attr_flags, courtyard_excess). The pin-1 marker sits
+    above pin 1 ("T"): left of it the courtyard (+/-6.5) has no room for it.
     """
     left = pitch_run(-7.0, 1.1, 7) + pitch_run(2.6, 1.1, 5)            # pins 1-7, gap, 8-12
     rows = (EdgeRow("L", -5.05, left, 1, length=1.5, width=0.8),
             EdgeRow("R", 5.05, tuple(reversed(left)), 13, length=1.5, width=0.8))
     grid = PadGrid(xs=pitch_run(-2.8, 1.4, 5), ys=pitch_run(-7.0, 1.4, 11), w=1.0, h=1.0)
+    defaults = {
+        "descr": ("Quectel LG290P(03) multi-band RTK GNSS module, LGA-79, 12.2x16.0x2.6 mm; "
+                  f"{LG290P_SOURCE}; keep other components >= 3 mm from the module"),
+        "tags": "Quectel LG290P GNSS RTK LGA-79", "datasheet": LG290P_DATASHEET,
+        "pin1_side": "T"}
     return lga_grid(
         LG290P_NAME, body=Body(12.2, 16.0, w_max=12.5, h_max=16.3, height=2.8),
         edge_rows=rows, grid=grid, numbering=lg290p_numbering, shapes={"25": "circle"},
-        descr=("Quectel LG290P(03) multi-band RTK GNSS module, LGA-79, 12.2x16.0x2.6 mm; "
-               f"{LG290P_SOURCE}; keep other components >= 3 mm from the module"),
-        tags="Quectel LG290P GNSS RTK LGA-79", datasheet=LG290P_DATASHEET, model=model,
-        pin1_side="L")
+        **{**defaults, **spec_kw})
 
 
 def pad_groups(functions: Mapping[str, str]) -> dict[str, list[str]]:
-    """{function: [pad numbers in numeric order]}: lets a netlist name all 59
+    """{function: [pad numbers in natural order]}: lets a netlist name all 59
     LG290P GND pads at once (D1 ``pin_groups``)."""
     groups: dict[str, list[str]] = {}
-    for number in sorted(functions, key=lambda n: (len(n), n)):
+    for number in sorted(functions, key=natural_key):
         groups.setdefault(functions[number], []).append(number)
     return groups

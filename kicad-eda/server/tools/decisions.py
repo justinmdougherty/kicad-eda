@@ -37,16 +37,30 @@ can end inside a multibyte character). A torn last line (a crash mid-write)
 is closed with a newline before the next entry so it costs only itself. The
 reader splits on "\\n" alone and decodes each line separately (a log written
 by another tool may hold raw UTF-8), naming every bad line by its number.
+
+Writers are serialised by an exclusive ``<log>.lock`` file (the harness and
+agents may append at once; 'a' mode on Windows is seek-then-write, so
+unlocked writers overwrite each other's lines): created with O_CREAT|O_EXCL,
+retried every LOCK_RETRY_S for up to LOCK_TIMEOUT_S, held around the
+torn-tail check and the write, removed afterwards. A lock older than
+LOCK_STALE_S (a writer that died holding it) is broken once per append and
+noted on stderr; a lock that cannot be taken is a DecisionError and nothing
+is written. (Breaking is a stat then a remove: two writers that see the
+same stale lock within microseconds could both take it. A lock is held for
+milliseconds and is stale only after a crash, so that window is accepted.)
 """
 from __future__ import annotations
 
 import codecs
 import json
 import os
+import sys
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple
+from typing import Any, Iterator, Mapping, NamedTuple
 
 from netlist_schema import CONFIDENCE_LEVELS
 
@@ -67,6 +81,17 @@ DECISIONS_SUFFIX = ".decisions.jsonl"
 STEM_SUFFIXES: tuple[str, ...] = (".json", ".kicad_pcb", ".kicad_sch", ".kicad_pro")
 ID_PREFIX = "dec-"
 ID_HEX_DIGITS = 12
+
+LOCK_SUFFIX = ".lock"            # <stem>.decisions.jsonl.lock
+LOCK_RETRY_S = 0.01              # poll interval while another writer holds the lock
+LOCK_TIMEOUT_S = 10.0            # then DecisionError, nothing written
+LOCK_STALE_S = 60.0              # a lock this old belongs to a dead writer: broken once
+LOCK_STALE_POLL_S = 0.5          # how often a waiting writer re-checks the lock's age
+LOCK_RELEASE_S = 2.0             # retry window for removing our own lock (Windows sharing)
+# Windows reports a lock being deleted, or briefly opened by another process's
+# stat, as access denied: busy, not a permission problem. POSIX does not.
+_LOCK_BUSY: tuple[type[OSError], ...] = ((FileExistsError, PermissionError) if os.name == "nt"
+                                         else (FileExistsError,))
 
 
 class DecisionError(ValueError):
@@ -94,6 +119,12 @@ def decisions_path(path: str | os.PathLike) -> Path:
     if p.suffix in STEM_SUFFIXES:
         p = p.with_suffix("")
     return p.with_name(p.name + DECISIONS_SUFFIX)
+
+
+def lock_path(path: str | os.PathLike) -> Path:
+    """``<stem>.decisions.jsonl.lock``: the writer lock of decisions_path(path)."""
+    log = decisions_path(path)
+    return log.with_name(log.name + LOCK_SUFFIX)
 
 
 # --- field checks ---------------------------------------------------------------
@@ -232,20 +263,116 @@ def _ends_without_newline(path: Path) -> bool:
         return False
 
 
+# --- the writer lock ------------------------------------------------------------
+def _remove_lock(lock: Path) -> bool:
+    """Remove ``lock``; True when it is gone (also when someone else removed
+    it), False when it could not be removed (busy / not permitted)."""
+    try:
+        os.remove(lock)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _lock_age(lock: Path) -> float | None:
+    """Seconds since ``lock`` was written; None when it is gone or unreadable."""
+    try:
+        return time.time() - os.stat(lock).st_mtime
+    except OSError:
+        return None
+
+
+def _break_if_stale(lock: Path) -> bool:
+    """Break ``lock`` when it is older than LOCK_STALE_S (noted on stderr).
+    True when a break was attempted (the one break an append gets)."""
+    age = _lock_age(lock)
+    if age is None or age <= LOCK_STALE_S:
+        return False
+    what = "broke" if _remove_lock(lock) else "could not remove"
+    print(f"decisions: {what} a stale lock {lock} ({age:.0f} s old, older than "
+          f"{LOCK_STALE_S:.0f} s: its writer died holding it)", file=sys.stderr)
+    return True
+
+
+def _try_create(lock: Path) -> bool:
+    """Create ``lock`` exclusively; False when another writer holds it. A
+    missing directory or (on POSIX) a permission problem raises OSError."""
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except _LOCK_BUSY:
+        return False
+    try:
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))     # who holds it, for a human
+    except OSError:
+        os.close(fd)
+        _remove_lock(lock)                                     # never leave a lock behind
+        raise
+    os.close(fd)
+    return True
+
+
+def _acquire(lock: Path) -> None:
+    """Take ``lock``, waiting up to LOCK_TIMEOUT_S; DecisionError otherwise."""
+    deadline = time.monotonic() + LOCK_TIMEOUT_S
+    next_stale_check, break_tried = time.monotonic(), False
+    while not _try_create(lock):
+        now = time.monotonic()
+        if not break_tried and now >= next_stale_check:
+            next_stale_check = now + LOCK_STALE_POLL_S
+            if _break_if_stale(lock):
+                break_tried = True
+                continue
+        if now >= deadline:
+            raise DecisionError(
+                f"could not lock the decision log: {lock} is held by another writer (waited "
+                f"{LOCK_TIMEOUT_S:g} s; it is broken only when older than {LOCK_STALE_S:g} s); "
+                f"nothing written")
+        time.sleep(LOCK_RETRY_S)
+
+
+def _release(lock: Path) -> None:
+    """Remove our lock, retrying briefly (on Windows another process's stat
+    can hold it open for a moment); a lock left behind is noted on stderr
+    and becomes stale for the next writer."""
+    deadline = time.monotonic() + LOCK_RELEASE_S
+    while not _remove_lock(lock):
+        if time.monotonic() >= deadline:
+            print(f"decisions: could not remove the lock {lock}; the next writer breaks it "
+                  f"after {LOCK_STALE_S:g} s", file=sys.stderr)
+            return
+        time.sleep(LOCK_RETRY_S)
+
+
+@contextmanager
+def _log_lock(log: Path) -> Iterator[None]:
+    """Hold ``lock_path(log)`` for the body (see the module doc)."""
+    lock = lock_path(log)
+    _acquire(lock)
+    try:
+        yield
+    finally:
+        _release(lock)
+
+
 def append_decision(stem_path: str | os.PathLike, **fields: Any) -> dict:
     """Validate ``fields`` (D5 entry fields minus ``id``/``ts``; alternatives
     None is written as []), stamp them with a fresh id and a UTC timestamp,
-    and append the entry as one line to ``decisions_path(stem_path)``.
-    Returns the entry written (a new dict).
+    and append the entry as one line to ``decisions_path(stem_path)`` while
+    holding the writer lock (``lock_path``). Returns the entry written (a new
+    dict).
     Raises DecisionError, before touching the file, when a field is missing,
-    unknown or malformed; OSError when the log cannot be written."""
+    unknown or malformed, or when the lock cannot be taken within
+    LOCK_TIMEOUT_S; OSError when the log cannot be written."""
     entry = _entry_from_fields(fields)
     path = decisions_path(stem_path)
     line = json.dumps(entry, ensure_ascii=True) + "\n"     # pure ASCII: see the module doc
-    if _ends_without_newline(path):
-        line = "\n" + line
-    with open(path, "a", encoding="ascii", newline="\n") as f:
-        f.write(line)
+    with _log_lock(path):
+        if _ends_without_newline(path):
+            line = "\n" + line
+        with open(path, "a", encoding="ascii", newline="\n") as f:
+            f.write(line)
     return entry
 
 

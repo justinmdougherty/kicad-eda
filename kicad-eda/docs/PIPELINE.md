@@ -43,7 +43,9 @@ and hangs headless; 1.9.0 is the pinned router**).
 
 ## 2. Author the netlist (`netlist.json`)
 
-The single source of truth. Pad-level, hand-authored or generated:
+The single source of truth. Pad-level, hand-authored or generated. Both
+examples in this section are literal designs: `tests/test_netlist_schema.py`
+strips the `//` comments and validates them against the schema.
 
 ```jsonc
 {
@@ -64,11 +66,11 @@ The single source of truth. Pad-level, hand-authored or generated:
     "footprints": {"SPS_parts": "libs/SPS_parts.pretty"}
   },
 
-  // BOARD — omit entirely for auto-sized boards. Frame: mm, Y down, origin =
-  // outline bbox top-left. For a FIXED outline:
+  // BOARD — omit entirely (or null) for auto-sized boards. Frame: mm, Y down,
+  // origin = outline bbox top-left. For a FIXED outline:
   "board": {
-    "w": 65.0, "h": 56.5,              // fixed rectangle, mm
-    "corner_radius": 3.0,              // optional: round its corners
+    "w": 65.0, "h": 56.5,              // fixed rectangle, mm (both > 0)
+    "corner_radius": 3.0,              // optional: round its corners (w/h only)
     // ...or any shape (w/h then optional) — exactly ONE of:
     //   "outline": {"loop": [[0,0],[60,0],[60,37,0.4142],[57,40],[0,40]]},
     //   "outline": {"dxf": "mech/outline.dxf", "layer": "OUTLINE", "units": "mm"},
@@ -77,53 +79,82 @@ The single source of truth. Pad-level, hand-authored or generated:
     // frame; units mm|cm|in|mil, layer/units only with "dxf".
     "cutouts": [{"loop": [[20,10],[30,10],[30,20],[20,20]]},
                 {"circle": [45.0, 20.0, 1.6]}],   // [cx, cy, r]
+    "panel_cutouts": false,            // true: a connector may mate through a
+                                       //   cutout edge (panel mount); default
+                                       //   false: only the outer edge counts
     "datum": [32.5, 28.25],            // source (Fusion) origin in this frame ->
-                                       //   KiCad aux/drill origin (STEP, pos)
+                                       //   KiCad aux/drill origin (STEP, pos);
+                                       //   default: the bbox bottom-left (0, h)
     "auto_x": 8.5, "auto_y": 21.0,     // free-field rectangle where the
-    "auto_w": 23.0, "auto_h": 25.0,    //   auto-placer may put TOP parts
+    "auto_w": 23.0, "auto_h": 25.0,    //   auto-placer may put TOP parts (w/h > 0)
     "auto_b": {"x":30,"y":26,"w":25,"h":22}  // ditto for BOTTOM-side parts
   },
 
-  "mounting_holes": true,              // 4 corner M3 NPTH, refs H1-H4 — or:
-  "mounting_holes": {
-    "footprint": "MountingHole:MountingHole_2.7mm_M2.5",
-    "positions": [[3.5,3.5],[61.5,3.5],[3.5,52.5],[61.5,52.5]]
-  },
+  "mounting_holes": true,              // 4 corner M3 NPTH, refs H1-H4 — or
+  //   "mounting_holes": {"footprint": "MountingHole:MountingHole_2.7mm_M2.5",
+  //     "positions": [[3.5,3.5],[61.5,3.5],[3.5,52.5],[61.5,52.5]]},
 
   "components": [
     // auto-placed (default):
     {"ref":"U1","lib_id":"Interface_USB:STUSB4500QTR","value":"STUSB4500",
      "footprint":"Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm_EP2.7x2.7mm"},
     // fixed (mixed placement — connectors, power chain in current-flow order):
-    {"ref":"J1", "...": "...", "x":3.0, "y":43.0, "rot":270},
+    {"ref":"J1","lib_id":"Connector:USB_C_Receptacle_USB2.0_16P","value":"USB-C",
+     "footprint":"Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal",
+     "x":3.0, "y":43.0, "rot":270},
+    // auto-placed connector on a chosen board edge: "edge" is top | bottom |
+    // left | right (null or absent = top); its mouth faces off that edge.
+    // Only on connectors (J* not "interior", or "edge_row" parts):
+    {"ref":"J2","lib_id":"Connector:Conn_Coaxial","value":"SMA",
+     "footprint":"Connector_Coaxial:SMA_Samtec_SMA-J-P-H-ST-EM1_EdgeMount",
+     "edge":"right"},
     // bottom side (auto-placed into auto_b, or fixed with x/y):
-    {"ref":"U4", "...": "...", "side":"B"},
+    {"ref":"U4","lib_id":"Regulator_Linear:AMS1117-3.3","value":"AMS1117-3.3",
+     "footprint":"Package_TO_SOT_SMD:SOT-223-3_TabPin2", "side":"B"},
     // a J* part that is NOT an edge connector (jumper, Kelvin header):
-    {"ref":"J4", "...": "...", "interior":true},
+    {"ref":"J4","lib_id":"Connector_Generic:Conn_01x03","value":"SENSE",
+     "footprint":"Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical",
+     "interior":true},
     // module on the top edge, antenna 4 mm past Edge.Cuts:
-    {"ref":"U2", "...": "...", "edge_row":true, "overhang":4.0},
+    {"ref":"U2","lib_id":"RF_Module:ESP32-C3-WROOM-02","value":"ESP32-C3-WROOM-02",
+     "footprint":"RF_Module:ESP32-C3-WROOM-02", "edge_row":true, "overhang":4.0},
     // assembly sourcing (carried into BOM.csv):
-    {"ref":"C1", "...": "...", "lcsc":"C15849", "mpn":"CL21B104KBCNNNC"},
+    {"ref":"C1","lib_id":"Device:C","value":"100nF",
+     "footprint":"Capacitor_SMD:C_0805_2012Metric",
+     "lcsc":"C15849", "mpn":"CL21B104KBCNNNC"},
+    // assembly flags: "dnp": true = in the design but not populated (marked
+    // DNP, left out of the assembly files); "in_bom": false = left out of the
+    // BOM (default true):
+    {"ref":"R7","lib_id":"Device:R","value":"0R",
+     "footprint":"Resistor_SMD:R_0603_1608Metric", "dnp":true},
+    {"ref":"TP1","lib_id":"Connector:TestPoint","value":"GND",
+     "footprint":"TestPoint:TestPoint_Pad_D1.0mm", "in_bom":false},
     // G2 thermal / G3 height inputs (thermal keys: §4 table):
-    {"ref":"Q1", "...": "...", "rds_mohm":4.5, "height":1.1,
+    {"ref":"Q1","lib_id":"Device:Q_NMOS","value":"PowerPAK NMOS",
+     "footprint":"Package_SO:PowerPAK_SO-8_Single", "rds_mohm":4.5, "height":1.1,
      "thermal":{"p_diss":0.4, "theta_ja":60, "tj_max":150, "i_max":3.0}},
     // fixed by footprint ORIGIN + final rotation (as KiCad shows it; for
     // side "B" the post-flip one) — Fusion coordinates, keep-mode rebuilds.
     // A part has "at" OR "x"/"y"/"rot", never both:
-    {"ref":"U5", "...": "...", "at":[30.0, 20.0, 90]},
+    {"ref":"U5","lib_id":"MCU_Microchip_SAMD:ATSAMD21G18A-A","value":"ATSAMD21G18A",
+     "footprint":"Package_QFP:TQFP-48_7x7mm_P0.5mm", "at":[30.0, 20.0, 90]},
     // board-only part (hole, logo, fiducial): on the board, not in the
     // schematic — "lib_id" may be omitted:
     {"ref":"H5", "footprint":"MountingHole:MountingHole_3.2mm_M3",
      "board_only":true, "at":[3.5, 3.5, 0]}
   ],
 
-  "nets":      {"GND": [["U1","13"],["C1","2"], "..."], "...": []},
-  "no_connect": [["U1","7"], "..."],
-  "power_flags": ["AMP_IN"],           // extra PWR_FLAG nets (ERC)
+  // pad-level connectivity: net name (non-empty) -> [[ref, pad], ...]
+  "nets":      {"GND":  [["U1","10"],["U1","25"],["C1","2"],["TP1","1"],
+                         ["J1","A1"],["J1","B1"]],
+                "VBUS": [["J1","A4"],["J1","B4"],["U1","24"],["C1","1"]]},
+  "no_connect": [["U1","3"]],
+  "power_flags": ["VBUS"],             // extra PWR_FLAG nets (ERC)
   "planes": {"In1.Cu":"GND", "In2.Cu":"+3V3"},  // default: In1 GND, In2 1st rail
   "stackup": {"h":0.20, "er":4.2},     // outer dielectric for impedance math
   "require_sourcing": true,            // G5: missing lcsc/mpn = blocker
-  "thermal": {"t_ambient":50, "tj_margin":0.8, "ep_vias_min":4},  // board-level
+  "thermal": {"t_ambient":50, "tj_margin":0.8, "ep_vias_min":4},  // board-level;
+                                       //   ep_vias_min: whole number (4.0 passes)
 
   // Design intent → IPC-2221/2141A net classes (track width, clearance,
   // via size) and the G4 ampacity checks:
@@ -170,12 +201,8 @@ The single source of truth. Pad-level, hand-authored or generated:
      "max_height":4.0, "exempt":["J5"]}
   ],
 
-  // IMPORTED DESIGN (written by the converters): provenance + rebuild mode.
-  // kind: kicad|eagle|altium|easyeda|vision; "keep" = original placement via
-  // "at", "reflow" = re-place (new form factor).
-  "source": {"kind":"kicad", "path":"orig/board.kicad_pcb",
-             "sha256":"<64 hex>", "tool":"kicad-cli 10.99..."},
-  "rebuild": "keep",
+  // IMPORTED / REBUILT DESIGNS add "source", "rebuild", "variant" and
+  // "blocks": see the second example below.
 
   // ASSUMPTIONS — every requirement-level guess of a napkin run, listed first
   // in <stem>_review.md (low confidence first); "override" (optional) names
@@ -188,18 +215,111 @@ The single source of truth. Pad-level, hand-authored or generated:
 }
 ```
 
+An **imported or rebuilt design** carries its provenance. The converters,
+`rebuild_variant` and `design_blocks.compose` write these keys; nobody types
+them by hand:
+
+```jsonc
+{
+  "name": "logger_v2",
+  "rebuild": "reflow",                 // keep = original placement via "at";
+                                       //   reflow = re-place (new form factor)
+  "board": {"w": 70.0, "h": 45.0, "corner_radius": 2.0},
+  "mounting_holes": true,
+
+  // SOURCE — provenance. Paths are relative to this file (or absolute).
+  // kind: kicad | eagle | altium | easyeda | vision (PDF/image schematic) |
+  // gerber (Gerber-only reconstruction):
+  "source": {
+    "kind": "altium", "path": "orig/logger.PcbDoc",
+    "sha256": "a53e676586fa0875b6e4b0b8bf99ba4233a1491cb61077d9a2b6f8b59d09b01c",
+    "tool": "kicad-cli 10.99 import + kicad_import",
+    "files": {                         // every original input: name -> sha256
+      "logger.PcbDoc": "a53e676586fa0875b6e4b0b8bf99ba4233a1491cb61077d9a2b6f8b59d09b01c",
+      "logger.SchDoc": "a6de381c3562450ead9bd7930fbe7921d8c571ee125f327aeb589bf163c5dc56"},
+    "via": "_foreign/logger.kicad_pro",      // the KiCad project a foreign
+                                             //   import went through
+    "reference": "reference_padnets.json",   // source pad nets as imported:
+                                             //   the equivalence target
+    "erc_baseline": "source_erc.json",       // ERC judged against it (no NEW
+                                             //   violations)
+    "drc_baseline": "source_drc.json",       // source DRC, informational
+    "import_report": "import_report.json",   // default <netlist dir>/import_report.json
+    "board": "orig/logger.PcbDoc",           // a source board KiCad 9/10 pcbnew or
+                                             //   swig_load_foreign can load
+    "copper": "reroute"                // carry = copy the source copper instead
+                                       //   of routing (keep rebuilds) | reroute
+                                       //   (default: route afresh)
+  },
+
+  // VARIANT (rebuild_variant) — how this design was derived from the import:
+  // "from" = the netlist it was made from; "dropped_refs" = parts it removed
+  // (artwork, holes); "holes" = what became of the source's mounting holes:
+  // source (mounting_holes with their footprint) | corners (mounting_holes:
+  // true) | none (dropped):
+  "variant": {"mode": "reflow", "from": "../logger_import/netlist.json",
+              "dropped_refs": ["LOGO1", "H1", "H2"], "holes": "corners"},
+
+  // BLOCKS (design_blocks.compose) — one entry per composed block: its own
+  // "source" (or null) and "rebuild"; "ref_map" = EVERY block ref old -> new
+  // (identity entries included); "net_map" = block net -> net here;
+  // "drop_refs" = BASE refs this compose step removed (here the micro-USB
+  // connector the USB-C block replaces):
+  "blocks": [{"name": "USBC", "source": null, "rebuild": "reflow",
+              "ref_map": {"J1": "J10", "R1": "R30"},
+              "net_map": {"GND": "GND", "CC1": "USBC_CC1"},
+              "drop_refs": ["J1"]}],
+
+  "components": [
+    {"ref":"U1","lib_id":"MCU_Microchip_SAMD:ATSAMD21G18A-A","value":"ATSAMD21G18A",
+     "footprint":"Package_QFP:TQFP-48_7x7mm_P0.5mm"},
+    {"ref":"C1","lib_id":"Device:C","value":"1uF",
+     "footprint":"Capacitor_SMD:C_0603_1608Metric"},
+    {"ref":"J10","lib_id":"Connector:USB_C_Receptacle_USB2.0_16P","value":"USB-C",
+     "footprint":"Connector_USB:USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal",
+     "edge":"left"},
+    {"ref":"R30","lib_id":"Device:R","value":"5.1k",
+     "footprint":"Resistor_SMD:R_0603_1608Metric"}
+  ],
+  "nets": {"GND":      [["U1","18"],["C1","2"],["J10","A1"],["J10","B1"],["R30","2"]],
+           "+3V3":     [["U1","17"],["C1","1"]],
+           "USBC_CC1": [["J10","A5"],["R30","1"]]}
+}
+```
+
 **Schema.** `server/tools/netlist_schema.py` is the machine-checked form of
-this block (JSON Schema 2020-12). Every key above is typed. Unknown keys pass at
-the top level and on components. `libraries`, `board.outline` and a cutout
-reject them, so a typo cannot silently fall back to a rectangle. Required:
-`components` (each with `ref`, `footprint`, and `lib_id` unless `board_only`);
-`source` needs `kind` + `path`; an assumption needs `id`, `topic`, `value`,
-`rationale`, `confidence`. Check a file in a second; every error carries its
-JSON path (`$.components[3].at: ... (component U5)`):
+these blocks (JSON Schema 2020-12). Every key above is typed. Unknown keys
+pass at the top level, on components and on the provenance records
+(`source`, `variant`, a `blocks` entry). `libraries`, `board.outline` and a
+cutout reject them, so a typo cannot silently fall back to a rectangle.
+Required: `components` (each with `ref`, `footprint`, and `lib_id` unless
+`board_only`); `source` needs `kind` + `path`; `variant` needs `mode`; a
+`blocks` entry needs `name` + a non-empty `ref_map`; an assumption needs `id`,
+`topic`, `value`, `rationale`, `confidence`. Board `w`/`h`, `auto_w`/`auto_h`
+and `auto_b` `w`/`h` must be > 0; a net name must not be empty. Integers are
+strict (`4.0` is not a layer count) except `thermal.ep_vias_min`, which its
+consumers read via `int()`. `null` means "absent" for component `edge` and for
+a block's `source` / `rebuild`. Check a file in a second; every error carries
+its JSON path (`$.components[3].at: ... (component U5)`):
 
 ```powershell
 <venv>\python server\tools\netlist_schema.py path\to\netlist.json   # --schema prints it
 ```
+
+**Board block contracts.** The schema checks types; `server/tools/outline.py`
+(`from_board_block`) enforces the geometry when the board is resolved:
+
+- **Outline loop bbox starts at (0, 0).** An `"outline"` loop is in the board
+  frame (translate it; the DXF loader normalises Fusion outlines for you), and
+  a `"w"`/`"h"` next to it must equal that bbox.
+- **corner_radius only with w/h.** It rounds the `"w"` x `"h"` rectangle; with an
+  `"outline"`, draw the fillets into the loop as bulge vertices.
+- **Default datum = the outline bbox bottom-left**, (0, h) in this frame, when
+  `"datum"` is absent. The exported outline DXF uses it as its origin, and it
+  is the point that becomes the KiCad aux/drill origin.
+- **An `auto_*`-only board block is rejected on purpose.** The `"auto_*"`
+  fields are windows inside a FIXED board, so a block needs `"w"` + `"h"` or
+  an `"outline"`. For an auto-sized board, omit the block (or set it to null).
 
 Hard-won authoring rules:
 

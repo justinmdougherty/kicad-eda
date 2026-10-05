@@ -24,7 +24,8 @@ Search order for kicad-cli (every hit is probed, duplicates collapse, the result
 is sorted newest first): $KICAD_PATH (root or bin), %ProgramFiles%\\KiCad\\*,
 %LOCALAPPDATA%\\Programs\\KiCad\\*, PATH, /usr/bin, /usr/local/bin and the macOS
 app bundle. Each probe (`kicad-cli version`, the bundled Python's
-`import pcbnew`, `kicad-cli api-server --help`) runs once per path per process.
+`import kicad_quiet; import pcbnew`, `kicad-cli api-server --help`) runs once
+per path per process.
 
 A file written by KiCad N can only be read by kicad-cli >= N, so schematics are
 always ERC'd and rendered with pick_cli() (the newest — the API backend writes
@@ -46,6 +47,11 @@ from pathlib import Path
 
 SERVER_DIR = Path(__file__).resolve().parent
 VENDOR_DIR = SERVER_DIR / "vendor"
+TOOLS_DIR = SERVER_DIR / "tools"           # kicad_quiet.py lives here
+# Inline code of the bundled-Python probe. kicad_quiet goes BEFORE pcbnew
+# (ROADMAP_DECISIONS D0: no modal wx dialogs in a headless child); `-c` code
+# has no script directory on sys.path, so server/tools arrives as argv[1].
+PCBNEW_PROBE = "import sys; sys.path.insert(0, sys.argv[1]); import kicad_quiet; import pcbnew"
 PROBE_TIMEOUT_S = 30
 PYTHON_PROBE_TIMEOUT_S = 90               # a cold `import pcbnew` can take a while
 API_SERVER_MIN_VERSION = (10, 99, 0)      # a KiCad 11 nightly reports itself as 10.99.x
@@ -131,10 +137,11 @@ def _run(argv: list[str], timeout_s: float = PROBE_TIMEOUT_S) -> ProbeResult:
     is the protocol pipe with a read pending on it, and a python.exe child that
     inherits that handle blocks at interpreter start-up (verified on Windows:
     even `python -c "print(1)"` hangs until the timeout; kicad-cli does not).
-    Every subprocess the server spawns must follow this rule."""
+    Every subprocess the server spawns must follow this rule. Output is
+    decoded as UTF-8 with replacement (D0), so a stray byte never raises."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
-                           stdin=subprocess.DEVNULL)
+        r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout_s, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return ProbeResult(TRANSIENT_RC, "", f"{argv[0]}: timed out after {timeout_s:g} s")
     except OSError as e:
@@ -201,6 +208,11 @@ def bundled_python(kicad_cli: Path) -> Path | None:
     return python
 
 
+def python_probe_argv(python: Path) -> list[str]:
+    """The probe child: `<python> -c PCBNEW_PROBE <server/tools>`."""
+    return [str(python), "-c", PCBNEW_PROBE, str(TOOLS_DIR)]
+
+
 def _probe_python(kicad_cli: Path) -> tuple[Path | None, str | None, bool]:
     """(python, error, settled). settled is False when every candidate's probe
     timed out or could not start (nothing definitive was learned)."""
@@ -209,7 +221,7 @@ def _probe_python(kicad_cli: Path) -> tuple[Path | None, str | None, bool]:
     for cand in python_candidates(kicad_cli):
         if not cand.is_file():
             continue
-        r = _run([str(cand), "-c", "import pcbnew"], timeout_s=PYTHON_PROBE_TIMEOUT_S)
+        r = _run(python_probe_argv(cand), timeout_s=PYTHON_PROBE_TIMEOUT_S)
         if r.ok:
             return (cand, None, True)
         if r.returncode == TRANSIENT_RC:

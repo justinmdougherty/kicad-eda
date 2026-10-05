@@ -2,22 +2,34 @@
 """Board-outline DXF in and out (ROADMAP_DECISIONS D2, the Fusion 360 round trip).
 
 Reader: DXF -> closed loops -> outline.py's Outline / the D2 board block in the
-board frame (mm, Y down, bbox top-left = 0, 0; ``datum`` = the DXF origin).
+board frame (mm, Y down, bbox top-left = 0, 0). ``datum`` = the origin of the
+2D frame read (D2): for a Fusion sketch the sketch origin, i.e. the coordinates
+the Fusion user sees in the sketch (even when its transform translates), else
+the DXF origin.
   * LINE, ARC (a 0..360 ARC is a circle), CIRCLE, LWPOLYLINE / 2D POLYLINE
     (bulges stay exact arcs), 3D POLYLINE, SPLINE / ELLIPSE (flattened within
     ``curve_tol``), INSERT and MINSERT (every array cell exploded; block
     entities on layer 0 take the INSERT's layer); anything else (POINT, TEXT,
     mesh POLYLINE, ...) is counted as skipped.
-  * Units: ``$INSUNITS`` (Fusion writes 5 = cm) unless ``units`` overrides it.
-  * Plane: XY, else the layer's ``NFusion_SketchTransform`` (Fusion writes an
-    XZ-plane sketch in world coordinates), else the common arc normal, else
-    (lines only) a plane fitted through the points, with a warning.
-  * ``layer`` keeps one layer (any case); the skipped entities and warnings
-    of the other layers are dropped with their geometry.
-  * dxf_loops does the geometry: duplicates dropped with a warning, pieces
-    chained within ``tol`` (an open loop raises DxfOutlineError listing every
-    gap and open path), outer = largest |area|, the rest cutouts strictly
-    inside it (else reported, or dropped with ``allow_stray``).
+  * Units: ``units`` (blank = none) > a non-zero ``$INSUNITS`` (Fusion: 5 = cm,
+    with $MEASUREMENT 0 even when metric) > ``$MEASUREMENT`` (0 = inch, 1 = mm;
+    all KiCad 9's DXF export writes) with a warning > mm with a warning.
+  * Plane: the layer's ``NFusion_SketchTransform`` when the geometry lies in
+    that sketch plane (Fusion writes an XZ-plane sketch in world coordinates),
+    else XY, else the common arc normal, else (lines only) a plane fitted
+    through the points, with a warning. ``DxfLoops.plane`` names it, as do the
+    gap, branch and stray-loop errors.
+  * ``layer`` keeps one layer (any case; None / blank = all: KiCad 9 names DXF
+    layers by colour, WHITE / BLACK, 10.99 writes Edge.Cuts); the skipped
+    entities, warnings and corrupt values of other layers are dropped too.
+  * A coordinate, radius or bulge that is not finite, or beyond MAX_COORD_MM
+    after unit scaling, raises DxfOutlineError naming the entity handle.
+  * dxf_loops: duplicates dropped with a warning, pieces chained within ``tol``
+    (an open loop raises DxfOutlineError listing the first gaps; ``gaps`` has
+    them all), degenerate loops dropped with a warning, outer = largest |area|,
+    the rest cutouts strictly inside it (else reported, or dropped with
+    ``allow_stray``), drill-hole warnings for circle cutouts no wider than the
+    fab's minimum slot (kicad-cli exports drills unless --drill-shape-opt 0).
 Writer: a D2 board block -> DXF R2010, mm, Y up, origin = ``datum``, closed
 LWPOLYLINEs with bulges and CIRCLEs on a named layer.
 
@@ -52,15 +64,17 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import outline as ol  # noqa: E402
-from dxf_loops import (Classified, DxfOutlineError, Gap, Loop, Piece,  # noqa: E402
-                       chain_pieces, circle_loop, classify_loops, describe, drop_duplicates,
-                       gap_error)
+from dxf_loops import (MAX_COORD_MM, Classified, DxfOutlineError, Gap, Loop,  # noqa: E402
+                       Piece, capped, chain_pieces, circle_loop, classify_loops, coord_problem,
+                       describe, drill_warnings, drop_degenerate, drop_duplicates, frame_note,
+                       gap_error, non_finite)
 from netlist_schema import DXF_UNITS  # noqa: E402
 from outline_geom import Point, dist  # noqa: E402
 
 __all__ = ["BoardOutline", "Classified", "DxfLoops", "DxfOutlineError", "Gap", "Loop",
            "classify_loops", "outline_from_spec", "read_board_outline", "read_dxf_loops",
-           "write_outline_dxf", "DEFAULT_JOIN_TOL_MM", "DEFAULT_CURVE_TOL_MM", "DEFAULT_LAYER"]
+           "write_outline_dxf", "DEFAULT_JOIN_TOL_MM", "DEFAULT_CURVE_TOL_MM", "DEFAULT_LAYER",
+           "MAX_COORD_MM"]
 
 DEFAULT_JOIN_TOL_MM = 0.01        # endpoint chaining tolerance
 DEFAULT_CURVE_TOL_MM = 0.02       # SPLINE / ELLIPSE flattening (max chord deviation)
@@ -72,7 +86,17 @@ INSUNITS = {1: ("in", 25.4), 2: ("ft", 304.8), 4: ("mm", 1.0), 5: ("cm", 10.0),
             6: ("m", 1000.0), 8: ("uin", 25.4e-6), 9: ("mil", 0.0254),
             10: ("yd", 914.4), 13: ("um", 0.001), 14: ("dm", 100.0)}
 INSUNITS_MM = 4
+MEASUREMENT = {0: "in", 1: "mm"}  # $MEASUREMENT: 0 = imperial, 1 = metric
 PLAUSIBLE_SIDE_MM = (1.0, 1000.0)  # bbox sides outside this suggest wrong units
+DRILL_FAB = "JLCPCB"              # whose minimum milled slot flags drill-hole circles
+# the entity attributes the outline geometry is built from (all must be finite)
+_GEOMETRY_ATTRIBS = frozenset({
+    "start", "end", "center", "radius", "start_angle", "end_angle", "major_axis", "ratio",
+    "start_param", "end_param", "extrusion", "elevation", "insert", "xscale", "yscale",
+    "zscale", "rotation", "row_spacing", "column_spacing", "start_tangent", "end_tangent"})
+_CURVE_POINTS = frozenset({"center", "major_axis", "control_points", "fit_points"})
+_READ_KINDS = frozenset({"LINE", "ARC", "CIRCLE", "LWPOLYLINE", "POLYLINE", "SPLINE",
+                         "ELLIPSE", "INSERT"})
 # ezdxf's flattening checks the deviation at segment midpoints only and overshoots
 # the requested distance by up to ~5 % on wiggly splines (0.0209 for 0.02 mm)
 _FLATTEN_MARGIN = 0.8
@@ -103,8 +127,40 @@ class _Ctx:
     layer so that _collect keeps only what the layer filter picks."""
     curve_du: float                    # flattening distance
     tol_du: float                      # join tolerance
+    scale: float                       # mm per drawing unit
     skipped: list[tuple[str, str]]     # (entity kind, layer)
     notes: list[tuple[str, str]]       # (layer, warning)
+    bad: list[tuple[str, str]]         # (layer, corrupt value naming the entity)
+
+
+def _values(e: Any) -> Iterator[tuple[str, Any]]:
+    """(name, value) of every number the entity's geometry is built from."""
+    yield from ((k, v) for k, v in e.dxf.all_existing_dxf_attribs().items()
+                if k in _GEOMETRY_ATTRIBS)
+    kind = e.dxftype()
+    if kind == "LWPOLYLINE":
+        yield from ((f"vertex {i}", xyb) for i, xyb in enumerate(e.get_points("xyb")))
+    elif kind == "POLYLINE" and (e.is_2d_polyline or e.is_3d_polyline):
+        yield from ((f"vertex {i}", (*v.dxf.location, float(v.dxf.bulge)))
+                    for i, v in enumerate(e.vertices))
+    elif kind == "SPLINE":
+        for name in ("control_points", "fit_points", "knots", "weights"):
+            yield from ((f"{name}[{i}]", v) for i, v in enumerate(getattr(e, name)))
+
+
+def _corrupt(e: Any, scale: float) -> str | None:
+    """Why the entity's own numbers are corrupt, checked before ezdxf builds
+    anything from them: not finite, or a point bounding a SPLINE / ELLIPSE
+    beyond MAX_COORD_MM (such a curve would take forever to flatten)."""
+    curve = e.dxftype() in ("SPLINE", "ELLIPSE")
+    for name, value in _values(e):
+        if non_finite(value):
+            return f"{name} {value!r} is not a finite number"
+        if curve and name.partition("[")[0] in _CURVE_POINTS:
+            reach = max(abs(c) for c in value) * scale
+            if reach > MAX_COORD_MM:
+                return f"{name} reaches {reach:.3g} mm, beyond the {MAX_COORD_MM:g} mm limit"
+    return None
 
 
 def _closed(points: list[Vec3], bulges: list[float], closed: bool) -> tuple:
@@ -162,37 +218,59 @@ def _insert_raws(e: Any, layer: str, source: str, ctx: _Ctx, depth: int) -> Iter
             ctx.notes.append((child_layer,
                               f"ezdxf could not explode {child.dxftype()} {where}: {reason}"))
 
-        for child in cell.virtual_entities(skipped_entity_callback=not_exploded):
+        try:                           # a corrupt block can fail mid-explosion
+            children = list(cell.virtual_entities(skipped_entity_callback=not_exploded))
+        except (DXFError, ValueError, ArithmeticError) as exc:
+            ctx.bad.append((layer, f"{source}: ezdxf cannot explode it ({exc})"))
+            continue
+        for child in children:
             child_layer = layer if child.dxf.layer == "0" else child.dxf.layer
             yield from _entity_raws(child, child_layer, f"{child.dxftype()} {where}", ctx,
                                     depth + 1)
 
 
-def _entity_raws(e: Any, layer: str, source: str, ctx: _Ctx, depth: int) -> Iterator[_Raw]:
-    kind = e.dxftype()
-    raw: _Raw | None = None
+def _raw_of(e: Any, kind: str, layer: str, source: str, ctx: _Ctx) -> _Raw | None:
     if kind == "LINE":
-        raw = _Raw((Vec3(e.dxf.start), Vec3(e.dxf.end)), (0.0,), None, source, layer)
-    elif kind == "ARC":
-        raw = _arc_raw(e, layer, source, ctx)
-    elif kind == "CIRCLE":
-        raw = _Raw((e.ocs().to_wcs(e.dxf.center),), (), Vec3(e.dxf.extrusion).normalize(),
-                   source, layer, float(e.dxf.radius))
-    elif kind in ("LWPOLYLINE", "POLYLINE"):
-        raw = _polyline_raw(e, source, layer)
-        if raw is None:
-            ctx.skipped.append(("POLYLINE (mesh)", layer))
-        elif len(raw.points) < 2:
-            ctx.notes.append((layer, f"ignored {source}: fewer than 2 vertices"))
-            raw = None
-    elif kind in ("SPLINE", "ELLIPSE"):
+        return _Raw((Vec3(e.dxf.start), Vec3(e.dxf.end)), (0.0,), None, source, layer)
+    if kind == "ARC":
+        return _arc_raw(e, layer, source, ctx)
+    if kind == "CIRCLE":
+        return _Raw((e.ocs().to_wcs(e.dxf.center),), (), Vec3(e.dxf.extrusion).normalize(),
+                    source, layer, float(e.dxf.radius))
+    if kind in ("SPLINE", "ELLIPSE"):
         pts = tuple(Vec3(p) for p in e.flattening(ctx.curve_du))
-        raw = _Raw(pts, (0.0,) * (len(pts) - 1), None, source, layer)
-    elif kind == "INSERT" and depth < _MAX_INSERT_DEPTH:
-        yield from _insert_raws(e, layer, source, ctx, depth)
-    else:
+        return _Raw(pts, (0.0,) * (len(pts) - 1), None, source, layer)
+    raw = _polyline_raw(e, source, layer)                     # LWPOLYLINE / POLYLINE
+    if raw is None:
+        ctx.skipped.append(("POLYLINE (mesh)", layer))
+    elif len(raw.points) < 2:
+        ctx.notes.append((layer, f"ignored {source}: fewer than 2 vertices"))
+        return None
+    return raw
+
+
+def _entity_raws(e: Any, layer: str, source: str, ctx: _Ctx, depth: int) -> Iterator[_Raw]:
+    """The entity's raws; corrupt values go to ``ctx.bad`` (naming ``source``)
+    instead, so only those on the picked layer raise."""
+    kind = e.dxftype()
+    if kind not in _READ_KINDS or (kind == "INSERT" and depth >= _MAX_INSERT_DEPTH):
         ctx.skipped.append((kind, layer))
+        return
+    problem = _corrupt(e, ctx.scale)
+    if problem is None and kind == "INSERT":
+        yield from _insert_raws(e, layer, source, ctx, depth)
+        return
+    raw = None
+    if problem is None:
+        try:
+            raw = _raw_of(e, kind, layer, source, ctx)
+        except (DXFError, ValueError, ArithmeticError) as exc:
+            problem = f"its geometry cannot be built ({exc})"
     if raw is not None:
+        problem = coord_problem(raw.points, raw.bulges, raw.radius, ctx.scale)
+    if problem is not None:
+        ctx.bad.append((layer, f"{source}: {problem}"))
+    elif raw is not None:
         yield raw
 
 
@@ -238,7 +316,7 @@ def _fusion_frame(doc: Any, layers: set[str], warnings: list[str]) -> _Frame | N
             m = tuple(float(v) for v in text.split(";"))
         except ValueError:
             m = ()
-        if len(m) == 16:
+        if len(m) == 16 and all(math.isfinite(v) for v in m):
             found.setdefault(m, []).append(name)
         else:
             warnings.append(f"layer '{name}': unreadable {FUSION_APPID} {text!r}; ignored")
@@ -276,8 +354,11 @@ def _fitted_frame(raws: Sequence[_Raw]) -> _Frame | None:
 
 def _pick_frame(doc: Any, raws: Sequence[_Raw], tol_du: float,
                 warnings: list[str]) -> _Frame:
-    """XY, else the Fusion sketch transform, else the common arc normal, else
-    (no arcs or circles) a plane fitted through the points."""
+    """The Fusion sketch transform when the geometry lies in its plane (tried
+    FIRST: an XY sketch whose transform translates is read in its sketch frame,
+    so the origin, and the datum, is the sketch origin), else XY, else the
+    common arc normal, else (no arcs or circles) a plane fitted through the
+    points."""
     fusion = _fusion_frame(doc, {r.layer for r in raws}, warnings)
     if fusion is not None:
         if fusion.fits(raws, tol_du):
@@ -310,14 +391,15 @@ def _pick_frame(doc: Any, raws: Sequence[_Raw], tol_du: float,
 # --- reader ------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class DxfLoops:
-    """Closed loops in the DXF frame (mm, Y up, DXF origin) plus provenance."""
+    """Closed loops in the 2D drawing frame ``plane`` (mm, Y up; origin = the
+    DXF origin, or the sketch origin for a Fusion sketch) plus provenance."""
     path: str
     loops: tuple[Loop, ...]
     units: str
-    units_source: str                  # "override" | "$INSUNITS" | "default"
+    units_source: str                  # "override" | "$INSUNITS" | "$MEASUREMENT" | "default"
     scale: float                       # mm per drawing unit
     layers: tuple[str, ...]            # layers that contributed geometry
-    plane: str
+    plane: str                         # the frame: "XY", "Fusion sketch transform (...)", ...
     skipped: tuple[tuple[str, int], ...]
     warnings: tuple[str, ...]
 
@@ -351,34 +433,75 @@ def _open(path: Path, warnings: list[str]) -> Any:
     return doc
 
 
+def _header_int(doc: Any, name: str) -> int | None:
+    raw = doc.header.get(name, None)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+        return None
+    return int(raw)
+
+
 def _units(doc: Any, override: str | None, warnings: list[str]) -> tuple[str, float, str]:
-    if override is not None:
+    """units= > a non-zero $INSUNITS > $MEASUREMENT (warning) > mm (warning)."""
+    choices = ", ".join(DXF_UNITS)
+    if override is not None and not (isinstance(override, str) and not override.strip()):
         key = str(override).strip().lower()
         if key not in UNIT_MM:
-            raise DxfOutlineError(f"units {override!r} is not one of {', '.join(DXF_UNITS)}")
+            raise DxfOutlineError(f"units {override!r} is not one of {choices}")
         return key, UNIT_MM[key], "override"
-    raw = doc.header.get("$INSUNITS", 0)
-    code = int(raw) if isinstance(raw, (int, float)) else 0
-    if code == 0:
-        warnings.append("the DXF has no $INSUNITS (unitless): read as mm; pass units= "
-                        f"({', '.join(DXF_UNITS)}) if it is not")
-        return "mm", 1.0, "default"
-    if code not in INSUNITS:
-        raise DxfOutlineError(f"$INSUNITS {code} ({ezdxf.units.unit_name(code)}) is not a "
-                              f"unit this reader converts; pass units= ({', '.join(DXF_UNITS)})")
-    return INSUNITS[code][0], INSUNITS[code][1], "$INSUNITS"
+    code = _header_int(doc, "$INSUNITS")
+    if code:
+        if code not in INSUNITS:
+            raise DxfOutlineError(f"$INSUNITS {code} ({ezdxf.units.unit_name(code)}) is not a "
+                                  f"unit this reader converts; pass units= ({choices})")
+        return INSUNITS[code][0], INSUNITS[code][1], "$INSUNITS"
+    missing = "no $INSUNITS" if code is None else "$INSUNITS 0 (unitless)"
+    flag = _header_int(doc, "$MEASUREMENT")
+    if flag in MEASUREMENT:
+        unit = MEASUREMENT[flag]
+        warnings.append(f"the DXF has {missing}: read as {unit} from $MEASUREMENT {flag} "
+                        f"({'metric' if flag else 'imperial'}; KiCad 9's DXF export writes only "
+                        f"this header); pass units= ({choices}) if it is not")
+        return unit, UNIT_MM[unit], "$MEASUREMENT"
+    found = ("no $MEASUREMENT" if flag is None
+             else f"$MEASUREMENT {flag} (neither 0 = inch nor 1 = mm)")
+    warnings.append(f"the DXF has {missing} and {found}: read as mm; pass units= ({choices}) "
+                    "if it is not")
+    return "mm", 1.0, "default"
 
 
 def _check_layer(layer: object) -> str | None:
-    if layer is not None and (not isinstance(layer, str) or not layer.strip()):
+    """None or a blank string = every layer (MCP tools pass '' for 'not given')."""
+    if layer is None or (isinstance(layer, str) and not layer.strip()):
+        return None
+    if not isinstance(layer, str):
         raise DxfOutlineError(f"layer must be a layer name, got {layer!r}")
     return layer
+
+
+def _no_geometry(doc: Any, layer: str | None, raws: Sequence[_Raw], skip: Counter,
+                 path: Path) -> DxfOutlineError:
+    """Nothing on the picked layer: list the layers that have geometry."""
+    have = Counter(r.layer for r in raws)
+    listed = ", ".join(f"{k} ({v})" for k, v in sorted(have.items())) or "none"
+    where = hint = ""
+    if layer is not None:
+        table = [lay.dxf.name for lay in doc.layers]
+        known = any(name.casefold() == layer.casefold() for name in [*table, *have])
+        where = f" on layer {layer!r}" + ("" if known else " (that layer is not in the DXF)")
+        others = sorted(set(table) - set(have), key=str.casefold)
+        listed += f"; other layers: {', '.join(capped(others, 10)) or 'none'}"
+        hint = (". Pass layer='' (or none) to read every layer; KiCad 9 names its DXF layers "
+                "by colour (WHITE, BLACK, ...), 10.99 writes Edge.Cuts")
+    return DxfOutlineError(
+        f"{path}: no outline geometry{where}; layers with geometry: {listed}; skipped: "
+        + (", ".join(f"{k} x{v}" for k, v in sorted(skip.items())) or "nothing") + hint)
 
 
 def _collect(doc: Any, layer: str | None, ctx: _Ctx, path: Path,
              warnings: list[str]) -> tuple[list[_Raw], Counter]:
     """The raws on ``layer`` (any case; None = all layers); the skipped
-    entities and per-entity warnings of the other layers are dropped too."""
+    entities, per-entity warnings and corrupt values of the other layers are
+    dropped too. Corrupt values on the picked layers raise."""
     raws: list[_Raw] = []
     for e in doc.modelspace():
         raws.extend(_entity_raws(e, e.dxf.layer, f"{e.dxftype()} #{e.dxf.handle}", ctx, 0))
@@ -387,15 +510,17 @@ def _collect(doc: Any, layer: str | None, ctx: _Ctx, path: Path,
     def wanted(name: str) -> bool:
         return want is None or name.casefold() == want
 
+    bad = [problem for lay, problem in ctx.bad if wanted(lay)]
+    if bad:
+        raise DxfOutlineError(
+            f"{path}: {len(bad)} entit{'y' if len(bad) == 1 else 'ies'} with corrupt values (not "
+            f"a finite number, or beyond {MAX_COORD_MM:g} mm after unit scaling); fix or delete "
+            "them in the source drawing:\n  " + "\n  ".join(capped(bad)), problems=bad)
     picked = [r for r in raws if wanted(r.layer)]
     skip = Counter(k for k, lay in ctx.skipped if wanted(lay))
     warnings.extend(note for lay, note in ctx.notes if wanted(lay))
     if not picked:
-        have = ", ".join(f"{k} ({v})" for k, v in sorted(Counter(r.layer for r in raws).items()))
-        raise DxfOutlineError(
-            f"{path}: no outline geometry{f' on layer {layer!r}' if layer is not None else ''}; "
-            f"layers with geometry: {have or 'none'}; skipped: "
-            + (", ".join(f"{k} x{v}" for k, v in sorted(skip.items())) or "nothing"))
+        raise _no_geometry(doc, layer, raws, skip, path)
     if set(skip) - {"POINT"}:
         warnings.append("skipped entities that are not outline geometry: "
                         + ", ".join(f"{k} x{v}" for k, v in sorted(skip.items())))
@@ -417,7 +542,8 @@ def _project(raws: Sequence[_Raw], frame: _Frame, scale: float, tol: float,
                                            r.source))
             continue
         pts = [frame.to2d(p, scale) for p in r.points]
-        edges = tuple((*pts[i], *pts[i + 1], r.bulges[i] * sign if abs(r.bulges[i]) > 1e-12 else 0.0)
+        edges = tuple((*pts[i], *pts[i + 1],
+                       r.bulges[i] * sign if abs(r.bulges[i]) > 1e-12 else 0.0)
                       for i in range(len(pts) - 1) if dist(pts[i], pts[i + 1]) > _EPS)
         piece = Piece(edges, r.source, f"{r.source} start", f"{r.source} end") if edges else None
         if piece is None or piece.length() <= tol:
@@ -430,25 +556,31 @@ def _project(raws: Sequence[_Raw], frame: _Frame, scale: float, tol: float,
 def read_dxf_loops(path: str | Path, *, layer: str | None = None, units: str | None = None,
                    tol: float = DEFAULT_JOIN_TOL_MM,
                    curve_tol: float = DEFAULT_CURVE_TOL_MM) -> DxfLoops:
-    """Every closed loop of a DXF in its own frame (mm, Y up). ``layer`` (any
-    case) keeps one layer's geometry. Raises DxfOutlineError (with ``gaps``)
-    when the pieces do not all close."""
+    """Every closed loop of a DXF in its own frame (mm, Y up; see DxfLoops).
+    ``layer`` (any case; None / blank = all) keeps one layer's geometry.
+    Raises DxfOutlineError (with ``gaps``) when the pieces do not all close,
+    and when an entity on the layer has corrupt values."""
     tol, curve_tol = _check_tol(tol, "tol"), _check_tol(curve_tol, "curve_tol")
     layer = _check_layer(layer)
     path = Path(path)
     warnings: list[str] = []
     doc = _open(path, warnings)
     unit, scale, unit_source = _units(doc, units, warnings)
-    ctx = _Ctx(curve_tol * _FLATTEN_MARGIN / scale, tol / scale, [], [])
+    ctx = _Ctx(curve_tol * _FLATTEN_MARGIN / scale, tol / scale, scale, [], [], [])
     raws, skipped = _collect(doc, layer, ctx, path, warnings)
     frame = _pick_frame(doc, raws, tol / scale, warnings)
     pieces, circles = drop_duplicates(*_project(raws, frame, scale, tol, warnings), tol, warnings)
-    chained, open_chains = chain_pieces(pieces, tol, warnings)
+    chained, open_chains = chain_pieces(pieces, tol, warnings, frame.label)
     if open_chains:
-        raise gap_error(path, open_chains, tol, len(chained) + len(circles))
-    return DxfLoops(str(path), tuple(circles + chained), unit, unit_source, scale,
+        raise gap_error(path, open_chains, tol, len(chained) + len(circles), frame.label)
+    dropped: list[str] = []
+    loops = drop_degenerate(circles + chained, tol, dropped)
+    if not loops:
+        raise DxfOutlineError(f"{path}: every closed loop is degenerate:\n  "
+                              + "\n  ".join(capped(dropped)), problems=dropped)
+    return DxfLoops(str(path), tuple(loops), unit, unit_source, scale,
                     tuple(dict.fromkeys(r.layer for r in raws)), frame.label,
-                    tuple(sorted(skipped.items())), tuple(warnings))
+                    tuple(sorted(skipped.items())), tuple(warnings + dropped))
 
 
 # --- board frame (outline.py) -------------------------------------------------------------
@@ -470,11 +602,14 @@ def _own_loop(ring: ol.Loop | ol.Circle, sources: tuple[str, ...], outer: bool) 
 class BoardOutline:
     """A DXF outline in the board frame (mm, Y down, bbox top-left = 0, 0).
     ``model`` is outline.py's validated Outline; ``outline`` / ``cutouts`` are
-    the same rings with the DXF entities they came from."""
+    the same rings with the DXF entities they came from. ``datum`` is the
+    origin of the drawing frame (``source.plane``) in the board frame: the
+    sketch origin for a Fusion sketch (D2: what the Fusion user sees in the
+    sketch), else the DXF origin."""
     model: ol.Outline
     outline: Loop
     cutouts: tuple[Loop, ...]
-    datum: Point                       # the DXF origin in the board frame
+    datum: Point                       # the drawing frame's origin in the board frame
     size: Point                        # outline bbox (w, h)
     source: DxfLoops
     warnings: tuple[str, ...]
@@ -500,10 +635,13 @@ def read_board_outline(path: str | Path, *, layer: str | None = None,
         if not allow_stray:
             raise DxfOutlineError(
                 f"{path}: {len(problems)} loop(s) cannot be cutouts of the outer "
-                f"{describe(cls.outer)} (DXF frame, mm, Y up):\n  " + "\n  ".join(problems)
+                f"{describe(cls.outer)} ({frame_note(src.plane)}):\n  "
+                + "\n  ".join(capped(problems))
                 + "\nMove them to another layer and pass layer=, or pass allow_stray=True "
                   "to drop them.", problems=problems)
         warnings.extend(f"dropped {p}" for p in problems)
+    warnings.extend(drill_warnings(cls.cutouts, src.plane,
+                                   ol.FAB_LIMITS[DRILL_FAB].min_slot_width, DRILL_FAB))
     try:                               # flip Y, bbox top-left to (0, 0), validate
         model, datum = ol.normalize_external([_model_ring(lp) for lp in (cls.outer, *cls.cutouts)])
     except ol.OutlineError as exc:
@@ -516,7 +654,7 @@ def read_board_outline(path: str | Path, *, layer: str | None = None,
                         "pass units= to override")
     return BoardOutline(model, _own_loop(model.outer, cls.outer.sources, True),
                         tuple(_own_loop(r, lp.sources, False)
-                              for r, lp in zip(model.cutouts, cls.cutouts)),
+                              for r, lp in zip(model.cutouts, cls.cutouts, strict=True)),
                         datum, size, src, tuple(warnings))
 
 
@@ -604,8 +742,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         result = _cli(args)
-    except (DxfOutlineError, OSError, json.JSONDecodeError) as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, indent=2))
+    except (OSError, ValueError, ArithmeticError) as exc:   # DxfOutlineError, bad JSON, ...
+        error = str(exc) if isinstance(exc, DxfOutlineError) else f"{type(exc).__name__}: {exc}"
+        print(json.dumps({"ok": False, "error": error}, indent=2))
         return 1
     print(json.dumps(result, indent=2))
     return 0

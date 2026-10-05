@@ -1,0 +1,56 @@
+{
+  "schema": "kicad-eda/materials@1",
+  "retrieved": "2026-10-04",
+  "note": "Isola FR-4 class laminates. Typical values from the data sheet tables (laminate); OSH Park publishes its own FR408HR per-construction Dk (fab entries).",
+  "materials": {
+    "isola.370hr": {
+      "vendor": "Isola", "product": "370HR", "family": "fr4-high-tg", "category": "fr4",
+      "forms": ["core", "prepreg"], "ptfe": false, "process": "fr4", "tg_c": 180,
+      "dk": [
+        {"value": 4.24, "freq_hz": 1e8, "basis": "typical", "source": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"},
+        {"value": 4.17, "freq_hz": 1e9, "basis": "typical", "source": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"},
+        {"value": 4.04, "freq_hz": 2e9, "basis": "typical", "source": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"},
+        {"value": 3.92, "freq_hz": 5e9, "basis": "typical", "source": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"},
+        {"value": 3.92, "freq_hz": 1e10, "basis": "typical", "source": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"}
+      ],
+      "df": [
+        {"value": 0.015, "freq_hz": 1e8, "basis": "typical", "source": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"},
+        {"value": 0.0161, "freq_hz": 1e9, "basis": "typical", "source": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"},
+        {"value": 0.021, "freq_hz": 2e9, "basis": "typical", "source": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"},
+        {"value": 0.025, "freq_hz": 5e9, "basis": "typical", "source": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"},
+        {"value": 0.025, "freq_hz": 1e10, "basis": "typical", "source": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"}
+      ],
+      "sources": [
+        {"title": "Isola 370HR data sheet rev B (2018-09-14)", "url": "https://www.epectec.com/downloads/Isola-370HR-Data-Sheet.pdf"}
+      ]
+    },
+    "isola.fr408hr": {
+      "vendor": "Isola", "product": "FR408HR", "family": "fr4-low-loss", "category": "fr4",
+      "forms": ["core", "prepreg"], "ptfe": false, "process": "fr4", "tg_c": 200,
+      "dk": [
+        {"value": 3.72, "freq_hz": 1e8, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"value": 3.69, "freq_hz": 1e9, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"value": 3.68, "freq_hz": 2e9, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"value": 3.64, "freq_hz": 5e9, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"value": 3.65, "freq_hz": 1e10, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"value": 3.61, "freq_hz": 1e9, "basis": "fab", "fab": "oshpark", "when": {"construction": "2113"}, "note": "OSH Park 4-layer stackup: FR408HR 2113 prepreg, 3.61 at 1 GHz", "source": "https://docs.oshpark.com/services/four-layer/"},
+        {"value": 3.66, "freq_hz": 1e9, "basis": "fab", "fab": "oshpark", "when": {"construction": "2113", "thickness_mm": 0.1016}, "note": "OSH Park 6-layer stackup: FR408HR 2113 core 0.1016 mm, 3.66 at 1 GHz", "source": "https://docs.oshpark.com/services/six-layer/"},
+        {"value": 3.23, "freq_hz": 1e9, "basis": "fab", "fab": "oshpark", "when": {"construction": "106"}, "note": "OSH Park 6-layer stackup: FR408HR 106 75% prepreg, 3.23 at 1 GHz", "source": "https://docs.oshpark.com/services/six-layer/"}
+      ],
+      "df": [
+        {"value": 0.0072, "freq_hz": 1e8, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"value": 0.0091, "freq_hz": 1e9, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"value": 0.0092, "freq_hz": 2e9, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"value": 0.0098, "freq_hz": 5e9, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"value": 0.0095, "freq_hz": 1e10, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"value": 0.009, "freq_hz": 1e9, "basis": "fab", "fab": "oshpark", "when": {"construction": "2113", "thickness_mm": 0.1016}, "source": "https://docs.oshpark.com/services/six-layer/"},
+        {"value": 0.011, "freq_hz": 1e9, "basis": "fab", "fab": "oshpark", "when": {"construction": "106"}, "source": "https://docs.oshpark.com/services/six-layer/"}
+      ],
+      "sources": [
+        {"title": "Isola FR408HR data sheet (rev 05-18-2010)", "url": "https://a-contract.ru/fileadmin/datasheets/base-material/FR-408HR.pdf"},
+        {"title": "OSH Park 4 layer prototype service (fetched 2026-10-04)", "url": "https://docs.oshpark.com/services/four-layer/"},
+        {"title": "OSH Park 6 layer prototype service (fetched 2026-10-04)", "url": "https://docs.oshpark.com/services/six-layer/"}
+      ]
+    }
+  }
+}

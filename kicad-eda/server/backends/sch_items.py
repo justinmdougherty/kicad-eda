@@ -7,8 +7,15 @@ JSON-friendly dicts.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from backends import kipy_bridge as kb
 from backends import sch_geometry as geo
+
+SheetKey = tuple[str, ...]                 # a sheet path: its KIID strings, root first
+PinKey = tuple[SheetKey, str]              # (sheet path, pin KIID)
+PinRef = tuple[str, str]                   # (reference, pin number)
+InstanceKey = tuple[SheetKey, str]         # (sheet path, symbol KIID)
 
 COMMON_UNITS = (None, 0)          # a pin shared by every unit of a symbol
 DESCRIPTION_FIELD = "Description"
@@ -145,11 +152,85 @@ def symbol_dict(inst, with_pins: bool = False) -> dict:
     return out
 
 
-def pin_map(instances) -> dict[str, tuple[str, str]]:
-    """KIID string -> (reference, pin number) for every pin of every instance;
-    GetSchematicNetlist reports pins by these ids."""
-    return {pin.id.value: (inst.reference, pin.number)
+# --- sheet paths and the netlist ----------------------------------------------
+# A sheet file used several times is ONE screen: its symbols and their pins
+# keep the same KIIDs in every instance, while each instance has its own sheet
+# path and its own reference (demos/multichannel on 10.99: channel_strip four
+# times, 80 pin KIIDs shared). A pin is therefore (sheet path, KIID).
+def sheet_key(path) -> SheetKey:
+    """A kipy SheetPath as a hashable tuple of KIID strings, root first."""
+    return tuple(kiid.value for kiid in path.path)
+
+
+def sheet_text(path) -> str:
+    """'/CH1/ (/<root>/<sheet>)' when KiCad names the path, else the KIIDs."""
+    ids = "/" + "/".join(sheet_key(path))
+    human = getattr(path, "path_human_readable", "")
+    return f"{human} ({ids})" if human else ids
+
+
+def instance_sheet(inst) -> SheetKey:
+    """The sheet path a symbol instance sits on. 10.99 reports the sheet's
+    own path; one that ends with the symbol's KIID (a SheetPath may also name
+    a symbol instance) is cut back to its sheet."""
+    key = sheet_key(inst.path)
+    return key[:-1] if key and key[-1] == inst.id.value else key
+
+
+def instance_key(inst) -> InstanceKey:
+    """(sheet path, symbol KIID): what tells the instances of a reused sheet apart."""
+    return instance_sheet(inst), inst.id.value
+
+
+def pin_map(instances) -> dict[PinKey, PinRef]:
+    """(sheet path, pin KIID) -> (reference, pin number) for every pin of every
+    instance; GetSchematicNetlist reports a net's pins by KIID per sheet path."""
+    return {(instance_sheet(inst), pin.id.value): (inst.reference, pin.number)
             for inst in instances for pin, _unit in pins_with_units(inst)}
+
+
+def kiid_index(pins: Mapping[PinKey, PinRef]) -> dict[str, frozenset[PinRef]]:
+    """Pin KIID -> every (reference, pin number) it stands for, on any sheet."""
+    found: dict[str, set[PinRef]] = {}
+    for (_sheet, kiid), ref in pins.items():
+        found.setdefault(kiid, set()).add(ref)
+    return {kiid: frozenset(refs) for kiid, refs in found.items()}
+
+
+def _net_pin(pins: Mapping[PinKey, PinRef], by_kiid: Mapping[str, frozenset[PinRef]],
+             sheet: SheetKey, kiid: str) -> tuple[PinRef | None, frozenset[PinRef]]:
+    """(pin, ambiguous): the pin at (sheet, KIID), else the one pin the KIID
+    stands for in the whole schematic (a KiCad that reports no or another
+    sheet path); a KIID standing for several pins gives (None, those pins)."""
+    exact = pins.get((sheet, kiid))
+    if exact is not None:
+        return exact, frozenset()
+    candidates = by_kiid.get(kiid, frozenset())
+    if len(candidates) == 1:
+        return next(iter(candidates)), frozenset()
+    return None, candidates                      # empty: a wire, label, junction ...
+
+
+def net_members(net, name: str, pins: Mapping[PinKey, PinRef],
+                by_kiid: Mapping[str, frozenset[PinRef]]) -> tuple[list[list[str]], list[str]]:
+    """([[ref, pin], ...] sorted and unique, warnings) for one SchematicNet.
+    Non-pin items are skipped; a pin KIID with no instance on the net's sheet
+    that stands for several pins elsewhere is left out with a warning, never
+    guessed."""
+    members: set[PinRef] = set()
+    warnings: list[str] = []
+    for sheet in net.sheets:
+        where = sheet_key(sheet.path)
+        for kiid in (item.value for item in sheet.items):
+            pin, candidates = _net_pin(pins, by_kiid, where, kiid)
+            if pin is not None:
+                members.add(pin)
+            elif candidates:
+                listed = ", ".join(f"{ref}.{number}" for ref, number in sorted(candidates))
+                warnings.append(f"net {name!r}: pin KIID {kiid} on sheet {sheet_text(sheet.path)} "
+                                f"has no symbol instance on that sheet and stands for "
+                                f"{len(candidates)} pins elsewhere ({listed}); left out")
+    return sorted(list(pin) for pin in members), warnings
 
 
 def label_dict(item) -> dict:

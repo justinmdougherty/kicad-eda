@@ -1,0 +1,36 @@
+{
+  "schema": "kicad-eda/materials@1",
+  "retrieved": "2026-10-04",
+  "note": "Panasonic MEGTRON 6 (laminate R-5775, prepreg R-5670). Laminate values plus the per-construction core table (cloth style + resin content) of the IPC data sheet; 1 GHz by IPC-TM-650 2.5.5.9, 13 GHz by the balanced-type circular disk resonance method (IEC 63185). Values are typical, not guaranteed.",
+  "materials": {
+    "panasonic.megtron6": {
+      "vendor": "Panasonic", "product": "MEGTRON 6 (R-5775/R-5670)", "family": "ppe-low-loss", "category": "high-speed",
+      "forms": ["core", "prepreg"], "ptfe": false, "process": "fr4-compatible",
+      "dk": [
+        {"value": 3.71, "freq_hz": 1e9, "basis": "typical", "method": "IPC-TM-650 2.5.5.9", "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.62, "freq_hz": 1.3e10, "basis": "typical", "method": "IEC 63185 disk resonance", "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.46, "freq_hz": 1e9, "basis": "typical", "when": {"construction": "1035", "rc_pct": 65}, "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.39, "freq_hz": 1.3e10, "basis": "typical", "when": {"construction": "1035", "rc_pct": 65}, "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.65, "freq_hz": 1e9, "basis": "typical", "when": {"construction": "1078", "rc_pct": 57}, "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.56, "freq_hz": 1.3e10, "basis": "typical", "when": {"construction": "1078", "rc_pct": 57}, "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.49, "freq_hz": 1e9, "basis": "typical", "when": {"construction": "1078", "rc_pct": 63}, "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.43, "freq_hz": 1.3e10, "basis": "typical", "when": {"construction": "1078", "rc_pct": 63}, "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.41, "freq_hz": 1e9, "basis": "typical", "when": {"construction": "1078", "rc_pct": 68}, "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.33, "freq_hz": 1.3e10, "basis": "typical", "when": {"construction": "1078", "rc_pct": 68}, "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.71, "freq_hz": 1e9, "basis": "typical", "when": {"construction": "3313", "rc_pct": 54}, "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 3.62, "freq_hz": 1.3e10, "basis": "typical", "when": {"construction": "3313", "rc_pct": 54}, "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"}
+      ],
+      "df": [
+        {"value": 0.002, "freq_hz": 1e9, "basis": "typical", "method": "IPC-TM-650 2.5.5.9", "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"},
+        {"value": 0.0046, "freq_hz": 1.3e10, "basis": "typical", "method": "IEC 63185 disk resonance", "source": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"}
+      ],
+      "constructions": {
+        "1035": {"thickness_mm": 0.05, "rc_pct": 65}, "1078": {"thickness_mm": 0.065, "rc_pct": 57},
+        "3313": {"thickness_mm": 0.1, "rc_pct": 54}
+      },
+      "sources": [
+        {"title": "Panasonic MEGTRON 6 R-5775 IPC data sheet (to 56 GHz), No. 22040129", "url": "https://industrial.panasonic.cn/content/data/EM/PDF/ipcdatasheet_R-5775_-50GHz_new.pdf"}
+      ]
+    }
+  }
+}

@@ -304,7 +304,8 @@ def test_tilted_plane_without_transform_uses_arc_normal(tmp_path: Path) -> None:
     assert res.outline.area == pytest.approx(2400 - (4 - math.pi) * 9)
     assert block["datum"] == pytest.approx([50, 30])
     assert cutout_circles(block) == [[50, 30, 1.6]]
-    assert cutout_loops(block) == [canon([[60 - x, 40 - y, *rest] for x, y, *rest in EXPECTED_SLOT])]
+    turned = [[60 - x, 40 - y, *rest] for x, y, *rest in EXPECTED_SLOT]
+    assert cutout_loops(block) == [canon(turned)]
     assert "normal" in res.source.plane
     assert any("plane" in w for w in res.warnings)
 
@@ -354,7 +355,7 @@ def test_identity_fusion_transform_with_offset_origin(tmp_path: Path) -> None:
 L_SHAPE = [(0, 0), (40, 0), (40, 10), (10, 10), (10, 25), (0, 25)]   # no mirror symmetry
 
 
-def _l_shape_lines(msp, xz: bool, reverse: bool = False) -> None:
+def _l_shape_lines(msp: object, xz: bool, reverse: bool = False) -> None:
     pts = L_SHAPE[::-1] if reverse else L_SHAPE
     sk = Sketch(msp, layer="0", xz=xz)
     for i in range(len(pts)):
@@ -415,11 +416,12 @@ def test_layer_filter_and_unknown_layer(tmp_path: Path) -> None:
     res = dxf_io.read_board_outline(path, layer="outline")
     assert res.size == pytest.approx((50, 30))
     assert res.source.layers == ("OUTLINE",)
-    with pytest.raises(DxfOutlineError, match=r"(?s)no outline geometry on layer 'EDGE'.*NOTES.*OUTLINE"):
+    with pytest.raises(DxfOutlineError,
+                       match=r"(?s)no outline geometry on layer 'EDGE'.*NOTES.*OUTLINE"):
         dxf_io.read_board_outline(path, layer="EDGE")
 
 
-@pytest.mark.parametrize("layer", [5, "", "   ", ["OUTLINE"], True])
+@pytest.mark.parametrize("layer", [5, ["OUTLINE"], True])   # '' = every layer (hardening)
 def test_layer_must_be_a_layer_name(tmp_path: Path, layer: object) -> None:
     doc, msp = new_doc()
     rect_poly(msp, 0, 0, 50, 30)
@@ -549,11 +551,11 @@ def test_mil_override_on_unitless_file(tmp_path: Path) -> None:
 
 
 def test_unitless_file_warns(tmp_path: Path) -> None:
-    doc, msp = new_doc(insunits=0)
+    doc, msp = new_doc(insunits=0)                 # ezdxf writes $MEASUREMENT 1 (metric)
     rect_poly(msp, 0, 0, 50, 30)
     res = dxf_io.read_board_outline(save(doc, tmp_path))
-    assert res.source.units == "mm" and res.source.units_source == "default"
-    assert any("$INSUNITS" in w for w in res.warnings)
+    assert res.source.units == "mm" and res.source.units_source == "$MEASUREMENT"
+    assert any("$INSUNITS" in w and "$MEASUREMENT 1" in w for w in res.warnings)
 
 
 def test_unsupported_insunits_and_bad_override(tmp_path: Path) -> None:
@@ -589,7 +591,7 @@ def test_write_read_round_trip(tmp_path: Path) -> None:
     assert cutout_circles(block) == [[10, 10, 1.6]]
     assert block["datum"] == pytest.approx([10, 10])
     for got, want in zip(sorted(map(tuple, block["outline"]["loop"])),
-                         sorted(tuple(v) for v in BOARD["outline"]["loop"])):
+                         sorted(tuple(v) for v in BOARD["outline"]["loop"]), strict=True):
         assert got == pytest.approx(want, abs=1e-6)
 
 

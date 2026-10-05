@@ -1,0 +1,12 @@
+{
+  "description": "ST-E7: copper_layers disagrees with the preset (6 declared, JLC04161H-3313 has 4)",
+  "design": {
+    "name": "st_e7",
+    "copper_layers": 6,
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x02",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]]},
+    "stackup": {"preset": "jlcpcb:JLC04161H-3313"}
+  },
+  "expect": {"error": "ST-E7", "path": "$.copper_layers"}
+}

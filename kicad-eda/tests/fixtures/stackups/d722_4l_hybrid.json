@@ -1,0 +1,34 @@
+{
+  "description": "ADR D7.2.2 example: 4L RO4350B/FR-4 hybrid (RF pair = Rogers clad core L1-L2) at PCBWay; the mask defaults to generic LPI (PCBWay publishes none): computed 1.3685 mm, 10 gbrjob thickness rows (D7.1 [C-h4]). RO4350B design Dk 3.66 on a 0.254 mm core is ST-W5 (thin core) and ST-W6 (L1 is below its 8-40 GHz band), RO4450F's 10 GHz process Dk at 1.575 GHz is ST-W6; the build is asymmetric (ST-W2)",
+  "design": {
+    "name": "d722_4l_hybrid",
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]], "SIG": [["J1", "3"]]},
+    "stackup": {"fab": "pcbway", "dk_policy": "design", "design_freq_hz": 1.575e9, "finish": "ENIG",
+      "impedance_control": {"required": true, "tolerance_pct": 10}, "rationale": "Rogers under the RF feeds only",
+      "layers": [
+        {"type": "copper", "oz": 1, "role": "signal"},
+        {"type": "dielectric", "kind": "core", "material": "rogers.ro4350b", "thickness": 0.254, "locked": true},
+        {"type": "copper", "oz": 1, "role": "plane", "net": "GND"},
+        {"type": "dielectric", "kind": "prepreg", "plies": [
+          {"material": "rogers.ro4450f", "thickness": 0.101},
+          {"material": "isola.370hr", "construction": "2116", "thickness": 0.12}]},
+        {"type": "copper", "oz": 0.5, "role": "plane", "net": "+3V3"},
+        {"type": "dielectric", "kind": "core", "material": "isola.370hr", "thickness": 0.71},
+        {"type": "copper", "oz": 1, "role": "signal"}]}
+  },
+  "expect": {
+    "source": "layers",
+    "fab": "pcbway",
+    "copper_layers": 4,
+    "kicad_copper_count": 4,
+    "thickness": 1.3685,
+    "gbrjob_rows": 10,
+    "roles": [["F.Cu", "signal", null], ["In1.Cu", "plane", "GND"], ["In2.Cu", "plane", "+3V3"],
+              ["B.Cu", "signal", null]],
+    "mask_source": "generic",
+    "issues": ["ST-W2", "ST-W5", "ST-W6", "ST-W6"],
+    "drafts": 0
+  }
+}

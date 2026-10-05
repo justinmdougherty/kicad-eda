@@ -14,11 +14,19 @@ are named ``.sexpr`` because the repo .gitignore drops every ``*.kicad_pcb``;
 kicad-cli 9.0.4 loads k5..k9 and the 10.99 nightly loads all seven, and both
 export identical pad nets for them (IPC-D-356), so they are real boards.
 
+Also: load_pad_nets_meta, the frozen ``kicad-eda.padnets/1`` reference
+(write_reference / read_reference), partly unconnected pads and
+real_conflicts. The synthetic ``.kicad_pcb`` text edge cases (duplicate
+references included) and the S-expression readers are tests/test_sexpr_read.py.
+
 Live tier: a KiCad demo's schematic netlist exported with that install's
-kicad-cli compared with the demo's own board; skipped without KiCad.
+kicad-cli compared with the demo's own board; skipped without KiCad. The
+10.99 nightly is found by a session fixture on first use: collecting this
+module starts no kicad-cli.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -188,108 +196,7 @@ def test_pcb_reader_survives_crlf_line_endings_and_a_bom() -> None:
     assert ne.pcb_pad_nets(text) == BOARD
 
 
-def test_pcb_reader_resolves_a_number_only_pad_net_through_the_table() -> None:
-    text = """(kicad_pcb (version 20241229) (generator "pcbnew")
-      (net 0 "") (net 7 "SDA")
-      (footprint "R" (layer "F.Cu") (property "Reference" "R1")
-        (pad "1" smd rect (net 7)) (pad "2" smd rect (net 0)))
-      (footprint "R" (layer "F.Cu") (property "Reference" "R2")
-        (pad "1" smd rect (net 7 "SDA"))))"""
-    assert ne.pcb_pad_nets(text) == {"SDA": {("R1", "1"), ("R2", "1")}, ne.NO_NET: {("R1", "2")}}
-
-
-def test_pcb_reader_fails_loudly_on_an_undefined_net_number() -> None:
-    text = """(kicad_pcb (version 20241229) (net 0 "")
-      (footprint "R" (property "Reference" "R1") (pad "1" smd rect (net 9))))"""
-    with pytest.raises(ValueError, match=r"R1 pad 1 .*net 9.*not define"):
-        ne.pcb_pad_nets(text)
-
-
-def test_pcb_reader_keeps_same_number_pads_on_different_nets_in_both() -> None:
-    text = """(kicad_pcb (version 20260901)
-      (footprint "U" (property "Reference" "U1")
-        (pad "25" smd rect (net "GND")) (pad "25" smd rect (net "VCC"))))"""
-    assert ne.pcb_pad_nets(text) == {"GND": {("U1", "25")}, "VCC": {("U1", "25")}}
-
-
-def test_pcb_reader_ignores_parentheses_inside_quoted_strings() -> None:
-    text = """(kicad_pcb (version 20241229)
-      (gr_text "a ) tricky ( \\" text" (at 0 0))
-      (footprint "X:Y (odd)" (property "Reference" "J(1)")
-        (property "Value" ")))")
-        (pad "1" smd rect (net 1 "Net-(J(1)-Pad1)"))))"""
-    assert ne.pcb_pad_nets(text) == {"Net-(J(1)-Pad1)": {("J(1)", "1")}}
-
-
-def test_pcb_reader_reads_empty_and_net_zero_pad_nets_as_no_net() -> None:
-    text = """(kicad_pcb (version 20260901)
-      (footprint "R" (property "Reference" "R1")
-        (pad "1" smd rect (net)) (pad "2" smd rect (net 0)) (pad "3" smd rect (net ""))))"""
-    assert ne.pcb_pad_nets(text) == {ne.NO_NET: {("R1", "1"), ("R1", "2"), ("R1", "3")}}
-
-
-@pytest.mark.parametrize("reader, text, match", [
-    (ne.pcb_pad_nets, '(kicad_pcb (version 1) (footprint "R" (pad "1" smd "unterminated)))',
-     "unbalanced|cannot parse"),
-    (ne.sexpr_netlist_pad_nets, '(export (version "E") (components))', r"no \(nets"),
-    (ne.sexpr_netlist_pad_nets, '(export (nets (net (code "1") (name "A") (node (pin "1")))))',
-     "node without ref"),
-])
-def test_s_expression_readers_fail_loudly(reader, text: str, match: str) -> None:
-    with pytest.raises(ValueError, match=match):
-        reader(text)
-
-
-def test_pcb_reader_drops_npth_and_aperture_pad_numbers_like_kicad() -> None:
-    # PAD::CanHaveNumber: KiCad clears the number of NPTH pads and of pads on
-    # no copper layer (paste-only apertures) when it loads a board
-    text = """(kicad_pcb (version 20231120) (net 0 "") (net 1 "GND")
-      (footprint "QFN" (property "Reference" "U5")
-        (pad "49" smd rect (layers "F.Cu" "F.Mask") (net 1 "GND"))
-        (pad "49" smd rect (layers "F.Paste"))
-        (pad "50" smd rect (layers "B.Paste" "B.Mask")))
-      (footprint "Hole" (fp_text reference "H1")
-        (pad "1" np_thru_hole circle (layers *.Cu *.Mask)))
-      (module "Old" (fp_text reference J1)
-        (pad 1 connect rect (layers Dessus F.Mask) (net 1 GND))))"""
-    assert ne.pcb_pad_nets(text) == {"GND": {("U5", "49"), ("J1", "1")}}
-
-
-def test_pcb_reader_keeps_footprints_with_an_empty_reference_as_kicad_does() -> None:
-    text = """(kicad_pcb (version 20240922)
-      (footprint "" (property "Reference" "")
-        (pad "1" smd rect (net "A")) (pad "2" smd rect (net "B")))
-      (footprint "X" (property "Reference" "R1") (pad "1" smd rect (net "A"))))"""
-    board = ne.pcb_pad_nets(text)
-    assert board == {"A": {("", "1"), ("R1", "1")}, "B": {("", "2")}}
-    assert ne.compare(board, board).equal
-
-
-def test_pcb_reader_reads_teardrops_missing_a_paren_like_kicad_does() -> None:
-    # KiCad 9.0.4's RoyalBlue54L-Feather demo has 349 of these; KiCad's
-    # teardrop parser makes '(' optional, so the board loads in KiCad
-    pad = """(pad "{n}" smd roundrect (net 1 "{net}")
-          (teardrops (best_length_ratio 0.5) (max_width 2)
-            (curved_edges no)filter_ratio 0.9)
-            (enabled yes) (allow_two_segments yes)
-          )
-          (uuid "954fd78b-8651-4ccc-942c-16ae54494df9"))"""
-    text = f"""(kicad_pcb (version 20241229) (net 0 "") (net 1 "a) filter_ratio")
-      (footprint "C" (property "Reference" "C1") {pad.format(n=1, net="a) filter_ratio")}
-        {pad.format(n=2, net="a) filter_ratio")})
-      (footprint "C" (property "Reference" "C2") {pad.format(n=1, net="a) filter_ratio")}))"""
-    assert ne.pcb_pad_nets(text) == {"a) filter_ratio": {("C1", "1"), ("C1", "2"), ("C2", "1")}}
-
-
-@pytest.mark.parametrize("text, match", [
-    ('(export (version "E"))', "not a KiCad board"),
-    ("", "not a KiCad board"),
-    ('(kicad_pcb (version 20241229) (footprint "R" (pad "1" smd rect)', "unbalanced"),
-    ('(kicad_pcb (version 20241229)))', "unbalanced"),
-])
-def test_pcb_reader_rejects_what_is_not_a_board(text: str, match: str) -> None:
-    with pytest.raises(ValueError, match=match):
-        ne.pcb_pad_nets(text)
+# The synthetic .kicad_pcb text edge cases live in tests/test_sexpr_read.py.
 
 
 # ----------------------------------------------------------------------------
@@ -327,6 +234,96 @@ def test_load_pad_nets_refuses_a_schematic_and_unknown_content(tmp_path: Path) -
         ne.load_pad_nets(bad_json)
     with pytest.raises(FileNotFoundError):
         ne.load_pad_nets(tmp_path / "missing.kicad_pcb")
+
+
+# ----------------------------------------------------------------------------
+# load_pad_nets_meta (a board with duplicate references: tests/test_sexpr_read.py)
+# ----------------------------------------------------------------------------
+@pytest.mark.parametrize("name, kind, version, board_only", [
+    ("board_k5.sexpr", "board", 20171130, []), ("board_k11.sexpr", "board", 20260901, ["H1"]),
+    ("sch_k9.xml", "xml", "E", []), ("sch_k9.net", "net", "E", []),
+    ("netlist.json", "netlist", None, ["H1"])])
+def test_load_pad_nets_meta_names_the_kind(name: str, kind: str, version: object,
+                                           board_only: list) -> None:
+    nets, meta = ne.load_pad_nets_meta(FIX / name)
+    assert nets == ne.load_pad_nets(FIX / name)
+    assert meta == {"kind": kind, "format_version": version, "duplicate_refs": [],
+                    "board_only_refs": board_only}
+
+
+# ----------------------------------------------------------------------------
+# The frozen pad-net reference (kicad-eda.padnets/1)
+# ----------------------------------------------------------------------------
+_SOURCE = {"kind": "kicad", "path": "src/x.kicad_pcb", "sha256": "ab12"}
+
+
+def test_write_reference_round_trips(tmp_path: Path) -> None:
+    nets = {**BOARD, "Ω µ": {("Q10", "G"), ("Q2", "G")}, "VCC": BOARD["VCC"] | {("U1", "2")}}
+    path = ne.write_reference(tmp_path / "out" / "ref.json", nets, board_only=["H1"],
+                              duplicate_refs=("STITCH1", "POLY", "STITCH1"), source=_SOURCE)
+    raw = path.read_bytes()
+    assert b"\r" not in raw and "Ω µ".encode() in raw and raw.endswith(b"}\n")
+    data = json.loads(raw)
+    assert data["format"] == "kicad-eda.padnets/1" and data["source"] == _SOURCE
+    assert data["board_only"] == ["H1"] and data["duplicate_refs"] == ["POLY", "STITCH1"]
+    assert list(data["nets"]) == ["", "/A/B", "GND", "Net-(R1-Pad2)", "VCC",
+                                  "unconnected-(U1-NC-Pad2)", "Ω µ"]
+    assert data["nets"][""] == [["U1", "3"]] and data["nets"]["Ω µ"] == [["Q2", "G"], ["Q10", "G"]]
+    got, meta = ne.read_reference(path)
+    assert got == nets
+    assert meta == {"kind": "reference", "format_version": "kicad-eda.padnets/1",
+                    "duplicate_refs": ["POLY", "STITCH1"], "board_only_refs": ["H1"],
+                    "source": _SOURCE}
+    assert ne.load_pad_nets_meta(path) == (got, meta) and ne.load_pad_nets(path) == got
+    assert ne.load_pad_nets(path, exclude_board_only=True) == {
+        **nets, "GND": nets["GND"] - {("H1", "1")}}
+    again = ne.write_reference(tmp_path / "again.json", got, board_only=meta["board_only_refs"],
+                               duplicate_refs=meta["duplicate_refs"], source=meta["source"])
+    assert again.read_bytes() == raw
+
+
+def test_a_reference_compares_like_its_source(tmp_path: Path) -> None:
+    path = ne.write_reference(tmp_path / "ref.json", ne.load_pad_nets(FIX / "board_k11.sexpr"))
+    assert json.loads(path.read_text(encoding="utf-8"))["source"] == {}
+    res = ne.compare(ne.load_pad_nets(FIX / "netlist.json"), ne.load_pad_nets(path))
+    assert res.equal and ne.read_reference(path)[1]["board_only_refs"] == []
+
+
+_FMT = "kicad-eda.padnets/1"
+
+
+@pytest.mark.parametrize("doc, match", [
+    ({"format": "kicad-eda.padnets/2", "nets": {}}, "kicad-eda.padnets/1"),
+    ([_FMT], "kicad-eda.padnets/1"),
+    ({"format": _FMT, "nets": []}, "'nets' must be an object"),
+    ({"format": _FMT, "nets": {"A": "R1.1"}}, "must be a list"),
+    ({"format": _FMT, "nets": {"A": [["R1"]]}}, r"\[ref, pad\]"),
+    ({"format": _FMT, "nets": {}, "board_only": "H1"}, "board_only"),
+    ({"format": _FMT, "nets": {}, "duplicate_refs": [1]}, "duplicate_refs"),
+    ({"format": _FMT, "nets": {}, "source": ["x"]}, "source"),
+])
+def test_read_reference_rejects_malformed_files(tmp_path: Path, doc: object, match: str) -> None:
+    path = tmp_path / "ref.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        ne.read_reference(path)
+    if isinstance(doc, dict):
+        with pytest.raises(ValueError, match=match):
+            ne.load_pad_nets(path)
+
+
+def test_reference_io_fails_loudly(tmp_path: Path) -> None:
+    (tmp_path / "bad.json").write_text("{nope", encoding="utf-8")
+    with pytest.raises(ValueError, match="bad.json"):
+        ne.read_reference(tmp_path / "bad.json")
+    out = tmp_path / "w.json"
+    for kw, match in (({"pad_nets": {"A": [["R1"]]}}, r"\[ref, pad\]"),
+                      ({"pad_nets": {}, "board_only": "H1"}, "board_only"),
+                      ({"pad_nets": {}, "source": ["x"]}, "source"),
+                      ({"pad_nets": {}, "source": {"x": object()}}, "source")):
+        with pytest.raises(ValueError, match=match):
+            ne.write_reference(out, **kw)
+    assert not out.exists()
 
 
 # ----------------------------------------------------------------------------
@@ -483,7 +480,8 @@ def test_a_pad_on_two_nets_joins_them_and_is_reported() -> None:
     a = _nets(GND="R1.2 U1.25", VCC="R1.1 C1.1")
     b = _nets(GND="R1.2 U1.25", VCC="R1.1 C1.1 U1.25")             # U1.25 copper on both nets
     res = ne.compare(a, b)
-    assert res.details["pad_conflicts_b"] == [{"pad": ["U1", "25"], "nets": ["GND", "VCC"]}]
+    assert res.details["pad_conflicts_b"] == [{"pad": ["U1", "25"], "nets": ["GND", "VCC"],
+                                               "single_pin": False}]
     (merged,) = res.merged_nets
     assert merged.net == "GND + VCC"
     assert sorted(p.net for p in merged.parts) == ["GND", "VCC"]
@@ -494,6 +492,37 @@ def test_the_same_conflict_on_both_sides_is_still_equivalent() -> None:
     a = _nets(GND="R1.2 U1.25", VCC="R1.1 U1.25")
     res = ne.compare(a, a)
     assert res.equal and res.details["pad_conflicts_a"] == res.details["pad_conflicts_b"]
+
+
+def test_real_conflicts_drops_pads_alone_on_unconnected_nets() -> None:
+    # cm5_minima J502: two copper 'MP' pads, each alone on its own unconnected-(...) net
+    nets = {"unconnected-(J502-MountPin-PadMP)": {("J502", "MP")},
+            "unconnected-(J502-MountPin-PadMP)_1": {("J502", "MP")},
+            "unconnected-(X)": {("U3", "1"), ("R5", "1")}, "unconnected-(X)_1": {("U3", "1")},
+            "A": {("U2", "5")}, "B": {("U2", "5")}, **_nets(GND="R1.2 U1.25", VCC="R1.1 U1.25")}
+    res = ne.compare(nets, nets)
+    assert res.equal and len(res.details["pad_conflicts_b"]) == 4
+    kept = [{"pad": ["U1", "25"], "nets": ["GND", "VCC"], "single_pin": False},
+            {"pad": ["U2", "5"], "nets": ["A", "B"], "single_pin": True},
+            {"pad": ["U3", "1"], "nets": ["unconnected-(X)", "unconnected-(X)_1"],
+             "single_pin": False}]
+    assert ne.real_conflicts(res.details) == {"pad_conflicts_a": kept, "pad_conflicts_b": kept}
+    assert ne.real_conflicts(json.loads(json.dumps(res.as_dict()))["details"])["pad_conflicts_a"] \
+        == kept
+
+
+def test_a_pad_partly_on_no_net_is_listed_and_still_equal() -> None:
+    # U1 'EP': one copper pad on GND, a second of the same number on no net
+    board = ne.pcb_pad_nets("""(kicad_pcb (version 20260206)
+      (footprint "QFN" (property "Reference" "U1") (pad "1" smd (net "GND"))
+        (pad "EP" smd rect (net "GND")) (pad "EP" smd rect)))""")
+    assert board == {"GND": {("U1", "EP"), ("U1", "1")}, ne.NO_NET: {("U1", "EP")}}
+    partly = [{"pad": ["U1", "EP"], "nets": ["GND"]}]
+    res = ne.compare(board, board)
+    assert res.equal and res.details["partly_unconnected_pads_a"] == partly
+    res = ne.compare({"GND": {("U1", "EP"), ("U1", "1")}}, board)
+    assert res.equal and res.details["partly_unconnected_pads_a"] == []
+    assert res.details["partly_unconnected_pads_b"] == partly
 
 
 def test_compare_accepts_json_style_lists_and_rejects_garbage() -> None:
@@ -608,6 +637,13 @@ def test_cli_exit_codes_and_json(capsys) -> None:
     assert "nope.kicad_pcb" in capsys.readouterr().err
 
 
+def test_cli_asks_for_kicad_cli_to_read_a_schematic(tmp_path: Path, capsys) -> None:
+    (tmp_path / "x.kicad_sch").write_text("(kicad_sch)", encoding="utf-8")
+    assert ne.main([str(tmp_path / "x.kicad_sch"), str(FIX / "board_k8.sexpr")]) == 2
+    assert ("x.kicad_sch is a schematic: pass --kicad-cli <path to kicad-cli> to export it"
+            in capsys.readouterr().err)
+
+
 def test_cli_describes_the_differences_and_exports_a_schematic(tmp_path: Path, capsys,
                                                                monkeypatch) -> None:
     calls: list[tuple] = []
@@ -688,6 +724,8 @@ def test_live_board_only_parts_are_the_only_difference(tmp_path: Path) -> None:
     assert {ref for ref, _ in res.extra_pins} <= board_only, _explain(res)
     assert _sch_vs_pcb(KICAD.cli, project, "tinytapeout-demo", tmp_path,
                        ignore_refs=board_only).equal
+    meta = ne.load_pad_nets_meta(pcb)[1]            # 130 stitching vias all called STITCH1
+    assert "STITCH1" in meta["duplicate_refs"] and "STITCH1" in meta["board_only_refs"]
 
 
 @requires_kicad_cli
@@ -707,36 +745,48 @@ def test_live_footprint_missing_symbol_pads_is_reported(tmp_path: Path) -> None:
     assert res.details["missing_refs"] == []                   # Cage3 itself is on the board
 
 
-def _nightly_cli() -> Path | None:
-    """A kicad-cli >= 10.99 (it reads the KiCad 10 format demo boards)."""
+@pytest.fixture(scope="session")
+def nightly() -> Path:
+    """A kicad-cli >= 10.99 (it reads the KiCad 10 format demo boards),
+    probed on first use: collecting this module runs no kicad-cli."""
     import kicad_env as env
     for cli in env.candidate_clis():
         version = env.cli_version(cli)
         if version and env.parse_version(version) >= (10, 99, 0):
             return cli
-    return None
+    pytest.skip("no KiCad 11 nightly (10.99) kicad-cli installed")
 
 
-NIGHTLY = _nightly_cli()
+def test_collecting_this_module_runs_no_kicad_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    import kicad_env as env
+
+    def trap(*args: object, **kw: object) -> None:
+        raise AssertionError(f"a probe ran at import: {args!r}")
+
+    for owner, name in ((subprocess, "run"), (subprocess, "Popen"), (env, "candidate_clis"),
+                        (env, "cli_version"), (env, "discover")):
+        monkeypatch.setattr(owner, name, trap)
+    spec = importlib.util.spec_from_file_location("_net_equivalence_collect", __file__)
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
 
 
-@pytest.mark.skipif(NIGHTLY is None, reason="no KiCad 11 nightly (10.99) kicad-cli installed")
-def test_live_nightly_kicad10_format_board_matches_its_schematic(tmp_path: Path) -> None:
+def test_live_nightly_kicad10_format_board_matches_its_schematic(tmp_path: Path,
+                                                                 nightly: Path) -> None:
     """The nightly's pic_programmer board is KiCad 10 format: name-only pad
     nets and no board net table."""
-    assert NIGHTLY is not None
-    project = _demo_copy(NIGHTLY.parent.parent, "pic_programmer", tmp_path)
+    project = _demo_copy(nightly.parent.parent, "pic_programmer", tmp_path)
     pcb = project / "pic_programmer.kicad_pcb"
     if (ne.pcb_format_version(pcb.read_text(encoding="utf-8")) or 0) < 20260206:
         pytest.skip("this nightly ships a pre-KiCad-10 pic_programmer board")
-    res = _sch_vs_pcb(NIGHTLY, project, "pic_programmer", tmp_path)
+    res = _sch_vs_pcb(nightly, project, "pic_programmer", tmp_path)
     assert res.equal, _explain(res)
 
 
-@pytest.mark.skipif(NIGHTLY is None, reason="no KiCad 11 nightly (10.99) kicad-cli installed")
 @pytest.mark.parametrize("demo, stem", [("stickhub", "StickHub"), ("cm5_minima", "CM5_MINIMA_3")])
-def test_live_nightly_demos_match(tmp_path: Path, demo: str, stem: str) -> None:
-    assert NIGHTLY is not None
-    project = _demo_copy(NIGHTLY.parent.parent, demo, tmp_path)
-    res = _sch_vs_pcb(NIGHTLY, project, stem, tmp_path)
+def test_live_nightly_demos_match(tmp_path: Path, nightly: Path, demo: str, stem: str) -> None:
+    project = _demo_copy(nightly.parent.parent, demo, tmp_path)
+    res = _sch_vs_pcb(nightly, project, stem, tmp_path)
     assert res.equal, _explain(res)
+    if demo == "cm5_minima":                    # J502/J503 'MP': harmless, not real conflicts
+        board = ne.load_pad_nets(project / f"{stem}.kicad_pcb")
+        assert ne.real_conflicts(ne.compare(board, board).details)["pad_conflicts_a"] == []

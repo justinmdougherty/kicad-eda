@@ -8,11 +8,16 @@ KiCad install is present.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 import sexpdata
 
+import libtable
 import symlib
 from fixtures.kicad_install import KICAD, requires_symbols
 
@@ -148,7 +153,8 @@ def test_pin_numbers_and_etypes():
 
 
 def test_unit_pins_multi_unit_and_unit0_folding():
-    assert symlib.unit_pins(_flat("BaseAmp")) == {1: ["3", "2", "1"], 2: ["5", "6", "7"], 3: ["8", "4"]}
+    assert symlib.unit_pins(_flat("BaseAmp")) == {1: ["3", "2", "1"], 2: ["5", "6", "7"],
+                                                  3: ["8", "4"]}
     assert symlib.unit_pins(_flat("DerivedAmp")) == symlib.unit_pins(_flat("BaseAmp"))
     # a pin in the common (unit 0) sub-symbol belongs to unit 1
     assert symlib.unit_pins(_flat("CommonPins")) == {1: ["1", "2"], 2: ["3"]}
@@ -158,7 +164,8 @@ def test_unit_pins_multi_unit_and_unit0_folding():
 @requires_symbols
 def test_unit_pins_real_library_lm358():
     units = symlib.unit_pins(_flat("LM358", lib="Amplifier_Operational", symbols_dir=KICAD.symbols))
-    assert {u: set(p) for u, p in units.items()} == {1: {"1", "2", "3"}, 2: {"5", "6", "7"}, 3: {"4", "8"}}
+    assert {u: set(p) for u, p in units.items()} == {1: {"1", "2", "3"}, 2: {"5", "6", "7"},
+                                                     3: {"4", "8"}}
 
 
 # --- pin_offsets -------------------------------------------------------------
@@ -187,10 +194,13 @@ def test_pin_offsets_name_first_wins_number_last_wins():
 
 
 def test_pin_offsets_folds_unit0_and_handles_pins_on_the_symbol_itself():
-    assert symlib.pin_offsets(_flat("CommonPins"))["VCC"] == {"x": 0.0, "y": -5.08, "unit": 1, "number": "1"}
+    assert symlib.pin_offsets(_flat("CommonPins"))["VCC"] == {"x": 0.0, "y": -5.08, "unit": 1,
+                                                              "number": "1"}
     bare = [S("symbol"), "X",
-            [S("pin"), S("passive"), S("line"), [S("at"), 1.27, -2.54, 0], [S("name"), "A"], [S("number"), "1"]],
-            [S("pin"), S("passive"), S("line"), [S("name"), "B"], [S("number"), "2"]]]   # no (at ...)
+            [S("pin"), S("passive"), S("line"), [S("at"), 1.27, -2.54, 0], [S("name"), "A"],
+             [S("number"), "1"]],
+            [S("pin"), S("passive"), S("line"), [S("name"), "B"],
+             [S("number"), "2"]]]                                              # no (at ...)
     assert symlib.pin_offsets(bare) == {"1": {"x": 1.27, "y": 2.54, "unit": 1, "number": "1"},
                                         "A": {"x": 1.27, "y": 2.54, "unit": 1, "number": "1"}}
 
@@ -235,3 +245,230 @@ def test_embed_of_flattened_derived_symbol_carries_inherited_pins():
 def test_dumps_round_trips_through_sexpdata():
     flat = _flat("BaseAmp")
     assert sexpdata.loads(symlib.dumps(flat)) == flat
+
+
+# --- symbol sources: a directory, a LibraryResolver, a library map (F2-09, D1) ----
+
+PROJ_LIB = "libs/my_parts.kicad_sym"          # nickname "Parts": the file is named otherwise
+
+
+def _proj_lib(root: Path, rel: str = PROJ_LIB) -> Path:
+    """A project library (a copy of TestLib) at ``root/rel``."""
+    lib = root / rel
+    lib.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(FIXTURE_SYMBOLS / "TestLib.kicad_sym", lib)
+    return lib
+
+
+def _resolver(root: Path, block: dict) -> libtable.LibraryResolver:
+    """A netlist in ``root`` with ``block`` as libraries.symbols; stock = fixtures."""
+    return libtable.LibraryResolver(root, {"symbols": block}, FIXTURE_SYMBOLS, None, env={})
+
+
+def _sym_lib_table(root: Path, *rows: str) -> None:
+    (root / "sym-lib-table").write_text(
+        "(sym_lib_table\n  (version 7)\n" + "".join(f"  {r}\n" for r in rows) + ")\n",
+        encoding="utf-8")
+
+
+def test_lib_path_of_a_directory_is_the_naming_convention(tmp_path: Path):
+    assert symlib.lib_path(tmp_path, "X") == tmp_path / "X.kicad_sym"     # need not exist
+    assert symlib.lib_path(str(tmp_path), "X") == tmp_path / "X.kicad_sym"
+
+
+def test_lib_path_through_a_resolver_block_then_stock(tmp_path: Path):
+    lib = _proj_lib(tmp_path)
+    r = _resolver(tmp_path, {"Parts": PROJ_LIB})
+    assert symlib.lib_path(r, "Parts") == lib
+    assert symlib.lib_path(r, "TestLib") == FIXTURE_SYMBOLS / "TestLib.kicad_sym"
+
+
+def test_lib_path_through_a_project_sym_lib_table(tmp_path: Path):
+    lib = _proj_lib(tmp_path)
+    _sym_lib_table(tmp_path, '(lib (name "Parts")(type "KiCad")'
+                             '(uri "${KIPRJMOD}/libs/my_parts.kicad_sym")(options "")(descr ""))')
+    assert symlib.lib_path(_resolver(tmp_path, {}), "Parts") == lib
+
+
+def test_lib_path_unknown_nickname_through_a_resolver_names_it(tmp_path: Path):
+    with pytest.raises(symlib.SymbolLibError,
+                       match=r"^symbol library not found: 'Nope': it is not in the netlist "
+                             r"libraries block, not in .*sym-lib-table, and .*Nope\.kicad_sym "
+                             r"does not exist$"):
+        symlib.lib_path(_resolver(tmp_path, {}), "Nope")
+
+
+def test_lib_path_through_a_library_map(tmp_path: Path):
+    lib = _proj_lib(tmp_path)
+    lib_map = json.loads(json.dumps(_resolver(tmp_path, {"Parts": PROJ_LIB}).library_map()))
+    assert symlib.lib_path(lib_map, "Parts") == lib
+    assert symlib.lib_path(lib_map, "TestLib") == FIXTURE_SYMBOLS / "TestLib.kicad_sym"
+    with pytest.raises(symlib.SymbolLibError,
+                       match=r"^symbol library not found: 'Nope': not in the library map's "
+                             r"symbols, and .*Nope\.kicad_sym does not exist$"):
+        symlib.lib_path(lib_map, "Nope")
+
+
+def test_lib_path_library_map_edge_cases(tmp_path: Path):
+    with pytest.raises(symlib.SymbolLibError, match="the map has no stock symbol directory"):
+        symlib.lib_path({"symbols": {}}, "Nope")
+    disabled = {"symbols": {"Off": {"path": str(tmp_path / "off.kicad_sym"), "disabled": True,
+                                    "origin": "the project sym-lib-table"}}}
+    with pytest.raises(symlib.SymbolLibError,
+                       match="^symbol library not found: 'Off': disabled in the project"):
+        symlib.lib_path(disabled, "Off")
+    for bad, match in [({"symbols": ["Parts"]}, "'symbols' must be an object"),
+                       ({"stock": "C:/syms"}, "'stock' must be an object"),
+                       ({"symbols": {"Parts": "libs/p.kicad_sym"}}, "must be an object with a "
+                                                                     "'path' string")]:
+        with pytest.raises(symlib.SymbolLibError, match=match):
+            symlib.lib_path(bad, "Parts")
+
+
+def test_non_kicad_library_type_is_a_clear_error_naming_nick_and_type(tmp_path: Path):
+    (tmp_path / "old.lib").write_text("EESchema-LIBRARY Version 2.4\n", encoding="utf-8")
+    _sym_lib_table(tmp_path, '(lib (name "Old")(type "Legacy")(uri "${KIPRJMOD}/old.lib")'
+                             '(options "")(descr ""))')
+    r = libtable.LibraryResolver.for_directory(tmp_path, FIXTURE_SYMBOLS, None, env={})
+    want = r"symbol library 'Old' \(.*old\.lib, from .*sym-lib-table\) has type 'Legacy'"
+    for source in (r, r.library_map()):
+        with pytest.raises(symlib.SymbolLibError, match=want):
+            symlib.lib_path(source, "Old")
+        with pytest.raises(symlib.SymbolLibError, match=want):
+            symlib.flatten({}, source, "Old", "X")
+
+
+def test_an_unsupported_source_is_a_type_error():
+    for source in (None, 42, ["C:/syms"]):
+        with pytest.raises(TypeError, match="symbol source must be"):
+            symlib.lib_path(source, "X")
+
+
+def test_flatten_and_load_lib_through_a_resolver_and_a_map(tmp_path: Path):
+    lib = _proj_lib(tmp_path)
+    r = _resolver(tmp_path, {"Parts": PROJ_LIB})
+    for source in (r, r.library_map()):
+        flat = symlib.flatten({}, source, "Parts", "DerivedAmp")
+        assert flat == _flat("DerivedAmp")
+        assert symlib.load_lib(source, "Parts").path == lib
+        with pytest.raises(symlib.SymbolLibError,
+                           match=r"^symbol Parts:Nope not found in my_parts\.kicad_sym$"):
+            symlib.flatten({}, source, "Parts", "Nope")
+
+
+def test_a_declared_library_whose_file_is_missing(tmp_path: Path):
+    r = _resolver(tmp_path, {"Gone": "libs/gone.kicad_sym"})
+    with pytest.raises(symlib.SymbolLibError,
+                       match=r"^symbol library not found: .*gone\.kicad_sym \(library 'Gone'\)$"):
+        symlib.load_lib(r, "Gone")
+
+
+def test_flatten_from_a_prefilled_cache_needs_no_source():
+    cache = {"TestLib": symlib.load_lib(FIXTURE_SYMBOLS, "TestLib")}
+    assert symlib.flatten(cache, None, "TestLib", "DerivedAmp") == _flat("DerivedAmp")
+    with pytest.raises(symlib.SymbolLibError, match="TestLib:Nope not found in TestLib.kicad_sym"):
+        symlib.flatten(cache, None, "TestLib", "Nope")
+    plain = {"Alias": dict(cache["TestLib"])}       # a plain dict carries no file name
+    with pytest.raises(symlib.SymbolLibError, match="Alias:Nope not found in Alias.kicad_sym"):
+        symlib.flatten(plain, None, "Alias", "Nope")
+
+
+# --- the parse cache: (path, mtime_ns, size) -----------------------------------
+
+def _aged(path: Path, seconds_ago: float = 3600.0) -> Path:
+    """Backdate ``path`` past the just-written window, so it is cacheable."""
+    t = time.time() - seconds_ago
+    os.utime(path, (t, t))
+    return path
+
+
+@pytest.fixture
+def parses(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
+    """Counts sexpdata.loads calls, starting from an empty parse cache."""
+    calls: list[int] = []
+    real = sexpdata.loads
+
+    def counting(text: str, **kw: object) -> object:
+        calls.append(len(text))
+        return real(text, **kw)
+
+    symlib.clear_cache()
+    monkeypatch.setattr(sexpdata, "loads", counting)
+    yield calls
+    symlib.clear_cache()
+
+
+def test_parse_cache_reuses_an_unchanged_file(tmp_path: Path, parses: list[int]):
+    _aged(_proj_lib(tmp_path, "Cached.kicad_sym"))
+    (tmp_path / "sub").mkdir()
+    a = symlib.load_lib(tmp_path, "Cached")
+    b = symlib.load_lib(os.path.join(tmp_path, "sub", ".."), "Cached")   # another spelling
+    assert len(parses) == 1
+    assert a == b and a is not b and a["BaseAmp"] is b["BaseAmp"]
+    a.pop("BaseAmp")                                  # a caller's dict is its own
+    assert "BaseAmp" in symlib.load_lib(tmp_path, "Cached")
+    assert len(parses) == 1
+
+
+def test_parse_cache_rereads_a_changed_file(tmp_path: Path, parses: list[int]):
+    lib = _aged(_proj_lib(tmp_path, "Cached.kicad_sym"))
+    assert "Extra" not in symlib.load_lib(tmp_path, "Cached")
+    text = lib.read_text(encoding="utf-8")
+    lib.write_text(text.rstrip()[:-1] + '  (symbol "Extra")\n)\n', encoding="utf-8")
+    _aged(lib, 1800.0)                                # another mtime and another size
+    assert "Extra" in symlib.load_lib(tmp_path, "Cached")
+    lib.write_text(text.replace("BaseAmp", "BaseAm2"), encoding="utf-8")    # same size
+    _aged(lib, 900.0)
+    assert "BaseAm2" in symlib.load_lib(tmp_path, "Cached")
+    assert len(parses) == 3
+
+
+def test_parse_cache_never_trusts_a_file_written_moments_ago(tmp_path: Path, parses: list[int]):
+    # a same-size rewrite inside one mtime tick would look unchanged by (mtime, size)
+    lib = _proj_lib(tmp_path, "Fresh.kicad_sym")
+    symlib.load_lib(tmp_path, "Fresh")
+    lib.write_text(lib.read_text(encoding="utf-8").replace("BaseAmp", "BaseAm2"),
+                   encoding="utf-8")
+    assert "BaseAm2" in symlib.load_lib(tmp_path, "Fresh")
+    assert len(parses) == 2
+
+
+def test_parse_cache_is_lru_within_a_byte_budget(tmp_path: Path, parses: list[int],
+                                                 monkeypatch: pytest.MonkeyPatch):
+    libs = {n: _aged(_proj_lib(tmp_path, f"{n}.kicad_sym")) for n in ("A", "B", "C")}
+    size = libs["A"].stat().st_size
+    monkeypatch.setattr(symlib, "PARSE_CACHE_BYTES", 2 * size)       # room for two
+    for name in ("A", "B", "A", "C"):                  # A is used again: B is the LRU
+        symlib.load_lib(tmp_path, name)
+    assert len(parses) == 3
+    assert symlib.cache_info() == {"entries": 2, "bytes": 2 * size, "limit": 2 * size}
+    symlib.load_lib(tmp_path, "A")
+    symlib.load_lib(tmp_path, "C")
+    assert len(parses) == 3                            # both still cached
+    symlib.load_lib(tmp_path, "B")
+    assert len(parses) == 4                            # B was evicted
+
+
+def test_parse_cache_keeps_neither_oversize_nor_superseded_versions(
+        tmp_path: Path, parses: list[int], monkeypatch: pytest.MonkeyPatch):
+    lib = _aged(_proj_lib(tmp_path, "Big.kicad_sym"))
+    monkeypatch.setattr(symlib, "PARSE_CACHE_BYTES", lib.stat().st_size - 1)
+    symlib.load_lib(tmp_path, "Big")
+    symlib.load_lib(tmp_path, "Big")
+    assert len(parses) == 2 and symlib.cache_info()["entries"] == 0
+    monkeypatch.setattr(symlib, "PARSE_CACHE_BYTES", 10 * lib.stat().st_size)
+    symlib.load_lib(tmp_path, "Big")
+    _aged(lib, 1800.0)                                 # a new version of the same file
+    symlib.load_lib(tmp_path, "Big")
+    assert len(parses) == 4 and symlib.cache_info()["entries"] == 1
+
+
+def test_a_parse_error_is_not_cached(tmp_path: Path, parses: list[int]):
+    lib = tmp_path / "Broken.kicad_sym"
+    lib.write_text('(kicad_symbol_lib (symbol "X"', encoding="utf-8")
+    _aged(lib)
+    with pytest.raises(symlib.SymbolLibError, match="cannot parse"):
+        symlib.load_lib(tmp_path, "Broken")
+    shutil.copyfile(FIXTURE_SYMBOLS / "TestLib.kicad_sym", lib)
+    _aged(lib, 1800.0)
+    assert "BaseAmp" in symlib.load_lib(tmp_path, "Broken")

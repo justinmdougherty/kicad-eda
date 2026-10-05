@@ -10,21 +10,26 @@ re-exported here) renders to a footprint in the D0 dialect,
   * F.Fab: the nominal body outline with a chamfered pin-1 corner, and a
     ``${REFERENCE}`` text;
   * F.SilkS: the body outline 0.11 mm outside the fab line, clipped so every
-    silk stroke keeps >= 0.2 mm from pad copper, and a pin-1 triangle;
+    silk stroke keeps >= 0.2 mm from pad copper, and a pin-1 triangle
+    (place_pin1_marker): inside the courtyard when it fits there, cutting a
+    notch into the outline if it must;
   * F.CrtYd: one rectangle around the max-material body and all pad copper,
     grown by the courtyard excess and rounded outward to a 0.01 mm grid. The
     excess is 0.25 mm: IPC-7351B ("Generic Requirements for Surface Mount
     Design and Land Pattern Standard", 2010), density level B "nominal"
-    courtyard excess; the KiCad Library Convention (F5.3) uses the same value;
+    courtyard excess; the KiCad Library Convention (F5.3) uses the same value.
+    A pin-1 marker with no room inside it grows it to cover the marker;
   * Reference (F.SilkS, above the courtyard) and Value (F.Fab, below it).
 
-Also here: a stdlib .kicad_mod reader; static checks (dialect, courtyard
-excess, silk clearance, copper overlaps); ``validate(path)`` = those checks
-plus ``kicad-cli fp upgrade`` (oldest install) into a temp dir, whose
-re-serialised pads must equal the source's; ``pcbnew_load(path)``
-(FootprintLoad in a KiCad-python child); ``compare_footprints(a, b)``.
-Templates are in fp_author_templates.py. Units: mm, footprint frame (+Y
-down). Stdlib-only, except that validate / pcbnew_load find KiCad through kicad_env.
+Also here: static checks (dialect, courtyard excess, silk clearance, copper
+overlaps); ``validate(path)`` = those checks plus ``kicad-cli fp upgrade``
+(oldest install) into a temp dir, whose re-serialised pads must equal the
+source's; ``pcbnew_load(path)`` (FootprintLoad in a KiCad-python child that
+imports kicad_quiet first). The stdlib .kicad_mod reader lives in fp_reader,
+compare_footprints in fp_compare and the templates in fp_author_templates;
+this module re-exports them (``__all__``). Units: mm, footprint frame (+Y
+down). Stdlib-only, except that validate / pcbnew_load find KiCad through
+kicad_env.
 """
 from __future__ import annotations
 
@@ -36,14 +41,31 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
-from fp_author_templates import (  # noqa: F401  (the spec vocabulary, re-exported)
+from fp_author_templates import (
     ATTR_FLAGS, ATTR_TYPES, COURTYARD_EXCESS_MM, DEFAULT_LAYERS, EPS, PAD_SHAPES, PAD_TYPES,
-    SIDES, Body, FootprintSpec, Model, Pad, has_copper)
+    SIDES, Body, FootprintSpec, Model, Pad, has_copper, natural_key, pad_bbox)
+from fp_author_templates import r6 as _r6
+from fp_compare import compare_footprints
+from fp_reader import (
+    FootprintParseError, ParsedFootprint, ParsedPad, parse_footprint, parse_sexpr, read_footprint)
+
+__all__ = [
+    # the spec vocabulary (fp_author_templates)
+    "ATTR_FLAGS", "ATTR_TYPES", "COURTYARD_EXCESS_MM", "DEFAULT_LAYERS", "EPS", "PAD_SHAPES",
+    "PAD_TYPES", "SIDES", "Body", "FootprintSpec", "Model", "Pad", "has_copper", "pad_bbox",
+    # the reader (fp_reader) and the comparison (fp_compare)
+    "FootprintParseError", "ParsedFootprint", "ParsedPad", "parse_footprint", "parse_sexpr",
+    "read_footprint", "compare_footprints",
+    # this module
+    "FORMAT_VERSION", "Pin1Marker", "body_courtyard", "courtyard_rect", "silk_segments",
+    "place_pin1_marker", "pin1_marker", "fab_outline", "footprint_tree", "render",
+    "write_footprint", "summary", "geometry_problems", "static_problems", "oldest_kicad_cli",
+    "kicad_parse_problems", "validate", "LOAD_CHILD", "oldest_kicad_python", "pcbnew_load",
+]
 
 FORMAT_VERSION = 20241229           # D0: the newest footprint dialect KiCad 9 pcbnew reads
 GENERATOR = "kicad-eda"
@@ -56,16 +78,19 @@ CRTYD_WIDTH_MM = 0.05
 MIN_SILK_SEGMENT_MM = 0.2           # clipped silk stubs shorter than this are dropped
 PIN1_MARKER_MM = (0.5, 0.4)         # pin-1 triangle base, height
 SILK_GAP_MM = 0.05                  # pin-1 marker to silk outline
+SILK_TO_SILK_MM = SILK_WIDTH_MM + SILK_GAP_MM      # marker to outline, centre line to centre line
+PIN1_MIN_STANDOFF_MM = SILK_PAD_CLEARANCE_MM + SILK_WIDTH_MM / 2 + 0.01   # marker tip to pad
+PIN1_STEP_MM = 0.05                 # the marker search walks outward in these steps ...
+PIN1_MAX_STEPS = 400                # ... at most this many (20 mm)
 TEXT_MARGIN_MM = 0.7                # courtyard edge to Reference / Value text centre
 KICAD_TIMEOUT_S = 120
 SERVER_DIR = Path(__file__).resolve().parents[1]
+TOOLS_DIR = Path(__file__).resolve().parent
+_CLI_ERROR = re.compile(r"(?:^|\s)error:", re.IGNORECASE)   # D0: rc 0 is not proof
+_NORMALS = {"L": (-1, 0), "R": (1, 0), "T": (0, -1), "B": (0, 1)}
 
 Point = tuple[float, float]
 Rect = tuple[float, float, float, float]        # x0, y0, x1, y1
-
-
-class FootprintParseError(ValueError):
-    """A .kicad_mod file could not be read as a KiCad footprint."""
 
 
 # ---------------------------------------------------------------------------
@@ -82,14 +107,6 @@ def _front_copper(pad: Any) -> bool:
     return any(layer in ("F.Cu", "*.Cu") for layer in pad.pad_layers) or pad.type == "np_thru_hole"
 
 
-def pad_bbox(pad: Any) -> Rect:
-    """Axis-aligned extent of a pad's copper (any rotation)."""
-    a = math.radians(pad.rotation)
-    c, s = abs(math.cos(a)), abs(math.sin(a))
-    hw, hh = (pad.w * c + pad.h * s) / 2, (pad.w * s + pad.h * c) / 2
-    return (pad.x - hw, pad.y - hh, pad.x + hw, pad.y + hh)
-
-
 def _union(rects: Iterable[Rect]) -> Rect:
     rs = list(rects)
     return (min(r[0] for r in rs), min(r[1] for r in rs),
@@ -100,18 +117,22 @@ def _grow(r: Rect, d: float) -> Rect:
     return (r[0] - d, r[1] - d, r[2] + d, r[3] + d)
 
 
-def courtyard_rect(spec: FootprintSpec) -> Rect:
-    """Max-material body and pad copper, grown by the excess, rounded outward
-    to COURTYARD_GRID_MM."""
-    copper = [pad_bbox(p) for p in spec.pads if has_copper(p) or p.type == "np_thru_hole"]
-    r = _grow(_union([spec.body.max_rect(), *copper]), spec.courtyard_excess)
+def _bbox(points: Sequence[Point]) -> Rect:
+    return _union((x, y, x, y) for x, y in points)
+
+
+def _round_out(r: Rect) -> Rect:
+    """``r`` rounded outward to COURTYARD_GRID_MM."""
     g = COURTYARD_GRID_MM
     return (_r6(math.floor(r[0] / g + EPS) * g), _r6(math.floor(r[1] / g + EPS) * g),
             _r6(math.ceil(r[2] / g - EPS) * g), _r6(math.ceil(r[3] / g - EPS) * g))
 
 
-def _r6(v: float) -> float:
-    return round(v, 6) + 0.0          # + 0.0 turns -0.0 into 0.0
+def body_courtyard(spec: FootprintSpec) -> Rect:
+    """Max-material body and pad copper, grown by the excess, rounded outward
+    to COURTYARD_GRID_MM (the IPC-7351B courtyard, before the pin-1 marker)."""
+    copper = [pad_bbox(p) for p in spec.pads if has_copper(p) or p.type == "np_thru_hole"]
+    return _round_out(_grow(_union([spec.body.max_rect(), *copper]), spec.courtyard_excess))
 
 
 def _keepouts(pads: Iterable[Any], stroke: float) -> list[Rect]:
@@ -129,11 +150,11 @@ def _subtract(lo: float, hi: float, cuts: list[tuple[float, float]]) -> list[tup
     return spans
 
 
-def silk_segments(spec: FootprintSpec) -> list[tuple[Point, Point]]:
+def _outline(spec: FootprintSpec, extra: Sequence[Rect]) -> list[tuple[Point, Point]]:
     """The body outline SILK_FAB_OFFSET_MM outside the fab line, with every
-    part that would come within SILK_PAD_CLEARANCE_MM of pad copper cut out."""
+    part within SILK_PAD_CLEARANCE_MM of pad copper (or inside ``extra``) cut out."""
     x0, y0, x1, y1 = spec.body.rect(SILK_FAB_OFFSET_MM)
-    keep = _keepouts(spec.pads, SILK_WIDTH_MM)
+    keep = _keepouts(spec.pads, SILK_WIDTH_MM) + list(extra)
     out: list[tuple[Point, Point]] = []
     for y in (y0, y1):                                  # horizontal sides
         cuts = [(k[0], k[2]) for k in keep if k[1] < y - EPS and y + EPS < k[3]]
@@ -146,51 +167,150 @@ def silk_segments(spec: FootprintSpec) -> list[tuple[Point, Point]]:
     return [((_r6(a[0]), _r6(a[1])), (_r6(b[0]), _r6(b[1]))) for a, b in out]
 
 
+# ---------------------------------------------------------------------------
+# The pin-1 marker
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Pin1Marker:
+    """The silk triangle pointing at pin 1 from beyond its ``side`` edge.
+    ``inside``: within body_courtyard (else courtyard_rect grows to cover it);
+    ``notch``: the silk outline is cut around it, because inside the
+    courtyard it had no room clear of the outline."""
+    points: tuple[Point, ...]
+    side: str
+    inside: bool
+    notch: bool
+
+
 def _pin1_pad(spec: FootprintSpec) -> Pad | None:
     if spec.pin1 is None:
         return None
     return next(p for p in spec.pads if p.number == spec.pin1 and has_copper(p))
 
 
-def _pin1_side(spec: FootprintSpec, pad: Pad) -> str:
+def _marker_sides(spec: FootprintSpec, pad: Pad) -> tuple[str, ...]:
+    """``pin1_side`` when given; for "auto" the body sides pin 1 lies toward
+    (its centre on that side of the body centre), the nearest body edge first."""
     if spec.pin1_side in SIDES:
-        return spec.pin1_side
+        return (spec.pin1_side,)
     bx0, by0, bx1, by1 = spec.body.rect()
     dist = {"L": pad.x - bx0, "T": pad.y - by0, "R": bx1 - pad.x, "B": by1 - pad.y}
-    return min(SIDES, key=lambda s: dist[s])
+    toward = {"L": pad.x <= spec.body.x + EPS, "T": pad.y <= spec.body.y + EPS,
+              "R": pad.x >= spec.body.x - EPS, "B": pad.y >= spec.body.y - EPS}
+    return tuple(sorted((s for s in SIDES if toward[s]), key=lambda s: dist[s]))
 
 
-def pin1_marker(spec: FootprintSpec) -> list[Point] | None:
-    """A silk triangle beyond pin 1's ``pin1_side`` edge pointing at the pad,
-    clear of all copper (SILK_PAD_CLEARANCE_MM) and of the silk outline."""
+def _triangle(pad: Pad, side: str, standoff: float) -> tuple[Point, ...]:
+    """The marker with its tip ``standoff`` beyond the pad's ``side`` edge."""
+    base, height = PIN1_MARKER_MM
+    nx, ny = _NORMALS[side]
+    px0, py0, px1, py1 = pad_bbox(pad)
+    tip = {"L": -px0, "R": px1, "T": -py0, "B": py1}[side] + standoff
+    if nx:
+        tri = ((nx * tip, pad.y), (nx * (tip + height), pad.y - base / 2),
+               (nx * (tip + height), pad.y + base / 2))
+    else:
+        tri = ((pad.x, ny * tip), (pad.x - base / 2, ny * (tip + height)),
+               (pad.x + base / 2, ny * (tip + height)))
+    return tuple((_r6(x), _r6(y)) for x, y in tri)
+
+
+def _edges(points: Sequence[Point]) -> list[tuple[Point, Point]]:
+    return list(zip(points, [*points[1:], *points[:1]], strict=True))
+
+
+def _clear_of_copper(tri: Sequence[Point], pads: Iterable[Any]) -> bool:
+    return all(_pad_clearance(a, b, p) - SILK_WIDTH_MM / 2 >= SILK_PAD_CLEARANCE_MM - EPS
+               for a, b in _edges(tri) for p in pads if _front_copper(p))
+
+
+def _clear_of_silk(tri: Sequence[Point], segments: Iterable[tuple[Point, Point]]) -> bool:
+    return all(_seg_seg_dist(a, b, c, d) >= SILK_TO_SILK_MM - EPS
+               for a, b in _edges(tri) for c, d in segments)
+
+
+def _inside(tri: Sequence[Point], box: Rect) -> bool:
+    """Every vertex, stroke included, within ``box``."""
+    x0, y0, x1, y1 = _grow(box, EPS - SILK_WIDTH_MM / 2)
+    return all(x0 <= x <= x1 and y0 <= y <= y1 for x, y in tri)
+
+
+def _marker_walk(spec: FootprintSpec, pad: Pad, side: str) -> Iterator[tuple[Point, ...]]:
+    """Copper-clear markers beyond the pad's ``side`` edge, nearest first."""
+    for k in range(PIN1_MAX_STEPS):
+        tri = _triangle(pad, side, PIN1_MIN_STANDOFF_MM + k * PIN1_STEP_MM)
+        if _clear_of_copper(tri, spec.pads):
+            yield tri
+
+
+def _first_inside(spec: FootprintSpec, pad: Pad, side: str, box: Rect,
+                  outline: list[tuple[Point, Point]] | None) -> tuple[Point, ...] | None:
+    """The nearest copper-clear marker on ``side`` inside ``box`` that also
+    clears ``outline`` (None: the outline will yield); None once the walk
+    leaves the box."""
+    for tri in _marker_walk(spec, pad, side):
+        if not _inside(tri, box):
+            return None
+        if outline is None or _clear_of_silk(tri, outline):
+            return tri
+    return None
+
+
+def place_pin1_marker(spec: FootprintSpec) -> Pin1Marker | None:
+    """Where the pin-1 marker goes (None: no pin 1, or ``pin1_side`` "none").
+
+    Inside body_courtyard when it fits: on the candidate sides (the given
+    ``pin1_side``, or for "auto" the sides pin 1 faces, nearest first), the
+    nearest spot clear of copper (SILK_PAD_CLEARANCE_MM) and of the silk
+    outline; failing that, the nearest spot clear of copper, and the outline
+    yields (a notch). When nothing fits inside, the first side's nearest spot
+    clear of copper and outline, and courtyard_rect grows to cover it."""
     pad = _pin1_pad(spec)
     if pad is None or spec.pin1_side == "none":
         return None
-    side = _pin1_side(spec, pad)
-    base, height = PIN1_MARKER_MM
-    nx, ny = {"L": (-1, 0), "R": (1, 0), "T": (0, -1), "B": (0, 1)}[side]
-    px0, py0, px1, py1 = pad_bbox(pad)
-    edge = {"L": -px0, "R": px1, "T": -py0, "B": py1}[side]   # pad's outer edge along the normal
-    outline = silk_segments(spec)
-    d = SILK_PAD_CLEARANCE_MM + SILK_WIDTH_MM / 2 + 0.01
-    for _ in range(400):
-        tip = edge + d
-        if nx:
-            tri = [(nx * tip, pad.y), (nx * (tip + height), pad.y - base / 2),
-                   (nx * (tip + height), pad.y + base / 2)]
-        else:
-            tri = [(pad.x, ny * tip), (pad.x - base / 2, ny * (tip + height)),
-                   (pad.x + base / 2, ny * (tip + height))]
-        tri = [(_r6(x), _r6(y)) for x, y in tri]
-        edges = list(zip(tri, tri[1:] + tri[:1]))
-        pad_ok = all(_pad_clearance(a, b, p) - SILK_WIDTH_MM / 2 >= SILK_PAD_CLEARANCE_MM - EPS
-                     for a, b in edges for p in spec.pads if _front_copper(p))
-        silk_ok = all(_seg_seg_dist(a, b, c, e) >= SILK_WIDTH_MM + SILK_GAP_MM - EPS
-                      for a, b in edges for c, e in outline)
-        if pad_ok and silk_ok:
-            return tri
-        d += 0.05
-    raise ValueError(f"{spec.name}: no room for a pin-1 marker on side {side}")
+    sides, box, outline = _marker_sides(spec, pad), body_courtyard(spec), _outline(spec, ())
+    for notch in (False, True):
+        for side in sides:
+            tri = _first_inside(spec, pad, side, box, None if notch else outline)
+            if tri is not None:
+                return Pin1Marker(tri, side, inside=True, notch=notch)
+    tri = next((t for t in _marker_walk(spec, pad, sides[0]) if _clear_of_silk(t, outline)), None)
+    if tri is None:
+        raise ValueError(f"{spec.name}: no room for a pin-1 marker on side {sides[0]}")
+    return Pin1Marker(tri, sides[0], inside=False, notch=False)
+
+
+def _notch(marker: Pin1Marker | None) -> list[Rect]:
+    """The outline cut-out around a notched marker (SILK_TO_SILK_MM clear)."""
+    if marker is None or not marker.notch:
+        return []
+    return [_grow(_bbox(marker.points), SILK_TO_SILK_MM)]
+
+
+def _courtyard(spec: FootprintSpec, marker: Pin1Marker | None) -> Rect:
+    box = body_courtyard(spec)
+    if marker is None or marker.inside:
+        return box
+    return _round_out(_union([box, _grow(_bbox(marker.points), SILK_WIDTH_MM / 2)]))
+
+
+def courtyard_rect(spec: FootprintSpec) -> Rect:
+    """body_courtyard, grown to cover the pin-1 marker when it has no room
+    inside (rounded outward to COURTYARD_GRID_MM)."""
+    return _courtyard(spec, place_pin1_marker(spec))
+
+
+def silk_segments(spec: FootprintSpec) -> list[tuple[Point, Point]]:
+    """The silk outline: the body outline SILK_FAB_OFFSET_MM outside the fab
+    line, cut where it would come within SILK_PAD_CLEARANCE_MM of pad copper
+    and around a notched pin-1 marker."""
+    return _outline(spec, _notch(place_pin1_marker(spec)))
+
+
+def pin1_marker(spec: FootprintSpec) -> list[Point] | None:
+    """The pin-1 triangle (tip first), or None (see place_pin1_marker)."""
+    marker = place_pin1_marker(spec)
+    return list(marker.points) if marker else None
 
 
 def fab_outline(spec: FootprintSpec) -> list[Point]:
@@ -204,6 +324,7 @@ def fab_outline(spec: FootprintSpec) -> list[Point]:
     c = min(1.0, 0.25 * min(spec.body.w, spec.body.h))
     i = min(range(4), key=lambda k: math.hypot(corners[k][0] - pad.x, corners[k][1] - pad.y))
     (cx, cy), prev, nxt = corners[i], corners[i - 1], corners[(i + 1) % 4]
+
     def toward(p: Point) -> Point:
         n = math.hypot(p[0] - cx, p[1] - cy)
         return (_r6(cx + (p[0] - cx) * c / n), _r6(cy + (p[1] - cy) * c / n))
@@ -227,10 +348,12 @@ def _seg_rect_dist(a: Point, b: Point, r: Rect) -> float:
     return min(_seg_seg_dist(a, b, c[k], c[(k + 1) % 4]) for k in range(4))
 
 
+def _orient(p: Point, q: Point, s: Point) -> float:
+    return (q[0] - p[0]) * (s[1] - p[1]) - (q[1] - p[1]) * (s[0] - p[0])
+
+
 def _seg_seg_dist(a: Point, b: Point, c: Point, d: Point) -> float:
-    def orient(p: Point, q: Point, s: Point) -> float:
-        return (q[0] - p[0]) * (s[1] - p[1]) - (q[1] - p[1]) * (s[0] - p[0])
-    if orient(a, b, c) * orient(a, b, d) < 0 and orient(c, d, a) * orient(c, d, b) < 0:
+    if _orient(a, b, c) * _orient(a, b, d) < 0 and _orient(c, d, a) * _orient(c, d, b) < 0:
         return 0.0
     return min(_seg_point_dist(a, b, c), _seg_point_dist(a, b, d),
                _seg_point_dist(c, d, a), _seg_point_dist(c, d, b))
@@ -311,7 +434,8 @@ def _poly(points: Sequence[Point], width: float, layer: str, fill: bool) -> tupl
 
 def footprint_tree(spec: FootprintSpec) -> tuple:
     """The footprint as a nested tuple tree (render() prints it)."""
-    cx0, cy0, cx1, cy1 = courtyard_rect(spec)
+    marker = place_pin1_marker(spec)
+    cx0, cy0, cx1, cy1 = _courtyard(spec, marker)
     bx, by = spec.body.x, spec.body.y
     tree: tuple = ("footprint", Q(spec.name), ("version", FORMAT_VERSION),
                    ("generator", Q(GENERATOR)), ("layer", Q("F.Cu")))
@@ -324,12 +448,11 @@ def footprint_tree(spec: FootprintSpec) -> tuple:
     if spec.datasheet:
         tree += (_text_prop("Datasheet", spec.datasheet, (bx, by), "F.Fab", hide=True),)
     tree += (("attr", spec.attr, *spec.attr_flags),)
-    for a, b in silk_segments(spec):
+    for a, b in _outline(spec, _notch(marker)):
         tree += (("fp_line", ("start", *a), ("end", *b), _stroke(SILK_WIDTH_MM),
                   ("layer", Q("F.SilkS"))),)
-    marker = pin1_marker(spec)
     if marker:
-        tree += (_poly(marker, SILK_WIDTH_MM, "F.SilkS", fill=True),)
+        tree += (_poly(marker.points, SILK_WIDTH_MM, "F.SilkS", fill=True),)
     tree += (("fp_rect", ("start", cx0, cy0), ("end", cx1, cy1), _stroke(CRTYD_WIDTH_MM),
               ("fill", "no"), ("layer", Q("F.CrtYd"))),
              _poly(fab_outline(spec), FAB_WIDTH_MM, "F.Fab", fill=False))
@@ -364,199 +487,40 @@ def write_footprint(spec: FootprintSpec, pretty_dir: str | os.PathLike) -> Path:
 
 def summary(spec: FootprintSpec) -> dict:
     """JSON-friendly facts for a tool result / the netlist."""
-    numbers = sorted({p.number for p in spec.pads if p.number and has_copper(p)}, key=_natural)
+    numbers = sorted({p.number for p in spec.pads if p.number and has_copper(p)}, key=natural_key)
     return {"name": spec.name, "pads": len(numbers), "pad_numbers": numbers,
             "attr": spec.attr, "body": [spec.body.w, spec.body.h], "height": spec.body.height,
             "courtyard": list(courtyard_rect(spec))}
 
 
-def _natural(s: str) -> list:
-    return [(0, int(t), "") if t.isdigit() else (1, 0, t) for t in re.findall(r"\d+|\D+", s)]
-
-
-# ---------------------------------------------------------------------------
-# Reading .kicad_mod files (stdlib s-expressions)
-# ---------------------------------------------------------------------------
-_TOKEN = re.compile(r'\s*(?:(\()|(\))|"((?:[^"\\]|\\.)*)"|([^\s()"]+))', re.S)
-_NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
-
-
-def parse_sexpr(text: str) -> list:
-    """Nested lists of string atoms (quotes removed, escapes resolved)."""
-    stack: list[list] = [[]]
-    pos = 0
-    text = text.rstrip()
-    while pos < len(text):
-        m = _TOKEN.match(text, pos)
-        if not m:
-            raise FootprintParseError(f"unreadable text at offset {pos}: {text[pos:pos + 30]!r}")
-        pos = m.end()
-        if m.group(1):
-            stack.append([])
-        elif m.group(2):
-            if len(stack) < 2:
-                raise FootprintParseError(f"unbalanced ')' at offset {pos}")
-            stack[-2].append(stack.pop())
-        elif m.group(3) is not None:
-            stack[-1].append(re.sub(r"\\(.)", lambda e: "\n" if e.group(1) == "n" else e.group(1),
-                                    m.group(3)))
-        else:
-            stack[-1].append(m.group(4))
-    if len(stack) != 1 or len(stack[0]) != 1 or not isinstance(stack[0][0], list):
-        raise FootprintParseError("expected exactly one balanced top-level expression")
-    return stack[0][0]
-
-
-def _kids(node: list, tag: str) -> list[list]:
-    return [c for c in node if isinstance(c, list) and c and c[0] == tag]
-
-
-def _first(node: list, tag: str) -> list | None:
-    found = _kids(node, tag)
-    return found[0] if found else None
-
-
-def _floats(node: list | None, n: int) -> list[float]:
-    vals = [float(v) for v in (node or [])[1:] if isinstance(v, str) and _NUMBER.fullmatch(v)]
-    return vals[:n] + [0.0] * (n - len(vals[:n]))
-
-
-@dataclass(frozen=True)
-class ParsedPad:
-    number: str
-    type: str
-    shape: str
-    x: float
-    y: float
-    w: float
-    h: float
-    rotation: float
-    drill: float | None
-    pad_layers: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class ParsedFootprint:
-    name: str
-    version: int | None
-    generator: str | None
-    attr: tuple[str, ...]
-    pads: tuple[ParsedPad, ...]
-    strokes: dict[str, tuple[tuple[Point, Point, float], ...]] = field(default_factory=dict)
-
-
-def _arc_points(s: Point, m: Point, e: Point, steps: int = 12) -> list[Point]:
-    """Points along the circular arc start -> mid -> end."""
-    ax, ay, bx, by, cx, cy = *s, *m, *e
-    d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
-    if abs(d) < 1e-12:
-        return [s, e]
-    sa, sb, sc = ax**2 + ay**2, bx**2 + by**2, cx**2 + cy**2
-    ux = (sa * (by - cy) + sb * (cy - ay) + sc * (ay - by)) / d
-    uy = (sa * (cx - bx) + sb * (ax - cx) + sc * (bx - ax)) / d
-    r = math.hypot(ax - ux, ay - uy)
-    a0, am, a1 = (math.atan2(p[1] - uy, p[0] - ux) for p in (s, m, e))
-    sweep = (a1 - a0) % (2 * math.pi)
-    if (am - a0) % (2 * math.pi) > sweep:           # mid is on the other way round
-        sweep -= 2 * math.pi
-    return [(ux + r * math.cos(a0 + sweep * i / steps), uy + r * math.sin(a0 + sweep * i / steps))
-            for i in range(steps + 1)]
-
-
-def _graphic_segments(node: list) -> list[tuple[Point, Point]]:
-    tag = node[0]
-    if tag == "fp_line":
-        s, e = _floats(_first(node, "start"), 2), _floats(_first(node, "end"), 2)
-        return [((s[0], s[1]), (e[0], e[1]))]
-    if tag in ("fp_rect", "fp_poly", "fp_circle", "fp_arc"):
-        if tag == "fp_rect":
-            (x0, y0), (x1, y1) = _floats(_first(node, "start"), 2), _floats(_first(node, "end"), 2)
-            pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
-        elif tag == "fp_poly":
-            pts = [tuple(_floats(xy, 2)) for xy in _kids(_first(node, "pts") or [], "xy")]
-            pts = pts + pts[:1]
-        elif tag == "fp_circle":
-            c, e = _floats(_first(node, "center"), 2), _floats(_first(node, "end"), 2)
-            r = math.hypot(e[0] - c[0], e[1] - c[1])
-            pts = [(c[0] + r * math.cos(math.pi * i / 12), c[1] + r * math.sin(math.pi * i / 12))
-                   for i in range(25)]
-        else:
-            s, m, e = (tuple(_floats(_first(node, k), 2)) for k in ("start", "mid", "end"))
-            pts = _arc_points(s, m, e)
-        return list(zip(pts, pts[1:]))
-    return []
-
-
-def _parse_pad(p: list) -> ParsedPad:
-    if len(p) < 4:
-        raise FootprintParseError(f"pad with too few fields: {p[:4]}")
-    x, y, rot = _floats(_first(p, "at"), 3)
-    w, h = _floats(_first(p, "size"), 2)
-    drill_node = _first(p, "drill")
-    drill = next((float(v) for v in (drill_node or [])[1:]
-                  if isinstance(v, str) and _NUMBER.fullmatch(v)), None)
-    layers = tuple(v for v in (_first(p, "layers") or [])[1:] if isinstance(v, str))
-    return ParsedPad(str(p[1]), str(p[2]), str(p[3]), x, y, w, h, rot, drill, layers)
-
-
-def parse_footprint(text: str) -> ParsedFootprint:
-    root = parse_sexpr(text)
-    if not root or root[0] not in ("footprint", "module") or len(root) < 2:
-        raise FootprintParseError(f"not a footprint: top-level ({root[0] if root else ''} ...)")
-    version_node, generator_node = _first(root, "version"), _first(root, "generator")
-    strokes: dict[str, list] = {}
-    for node in root:
-        if isinstance(node, list) and node and str(node[0]).startswith("fp_"):
-            layer_node = _first(node, "layer")
-            width_node = _first(_first(node, "stroke") or [], "width") or _first(node, "width")
-            width = _floats(width_node, 1)[0]
-            for a, b in _graphic_segments(node):
-                strokes.setdefault(layer_node[1] if layer_node else "", []).append((a, b, width))
-    try:
-        version = int(version_node[1]) if version_node else None
-    except (IndexError, ValueError) as e:
-        raise FootprintParseError(f"unreadable (version ...): {version_node}") from e
-    return ParsedFootprint(name=str(root[1]), version=version,
-                           generator=str(generator_node[1]) if generator_node else None,
-                           attr=tuple(str(a) for a in (_first(root, "attr") or [])[1:]),
-                           pads=tuple(_parse_pad(p) for p in _kids(root, "pad")),
-                           strokes={k: tuple(v) for k, v in strokes.items()})
-
-
-def read_footprint(path: str | os.PathLike) -> ParsedFootprint:
-    try:
-        text = Path(path).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as e:
-        raise FootprintParseError(f"cannot read {path}: {e}") from e
-    return parse_footprint(text)
-
-
 # ---------------------------------------------------------------------------
 # Checks
 # ---------------------------------------------------------------------------
+def _courtyard_problems(fp: ParsedFootprint, copper: list[Any], excess: float) -> list[str]:
+    crtyd = fp.strokes.get("F.CrtYd", ())
+    if not crtyd:
+        return ["no F.CrtYd courtyard"]
+    pts = [pt for a, b, _ in crtyd for pt in (a, b)]
+    cx0, cy0, cx1, cy1 = _bbox(pts)
+    tight = []
+    for p in copper:
+        x0, y0, x1, y1 = pad_bbox(p)
+        margin = min(x0 - cx0, y0 - cy0, cx1 - x1, cy1 - y1)
+        if margin < excess - EPS:
+            tight.append((margin, p.number))
+    if not tight:
+        return []
+    worst = min(tight)
+    return [f"courtyard leaves {worst[0]:.3f} mm around pad {worst[1]!r} "
+            f"({len(tight)} pad(s) under the IPC-7351B nominal {excess} mm excess)"]
+
+
 def geometry_problems(fp: ParsedFootprint, excess: float = COURTYARD_EXCESS_MM) -> list[str]:
     """Courtyard present with >= ``excess`` around all copper, an F.Fab
     drawing, silk >= SILK_PAD_CLEARANCE_MM from front copper, and no copper
     overlap between differently numbered pads."""
-    problems: list[str] = []
     copper = [p for p in fp.pads if has_copper(p) or p.type == "np_thru_hole"]
-    crtyd = fp.strokes.get("F.CrtYd", ())
-    if not crtyd:
-        problems.append("no F.CrtYd courtyard")
-    elif copper:
-        pts = [pt for a, b, _ in crtyd for pt in (a, b)]
-        cx0, cy0 = min(x for x, _ in pts), min(y for _, y in pts)
-        cx1, cy1 = max(x for x, _ in pts), max(y for _, y in pts)
-        tight = []
-        for p in copper:
-            x0, y0, x1, y1 = pad_bbox(p)
-            margin = min(x0 - cx0, y0 - cy0, cx1 - x1, cy1 - y1)
-            if margin < excess - EPS:
-                tight.append((margin, p.number))
-        if tight:
-            worst = min(tight)
-            problems.append(f"courtyard leaves {worst[0]:.3f} mm around pad {worst[1]!r} "
-                            f"({len(tight)} pad(s) under the IPC-7351B nominal {excess} mm excess)")
+    problems = _courtyard_problems(fp, copper, excess)
     if not fp.strokes.get("F.Fab"):
         problems.append("no F.Fab body outline")
     hits: dict[str, float] = {}
@@ -568,7 +532,8 @@ def geometry_problems(fp: ParsedFootprint, excess: float = COURTYARD_EXCESS_MM) 
                     hits[p.number] = min(gap, hits.get(p.number, gap))
     if hits:
         problems.append(f"silk within {SILK_PAD_CLEARANCE_MM} mm of pad(s) "
-                        f"{sorted(hits, key=_natural)[:10]} (closest {min(hits.values()):.3f} mm)")
+                        f"{sorted(hits, key=natural_key)[:10]} "
+                        f"(closest {min(hits.values()):.3f} mm)")
     boxes = [(pad_bbox(p), _cu_layers(p), p) for p in copper if p.number and has_copper(p)]
     overlaps = sorted({(p.number, q.number) for i, (r, lr, p) in enumerate(boxes)
                        for s, ls, q in boxes[i + 1:] if p.number != q.number and lr & ls
@@ -601,6 +566,9 @@ def static_problems(fp: ParsedFootprint, path: str | os.PathLike | None = None,
     return problems + geometry_problems(fp)
 
 
+# ---------------------------------------------------------------------------
+# KiCad itself: kicad-cli parse check, pcbnew FootprintLoad
+# ---------------------------------------------------------------------------
 def _kicad_installs() -> list:
     if str(SERVER_DIR) not in sys.path:
         sys.path.insert(0, str(SERVER_DIR))
@@ -618,9 +586,16 @@ def oldest_kicad_cli() -> tuple[str | None, str]:
     return str(inst.kicad_cli), f"kicad-cli {inst.version}"
 
 
+def _run_kicad(args: list[str]) -> subprocess.CompletedProcess:
+    """A KiCad child (D0): stdin DEVNULL, utf-8 with replacement, a timeout."""
+    return subprocess.run(args, capture_output=True, stdin=subprocess.DEVNULL,
+                          encoding="utf-8", errors="replace", timeout=KICAD_TIMEOUT_S)
+
+
 def kicad_parse_problems(path: str | os.PathLike, kicad_cli: str | None = None) -> list[str]:
     """Load the file with ``kicad-cli fp upgrade`` (a .pretty copy in a temp
-    dir) and require KiCad's re-serialised pads to equal the source's."""
+    dir) and require KiCad's re-serialised pads (copper and paste windows) to
+    equal the source's. rc 0 alone is not proof: "Error:" lines count too."""
     path = Path(path)
     cli, label = (kicad_cli, f"kicad-cli ({kicad_cli})") if kicad_cli else oldest_kicad_cli()
     if not cli:
@@ -631,17 +606,15 @@ def kicad_parse_problems(path: str | os.PathLike, kicad_cli: str | None = None) 
         src.mkdir()
         shutil.copyfile(path, src / path.name)
         try:
-            r = subprocess.run([cli, "fp", "upgrade", "--force", "-o", str(out), str(src)],
-                               capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                               timeout=KICAD_TIMEOUT_S)
+            r = _run_kicad([cli, "fp", "upgrade", "--force", "-o", str(out), str(src)])
         except (OSError, subprocess.TimeoutExpired) as e:
             return [f"{label} fp upgrade could not run: {e}"]
-        console = (r.stdout + r.stderr).strip()
+        console = ((r.stdout or "") + (r.stderr or "")).strip()
         if r.returncode != 0:
             return [f"{label} fp upgrade could not load {path.name} (rc={r.returncode}): "
                     f"{console[-400:] or 'no output'}"]
         problems = [f"{label} fp upgrade reported: {ln.strip()}"
-                    for ln in console.splitlines() if "error" in ln.lower()]
+                    for ln in console.splitlines() if _CLI_ERROR.search(ln)]
         produced = out / path.name
         if not produced.is_file():
             return problems + [f"{label} fp upgrade wrote no {path.name}"]
@@ -666,26 +639,28 @@ def validate(path: str | os.PathLike, *, expected_pads: int | None = None,
     return static_problems(fp, path, expected_pads) + kicad_parse_problems(path, kicad_cli)
 
 
-# The KiCad-python child for pcbnew_load. The wx preamble (kicad_quiet's,
-# inline) comes before pcbnew: no modal assert / log dialog can block (D0).
+# The KiCad-python child for pcbnew_load: argv = [tools dir, .pretty dir, name].
+# kicad_quiet (from the tools dir) comes before pcbnew: no modal assert / log
+# dialog can block (D0). 9.0.4 leaves GetCourtyard empty until
+# BuildCourtyardCaches() ran.
 LOAD_CHILD = """\
-import wx
-wx.DisableAsserts()
-wx.Log.SetLogLevel(wx.LOG_Info)
-_LOG_TARGET = wx.LogStderr()   # kept referenced: wx holds only a raw pointer to it
-wx.Log.SetActiveTarget(_LOG_TARGET)
 import json
 import sys
-import pcbnew
+
+sys.path.insert(0, sys.argv[1])
+import kicad_quiet  # noqa: E402,F401  (before pcbnew: no modal wx dialogs)
+import pcbnew  # noqa: E402
 
 out = {"kicad_version": pcbnew.Version()}
 try:
-    fp = pcbnew.FootprintLoad(sys.argv[1], sys.argv[2])
+    fp = pcbnew.FootprintLoad(sys.argv[2], sys.argv[3])
 except Exception as e:          # KiCad's IO_ERROR on a file it cannot parse
     fp, out["error"] = None, f"{type(e).__name__}: {e}"
 out["loaded"] = fp is not None
 if fp is not None:
     numbers = [str(p.GetNumber()) for p in fp.Pads()]
+    if hasattr(fp, "BuildCourtyardCaches"):
+        fp.BuildCourtyardCaches()
     out.update(pads=len(numbers), numbers=numbers,
                courtyard_outlines=fp.GetCourtyard(pcbnew.F_CrtYd).OutlineCount())
 print(json.dumps(out), flush=True)
@@ -715,83 +690,17 @@ def pcbnew_load(path: str | os.PathLike, *, python: str | None = None) -> dict:
         lib.mkdir()
         shutil.copyfile(path, lib / path.name)
         try:
-            r = subprocess.run([python, "-c", LOAD_CHILD, str(lib), path.stem],
-                               capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                               timeout=KICAD_TIMEOUT_S)
+            r = _run_kicad([python, "-c", LOAD_CHILD, str(TOOLS_DIR), str(lib), path.stem])
         except (OSError, subprocess.TimeoutExpired) as e:
             return {"ok": False, "error": f"KiCad python could not run: {e}"}
-    lines = [ln for ln in r.stdout.strip().splitlines() if ln.startswith("{")]
-    if r.returncode != 0 or not lines:
-        return {"ok": False, "error": f"rc={r.returncode}: {(r.stdout + r.stderr).strip()[-600:]}"}
-    result = json.loads(lines[-1])
+    console = ((r.stdout or "") + (r.stderr or "")).strip()
+    lines = [ln for ln in (r.stdout or "").strip().splitlines() if ln.startswith("{")]
+    try:
+        result = json.loads(lines[-1]) if r.returncode == 0 and lines else None
+    except ValueError:
+        result = None
+    if not isinstance(result, dict):
+        return {"ok": False, "error": f"rc={r.returncode}: {console[-600:]}"}
     if not result.get("loaded") and "error" not in result:
-        result["error"] = f"pcbnew.FootprintLoad returned None for {path.name}"
+        result = {**result, "error": f"pcbnew.FootprintLoad returned None for {path.name}"}
     return {"ok": bool(result.get("loaded")), **result}
-
-
-# ---------------------------------------------------------------------------
-# Comparison
-# ---------------------------------------------------------------------------
-def _extent(p: Any) -> tuple[float, float]:
-    x0, y0, x1, y1 = pad_bbox(p)
-    return x1 - x0, y1 - y0
-
-
-def compare_footprints(a_path: str | os.PathLike, b_path: str | os.PathLike, *,
-                       tolerance: float = 0.001, match_radius: float = 1.0) -> dict:
-    """Pair the copper pads of A and B by position (nearest first, within
-    ``match_radius`` mm) and report per-pad position / size / shape deltas,
-    pads whose numbers differ, duplicate numbers and unmatched pads.
-    ``identical`` is True only when nothing differs beyond ``tolerance``."""
-    fa, fb = read_footprint(a_path), read_footprint(b_path)
-    pa = [p for p in fa.pads if has_copper(p)]
-    pb = [p for p in fb.pads if has_copper(p)]
-    cands = sorted((math.hypot(p.x - q.x, p.y - q.y), set(p.pad_layers) != set(q.pad_layers),
-                    p.number != q.number, i, j)
-                   for i, p in enumerate(pa) for j, q in enumerate(pb)
-                   if abs(p.x - q.x) <= match_radius and abs(p.y - q.y) <= match_radius)
-    used_a: set[int] = set()
-    used_b: set[int] = set()
-    deviations, renumbered, max_offset = [], 0, 0.0
-    for dist, _, _, i, j in cands:
-        if dist > match_radius or i in used_a or j in used_b:
-            continue
-        used_a.add(i)
-        used_b.add(j)
-        p, q = pa[i], pb[j]
-        (wa, ha), (wb, hb) = _extent(p), _extent(q)
-        issues = [name for name, hit in (
-            ("moved", dist > tolerance), ("resized", max(abs(wb - wa), abs(hb - ha)) > tolerance),
-            ("shape", p.shape != q.shape), ("type", p.type != q.type),
-            ("layers", set(p.pad_layers) != set(q.pad_layers)),
-            ("renumbered", p.number != q.number)) if hit]
-        max_offset = max(max_offset, dist)
-        renumbered += p.number != q.number
-        if issues:
-            deviations.append({"a": p.number, "b": q.number, "at": [p.x, p.y],
-                               "dx": _r6(q.x - p.x), "dy": _r6(q.y - p.y), "offset": _r6(dist),
-                               "dw": _r6(wb - wa), "dh": _r6(hb - ha),
-                               "shape": [p.shape, q.shape], "issues": issues})
-    unmatched_a = [{"number": p.number, "at": [p.x, p.y]}
-                   for i, p in enumerate(pa) if i not in used_a]
-    unmatched_b = [{"number": q.number, "at": [q.x, q.y]}
-                   for j, q in enumerate(pb) if j not in used_b]
-    na, nb = Counter(p.number for p in pa), Counter(q.number for q in pb)
-    numbering = {"duplicates_a": {n: c for n, c in na.items() if c > 1 and n},
-                 "duplicates_b": {n: c for n, c in nb.items() if c > 1 and n},
-                 "only_in_a": sorted(set(na) - set(nb), key=_natural),
-                 "only_in_b": sorted(set(nb) - set(na), key=_natural),
-                 "renumbered": renumbered}
-    identical = not (deviations or unmatched_a or unmatched_b or numbering["only_in_a"]
-                     or numbering["only_in_b"]
-                     or numbering["duplicates_a"] != numbering["duplicates_b"])
-    dup_b = ", ".join(f'"{n}" x{c}' for n, c in numbering["duplicates_b"].items())
-    text = (f"{len(deviations)} of {len(used_a)} matched pads differ "
-            f"(max offset {max_offset:.3f} mm, {renumbered} renumbered); "
-            f"{len(unmatched_a)} pads only in A, {len(unmatched_b)} only in B"
-            + (f"; B repeats pad numbers {dup_b}" if dup_b else ""))
-    return {"a": str(a_path), "b": str(b_path), "pads": [len(pa), len(pb)],
-            "matched": len(used_a), "identical": identical, "tolerance": tolerance,
-            "max_offset": _r6(max_offset), "deviations": deviations, "numbering": numbering,
-            "unmatched_a": unmatched_a, "unmatched_b": unmatched_b,
-            "summary": "identical" if identical else text}

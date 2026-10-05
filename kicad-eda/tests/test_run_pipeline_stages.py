@@ -1,178 +1,40 @@
 """run_pipeline.run as a sequence of stages sharing a RunContext.
 
-Every KiCad-facing call the harness makes (lint, schematic build, design
-review, board build, Freerouting, DRC, the SWIG gate/fix/stitch scripts, fab
-export, renders) is replaced by a scripted stand-in, so these tests drive the
-real stage logic -- gate sequencing, the G2 / G3 / G4 corrective-action loops,
-the route cache, the persisted report -- with no KiCad installed. The board
-"file" the fakes write is a header-only stub whose generator_version decides
-what toolchain.swig_readable says about it.
+Every KiCad-facing call the harness makes is replaced by the scripted
+stand-ins of tests/fixtures/pipeline_world.py (World), so these tests drive
+the real stage logic -- gate sequencing, the G2 / G3 / G4 corrective-action
+loops, the route cache, the persisted report -- with no KiCad installed. The
+board "file" the fakes write is a header-only stub whose generator_version
+decides what toolchain.swig_readable says about it.
 """
 from __future__ import annotations
 
+import ast
 import copy
-import inspect
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-import kicad_env as env
+import remediate
+import rp_context
+import rp_route
+import rp_route_hash
+import rp_stage_place
+import rp_stage_schematic
 import run_pipeline as rp
+from fixtures import pipeline_world
+from fixtures.pipeline_world import (CLEAN_DRC, DESIGN, K9_HEADER, K11_HEADER, OK_ANALYSIS,
+                                     OK_BUILD, World)
 
-K9_HEADER = '(kicad_pcb (version 20241229) (generator "pcbnew") (generator_version "9.0")\n'
-K11_HEADER = '(kicad_pcb (version 20260901) (generator "pcbnew") (generator_version "10.99")\n'
+world = pipeline_world.world        # the fixture (an assignment: see pipeline_world)
 
-CLEAN_DRC = {"errors": 0, "unconnected": 0, "types": {}, "kicad_cli": "fake-cli"}
-OK_ANALYSIS = {"decoupling": {"uncovered": []}, "flags": {}, "errors": []}
-# the keys swig_build_board prints on success (missing_pads / mounting_holes are lists)
-OK_BUILD = {"ok": True, "footprints": 2, "pads_assigned": 4, "zones": ["In1.Cu:GND"],
-            "antenna_keepout": None, "mounting_holes": [], "missing_pads": []}
-
-DESIGN = {
-    "title": "two resistors",
-    "components": [{"ref": "R1", "lib_id": "Device:R", "value": "1k",
-                    "footprint": "Resistor_SMD:R_0603_1608Metric"},
-                   {"ref": "R2", "lib_id": "Device:R", "value": "1k",
-                    "footprint": "Resistor_SMD:R_0603_1608Metric"}],
-    "nets": {"N1": [["R1", "1"], ["R2", "1"]], "N2": [["R1", "2"], ["R2", "2"]]},
-}
-
-
-def _stable(base: Path) -> env.KiCadInstall:
-    root = base / "kicad9"
-    return env.KiCadInstall(
-        version="9.0.4", version_tuple=(9, 0, 4), root=root,
-        kicad_cli=root / "bin" / "kicad-cli.exe", python=root / "bin" / "python.exe",
-        share=root / "share" / "kicad", has_api_server=False)
-
-
-def _next(seq: list) -> Any:
-    """Scripted results: each call consumes one, the last one repeats."""
-    return seq.pop(0) if len(seq) > 1 else seq[0]
-
-
-class World:
-    """Scripted stand-ins for every external call run() makes. Each field is a
-    list of results consumed one per call (the last repeats); `calls` records
-    (name, args) in call order."""
-
-    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.dir = tmp_path
-        self.netlist = tmp_path / "netlist.json"
-        self.pcb = tmp_path / "netlist.kicad_pcb"
-        self.write_design(copy.deepcopy(DESIGN))
-        self.calls: list[tuple[str, tuple]] = []
-        self.lint = [{"ok": True, "errors": [], "warnings": []}]
-        self.schematics = [{"ok": True, "backend": "file", "components": 2, "nets": 2,
-                            "erc_ok": True, "erc_violations": 0}]
-        self.analyses = [OK_ANALYSIS]
-        self.thermal = [{"blockers": [], "warnings": []}]
-        self.builds = [dict(OK_BUILD)]
-        self.routes: list[Any] = [{"ok": True, "tracks": 7, "unconnected": 0}]
-        self.drcs = [CLEAN_DRC]
-        self.gate_checks: dict[str, list] = {}
-        self.fixes: dict[str, list] = {}
-        self.emc = [{"ok": True, "vias_added": 12, "fence": 8, "interior": 4,
-                     "pitch_mm": 3.0}]
-        self.fab = [{"ok": True, "zip": str(tmp_path / "netlist_JLCPCB.zip"),
-                     "files": [f"f{i}" for i in range(12)], "bom": "BOM.csv", "cpl": "CPL.csv"}]
-        self.header = K9_HEADER
-        self._patch(monkeypatch, tmp_path)
-
-    def write_design(self, design: dict) -> None:
-        self.netlist.write_text(json.dumps(design, indent=2), encoding="utf-8")
-
-    def names(self) -> list[str]:
-        return [name for name, _ in self.calls]
-
-    def args_of(self, name: str) -> list[tuple]:
-        return [args for n, args in self.calls if n == name]
-
-    def _rec(self, name: str, *args: Any) -> None:
-        self.calls.append((name, args))
-
-    def _patch(self, mp: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        stable = _stable(tmp_path)
-        mp.setattr(env, "discover", lambda refresh=False: [stable])
-        mp.delenv("PIPELINE_NO_CACHE", raising=False)
-        mp.setattr(rp.k, "_kicad_share", lambda: None)
-        mp.setattr(rp.lint, "lint", self.fake_lint)
-        mp.setattr(rp.k, "build_schematic_from_netlist", self.fake_schematic)
-        mp.setattr(rp.drpt, "analyze", self.fake_analyze)
-        mp.setattr(rp.thermal_check, "check", self.fake_thermal)
-        mp.setattr(rp.k, "build_board_from_netlist", self.fake_build)
-        mp.setattr(rp.k, "autoroute_board", self.fake_route)
-        mp.setattr(rp.k, "export_fab_package", self.fake_fab)
-        mp.setattr(rp, "_drc", self.fake_drc)
-        mp.setattr(rp, "_gate_check", self.fake_gate_check)
-        mp.setattr(rp, "_board_fix", self.fake_board_fix)
-        mp.setattr(rp, "_render", self.fake_render)
-        mp.setattr(rp, "_emc_stitch", self.fake_emc)
-
-    # --- the stand-ins ---------------------------------------------------------
-    def fake_lint(self, design: dict, syms: str) -> dict:
-        self._rec("lint", syms)
-        return _next(self.lint)
-
-    def fake_schematic(self, netlist: str, sch: str) -> dict:
-        self._rec("schematic", netlist, sch)
-        return _next(self.schematics)
-
-    def fake_analyze(self, design: dict, syms: str) -> dict:
-        self._rec("analyze", len(design["components"]))
-        return _next(self.analyses)
-
-    def fake_thermal(self, design: dict) -> dict:
-        self._rec("thermal")
-        return _next(self.thermal)
-
-    def fake_build(self, netlist: str, w: float, h: float, pcb: str, fps: str,
-                   placement: str, scale: float) -> dict:
-        self._rec("build", w, h, placement, scale)
-        res = dict(_next(self.builds))
-        if res.get("ok"):
-            Path(pcb).write_text(f"{self.header}(built {scale})\n", encoding="utf-8")
-        return res
-
-    def fake_route(self, pcb: str, passes: int, jar: str, timeout: int) -> dict:
-        self._rec("route", passes, timeout)
-        res = _next(self.routes)
-        if isinstance(res, Exception):
-            raise res
-        with open(pcb, "a", encoding="utf-8") as f:
-            f.write("(routed)\n")
-        return dict(res)
-
-    def fake_drc(self, pcb: str) -> dict:
-        self._rec("drc")
-        return dict(_next(self.drcs))
-
-    def fake_gate_check(self, mode: str, pcb: str, netlist: str) -> dict:
-        self._rec("gate_check", mode)
-        return copy.deepcopy(_next(self.gate_checks.get(mode, [{"issues": [], "warnings": []}])))
-
-    def fake_board_fix(self, pcb: str, netlist: str, mode: str) -> list:
-        self._rec("board_fix", mode)
-        return list(_next(self.fixes.get(mode, [[]])))
-
-    def fake_render(self, pcb: str, tag: str, quality: str = "basic") -> list:
-        self._rec("render", tag)
-        return [f"{tag}_top.png"]
-
-    def fake_emc(self, pcb: str, emc: dict) -> dict:
-        self._rec("emc", emc.get("max_freq_hz"))
-        return dict(_next(self.emc))
-
-    def fake_fab(self, pcb: str, netlist: str = "") -> dict:
-        self._rec("fab")
-        return dict(_next(self.fab))
-
-
-@pytest.fixture
-def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
-    return World(tmp_path, monkeypatch)
+PIPELINE = Path(rp.__file__).resolve().parent
+# every harness module: run_pipeline.py plus the pipeline/rp_*.py it is split into
+HARNESS_FILES = sorted([PIPELINE / "run_pipeline.py", *PIPELINE.glob("rp_*.py")])
+# the helper modules a stage reaches only through its module object
+HELPER_MODULES = {"kicad_server", "toolchain", "lint_netlist", "design_report", "gates",
+                  "remediate", "thermal_check"}
 
 
 def _run(world: World, placement: str = "") -> dict:
@@ -193,7 +55,7 @@ def test_run_delegates_to_the_stage_table_and_stops_at_the_first_failure(world, 
     seen: list[tuple[str, str]] = []
 
     def stage(name: str, passed: bool):
-        def fn(ctx: rp.RunContext) -> bool:
+        def fn(ctx: rp_context.RunContext) -> bool:
             seen.append((name, type(ctx).__name__))
             ctx.report["gates"].append({"gate": name, "name": name, "feeds": "-",
                                         "passed": passed, "blockers": [], "warnings": []})
@@ -208,19 +70,65 @@ def test_run_delegates_to_the_stage_table_and_stops_at_the_first_failure(world, 
 
 def test_stage_table_is_the_gate_order():
     assert [s.__name__ for s in rp.STAGES] == [
-        "_stage_g1", "_stage_g2", "_stage_route_cache", "_stage_place_route",
-        "_stage_g4", "_stage_cache_manifest", "_stage_g5"]
+        "stage_g1", "stage_g2", "stage_route_cache", "stage_place_route",
+        "stage_g4", "stage_cache_manifest", "stage_g5"]
+    assert [s.__module__ for s in rp.STAGES] == [
+        "rp_stage_schematic", "rp_stage_schematic", "rp_stage_place", "rp_stage_place",
+        "rp_stage_layout", "rp_stage_fab", "rp_stage_fab"]
+
+
+def _functions(path: Path) -> list[tuple[str, int]]:
+    """(name, source lines incl. decorators) of every def in `path`, methods
+    and nested functions included."""
+    out = []
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+            out.append((node.name, node.end_lineno - first + 1))
+    return out
 
 
 def test_no_function_in_the_harness_is_longer_than_80_lines():
-    long = {name: len(inspect.getsourcelines(fn)[0])
-            for name, fn in inspect.getmembers(rp, inspect.isfunction)
-            if fn.__module__ == rp.__name__ and len(inspect.getsourcelines(fn)[0]) > 80}
+    assert {"run_pipeline", "rp_paths", "rp_cli", "rp_context", "rp_kicad", "rp_route_hash",
+            "rp_route", "rp_stage_schematic", "rp_stage_place", "rp_stage_layout",
+            "rp_stage_fab"} <= {p.stem for p in HARNESS_FILES}
+    long = {f"{path.stem}.{name}": n for path in HARNESS_FILES
+            for name, n in _functions(path) if n > 80}
     assert long == {}
 
 
+def test_every_harness_module_stays_under_800_lines():
+    sizes = {path.name: len(path.read_text(encoding="utf-8").splitlines())
+             for path in HARNESS_FILES}
+    assert {name: n for name, n in sizes.items() if n >= 800} == {}
+
+
+def _helper_from_imports(path: Path) -> list[str]:
+    """'from <helper> import ...' statements (any level), plus every from-import
+    inside a function body, in one harness module."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    bad = [f"line {n.lineno}: from {n.module} import ..." for n in ast.walk(tree)
+           if isinstance(n, ast.ImportFrom) and n.module
+           and (n.module.startswith("rp_") or n.module in HELPER_MODULES)]
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bad += [f"line {n.lineno}: from {n.module} import ... inside {fn.name}()"
+                    for n in ast.walk(fn) if isinstance(n, ast.ImportFrom)]
+    return bad
+
+
+def test_stage_modules_call_helpers_through_module_objects():
+    """The run_pipeline docstring rule: rp_kicad.drc(...), never 'from rp_kicad
+    import drc' -- so one monkeypatch on the module object reaches every caller."""
+    stage_files = [p for p in HARNESS_FILES
+                   if p.stem.startswith("rp_stage_") or p.stem in ("rp_route", "run_pipeline")]
+    assert len(stage_files) >= 6
+    assert {p.name: _helper_from_imports(p) for p in stage_files
+            if _helper_from_imports(p)} == {}
+
+
 def test_run_context_derives_every_path_from_the_netlist(tmp_path):
-    ctx = rp.RunContext(netlist=str(tmp_path / "board.json"), w=30, h=20)
+    ctx = rp_context.RunContext(netlist=str(tmp_path / "board.json"), w=30, h=20)
     assert ctx.base == str(tmp_path / "board")
     assert ctx.sch == str(tmp_path / "board.kicad_sch")
     assert ctx.pcb == str(tmp_path / "board.kicad_pcb")
@@ -230,13 +138,33 @@ def test_run_context_derives_every_path_from_the_netlist(tmp_path):
 
 
 def test_log_remediation_keeps_one_log_in_the_report(tmp_path):
-    ctx = rp.RunContext(netlist=str(tmp_path / "n.json"), w=1, h=1)
+    ctx = rp_context.RunContext(netlist=str(tmp_path / "n.json"), w=1, h=1)
     assert "remediation" not in ctx.report
     ctx.log_remediation("G2", 1, ["added C9"])
     ctx.log_remediation("G3", 2, ["re-placed"])
     assert ctx.report["remediation"] == ctx.remediation == [
         {"gate": "G2", "round": 1, "applied": ["added C9"]},
         {"gate": "G3", "round": 2, "applied": ["re-placed"]}]
+
+
+def test_g2_review_keeps_the_design_analysis_on_the_context(world):
+    """ctx.analysis holds design_report.analyze()'s result (the review report's
+    input); the JSON report keeps only its summary, as before the split."""
+    ctx = rp_context.RunContext(netlist=str(world.netlist), w=30, h=30)
+    assert ctx.analysis == {}
+    rp_stage_schematic.stage_load(ctx)
+    verdict = rp_stage_schematic.g2_review(ctx)
+    assert verdict["passed"] is True
+    assert ctx.analysis == OK_ANALYSIS
+    assert ctx.report["design_report"] == {"decoupling_uncovered": [], "flags": {}, "errors": []}
+    assert "analysis" not in ctx.report
+
+
+def test_world_fake_route_records_keyword_arguments(world):
+    res = world.fake_route(str(world.pcb), 5, "", 9, dsn_seed=3, from_snapshot=True)
+    assert res == {"ok": True, "tracks": 7, "unconnected": 0}
+    assert world.args_of("route") == [(5, 9)]
+    assert world.route_kw == [{"dsn_seed": 3, "from_snapshot": True}]
 
 
 # --- the persisted report (every exit) -----------------------------------------
@@ -281,7 +209,7 @@ def test_an_unreadable_netlist_persists_a_failing_report(world):
 
 
 def test_a_report_that_cannot_be_written_is_flagged_not_hidden(world, monkeypatch, capsys):
-    monkeypatch.setattr(rp, "REPORT_SUFFIX", "/no/such/dir/r.json")   # parent dir missing
+    monkeypatch.setattr(rp_context, "REPORT_SUFFIX", "/no/such/dir/r.json")   # parent dir missing
     rep = _run(world)
     assert rep["PASS"] is True
     assert "pipeline_report" not in rep
@@ -301,7 +229,7 @@ def test_g2_remediation_rewrites_the_netlist_and_retests(world, monkeypatch):
         fixed["components"].append({"ref": "C9", "footprint": "Capacitor_SMD:C_0402"})
         return fixed, [f"added C9 for {tasks[0]['fix']['rail']}"]
 
-    monkeypatch.setattr(rp.remediate, "apply", fake_apply)
+    monkeypatch.setattr(remediate, "apply", fake_apply)
     rep = _run(world)
     assert _gate(rep, "G2")["passed"] and rep["PASS"]
     assert rep["remediation"][0] == {"gate": "G2", "round": 1, "applied": ["added C9 for +5V"]}
@@ -370,7 +298,8 @@ def test_router_failure_surfaces_at_g4_without_escalating(world):
     assert len(world.args_of("build")) == 1
     assert rep["autoroute"]["error"] == "java not found"
     assert _gate(rep, "G4")["blockers"][0] == "autoroute failed: java not found"
-    assert world.args_of("route") == [(rp.AUTOROUTE_MAX_PASSES, rp.AUTOROUTE_TIMEOUT_S)]
+    assert world.args_of("route") == [
+        (rp_route.AUTOROUTE_MAX_PASSES, rp_route.AUTOROUTE_TIMEOUT_S)]
 
 
 def test_near_miss_is_healed_in_place(world):
@@ -407,8 +336,8 @@ def test_unrouted_on_the_last_scale_is_judged_at_g4(world):
     world.routes = [{"tracks": 15, "unconnected": 9}]
     world.drcs = [CLEAN_DRC] * 5 + [{**CLEAN_DRC, "unconnected": 9}]
     rep = _run(world)
-    assert [a[3] for a in world.args_of("build")] == list(rp.PACK_SCALES)
-    assert len(rep["remediation"]) == len(rp.PACK_SCALES) - 1
+    assert [a[3] for a in world.args_of("build")] == list(rp_stage_place.PACK_SCALES)
+    assert len(rep["remediation"]) == len(rp_stage_place.PACK_SCALES) - 1
     assert "9 net(s) unrouted" in _gate(rep, "G4")["blockers"]
 
 
@@ -460,7 +389,8 @@ def test_emc_failure_is_a_warning_and_skips_the_redrc(world):
 def test_second_run_reuses_the_routed_board_and_still_judges_it(world):
     first = _run(world)
     manifest = json.loads((world.dir / "netlist.cache.json").read_text(encoding="utf-8"))
-    assert manifest["route_hash"] == rp._route_hash(DESIGN) and manifest["routed_ok"] is True
+    assert manifest["route_hash"] == rp_route_hash.route_hash(DESIGN)
+    assert manifest["routed_ok"] is True
     world.calls.clear()
     second = _run(world)
     assert first["route_cache"] == "miss" and second["route_cache"] == "hit"
@@ -482,25 +412,25 @@ def test_emc_is_not_restitched_on_a_cached_board(world):
     assert "emc" not in world.names()
 
 
-def _context_with_manifest(world: World, header: str) -> rp.RunContext:
-    ctx = rp.RunContext(netlist=str(world.netlist), w=30, h=30)
-    rp._stage_load(ctx)
+def _context_with_manifest(world: World, header: str) -> rp_context.RunContext:
+    ctx = rp_context.RunContext(netlist=str(world.netlist), w=30, h=30)
+    rp_stage_schematic.stage_load(ctx)
     world.pcb.write_text(header + "(routed)\n", encoding="utf-8")
     (world.dir / "netlist.cache.json").write_text(json.dumps(
-        {"route_hash": rp._route_hash(ctx.design), "routed_ok": True, "unconnected": 0,
+        {"route_hash": rp_route_hash.route_hash(ctx.design), "routed_ok": True, "unconnected": 0,
          "pack_scale": 1.0, "tracks": 7, "board_rep": {"ok": True}}), encoding="utf-8")
     return ctx
 
 
 def test_route_cache_uses_a_board_pcbnew_can_read(world):
     ctx = _context_with_manifest(world, K9_HEADER)
-    assert rp._stage_route_cache(ctx) is True
+    assert rp_stage_place.stage_route_cache(ctx) is True
     assert ctx.use_cache is True and ctx.report["route_cache"] == "hit"
 
 
 def test_route_cache_refuses_a_board_saved_by_kicad_11(world):
     ctx = _context_with_manifest(world, K11_HEADER)
-    assert rp._stage_route_cache(ctx) is True
+    assert rp_stage_place.stage_route_cache(ctx) is True
     assert ctx.use_cache is False and ctx.report["route_cache"] == "miss"
     reason = ctx.report["route_cache_reason"]
     assert reason.startswith("the cached board is not readable by the SWIG gate scripts: ")
@@ -527,21 +457,22 @@ def test_a_kicad_11_board_is_preserved_then_rebuilt_never_fed_to_swig(world):
     (lambda w, ctx: ctx.design.__setitem__("planes", {"In2.Cu": "N1"}),
      "placement/routing inputs changed since the cached run"),
     (lambda w, ctx: ctx.cache_path.write_text(json.dumps(
-        {"route_hash": rp._route_hash(ctx.design), "routed_ok": False}), encoding="utf-8"),
+        {"route_hash": rp_route_hash.route_hash(ctx.design), "routed_ok": False}),
+        encoding="utf-8"),
      "the cached run did not finish routing"),
     (lambda w, ctx: w.pcb.unlink(), "the cached board file is missing"),
 ], ids=["no-manifest", "junk-manifest", "hash-changed", "not-routed", "no-board"])
 def test_route_cache_miss_reasons(world, setup, reason):
     ctx = _context_with_manifest(world, K9_HEADER)
     setup(world, ctx)
-    rp._stage_route_cache(ctx)
+    rp_stage_place.stage_route_cache(ctx)
     assert ctx.use_cache is False and ctx.report["route_cache_reason"] == reason
 
 
 def test_pipeline_no_cache_env_bypasses_the_cache(world, monkeypatch):
     monkeypatch.setenv("PIPELINE_NO_CACHE", "1")          # read when the context is made
     ctx = _context_with_manifest(world, K9_HEADER)
-    rp._stage_route_cache(ctx)
+    rp_stage_place.stage_route_cache(ctx)
     assert ctx.use_cache is False and ctx.report["route_cache_reason"] == "PIPELINE_NO_CACHE is set"
 
 

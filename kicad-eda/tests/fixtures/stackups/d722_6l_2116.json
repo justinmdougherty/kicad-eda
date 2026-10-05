@@ -1,0 +1,24 @@
+{
+  "description": "ADR D7.2.2 example: 6L, four routable layers, JLC06161H-2116 geometry (D7.1) with its default roles SIG / GND / SIG / SIG / PWR (first rail) / SIG; copper + dielectric 1.5944 mm, 1.6554 mm with JLC masks, 16 gbrjob thickness rows",
+  "design": {
+    "name": "d722_6l_2116",
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]], "SIG": [["J1", "3"]]},
+    "stackup": {"preset": "jlcpcb:JLC06161H-2116", "impedance_control": {"required": true},
+                "rationale": "6L: two inner routing layers for the MCU fan-out"}
+  },
+  "expect": {
+    "source": "preset",
+    "fab": "jlcpcb",
+    "copper_layers": 6,
+    "kicad_copper_count": 6,
+    "thickness": 1.6554,
+    "gbrjob_rows": 16,
+    "roles": [["F.Cu", "signal", null], ["In1.Cu", "plane", "GND"], ["In2.Cu", "signal", null],
+              ["In3.Cu", "signal", null], ["In4.Cu", "plane", "+3V3"], ["B.Cu", "signal", null]],
+    "mask_source": "fab",
+    "issues": [],
+    "drafts": 2
+  }
+}

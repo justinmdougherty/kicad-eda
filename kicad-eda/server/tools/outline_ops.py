@@ -20,9 +20,10 @@ if _HERE not in sys.path:
 
 from outline_geom import (EPS, Arc, Line, Point, Prim, add, angle_of,  # noqa: E402
                           closest_point, cross, dist, dot, mul, norm, ray_hits, sub)
-from outline_model import (CHORD_ERROR_MM, Circle, Edge, Outline,  # noqa: E402
-                           OutlineError, PrimIndex, _fmt, bbox, check, contains,
-                           contains_rect, cross_turn, distance_to_edge, flatten, ring_name)
+from outline_inset import _CUSP_RAD  # noqa: E402  (the turn inset refuses: "doubles back")
+from outline_model import (CHORD_ERROR_MM, Edge, Outline, OutlineError,  # noqa: E402
+                           PrimIndex, _fmt, bbox, check, contains, contains_rect,
+                           distance_to_edge, flatten, ring_name)
 
 
 # =============================================================================
@@ -88,7 +89,7 @@ def _best_histogram_rect(free_rows: list[list[bool]], xs: Sequence[float],
     best: tuple[float, tuple | None] = (0.0, None)
     for j, free in enumerate(free_rows):
         dy = ys[j + 1] - ys[j]
-        heights = [h + dy if f else 0.0 for h, f in zip(heights, free)]
+        heights = [h + dy if f else 0.0 for h, f in zip(heights, free, strict=True)]
         stack: list[tuple[int, float]] = []
         for i in range(ncol + 1):
             h = heights[i] if i < ncol else 0.0
@@ -213,6 +214,8 @@ FAB_LIMITS: dict[str, FabLimits] = {
                 "2 x the +-0.2 mm routed-edge tolerance (" + _CAPS + ") + 0.4 mm of FR4 "
                 "left in the worst case"),
             "hole_inside": "geometry: a drilled hole must lie on the board",
+            "cusp": ("geometry: a zero-angle tip (the edge doubles back on itself) is "
+                     "narrower than any router bit"),
         },
         assumptions=frozenset({"feature_width"})),
 }
@@ -223,6 +226,7 @@ _SAMPLE_MM = 0.2           # fab width check: ray spacing along every edge
 # quarter of JLCPCB's +-0.2 mm routed-edge tolerance; a sharp 90 degree corner
 # leaves 0.207 mm with R0.5, a 45 degree turn 0.041 mm (not reported).
 _CORNER_EXCESS_MM = 0.05
+_SAME_CIRCLE_MM = 1e-4     # arcs whose centres and radii agree this closely share a circle
 
 
 def _limits(profile: str | FabLimits) -> FabLimits:
@@ -242,40 +246,81 @@ def _problem(lim: FabLimits, rule: str, severity: str, message: str, at: Point |
             "source": lim.sources.get(rule, ""), "assumption": rule in lim.assumptions}
 
 
-def _router_excess(p: Prim, q: Prim, r_bit: float) -> float:
-    """Material a bit of radius r_bit leaves beyond the vertex p -> q (0 for a
-    left turn: only reflex vertices, where the material turns right, trap it)."""
-    if cross_turn(p, q) >= 0:
-        return 0.0
+def _turn(p: Prim, q: Prim) -> float:
+    """Signed turn (rad, + = left) from p's end tangent to q's start tangent."""
     t1, t2 = p.tangent(1.0), q.tangent(0.0)
-    turn = math.acos(max(-1.0, min(1.0, t1[0] * t2[0] + t1[1] * t2[1])))
-    half_cos = math.cos(turn / 2.0)
-    return math.inf if half_cos <= 1e-12 else r_bit * (1.0 / half_cos - 1.0)
+    return math.atan2(cross(t1, t2), dot(t1, t2))
+
+
+def _vertex_turns(prims: Sequence[Prim]) -> tuple[float, ...]:
+    """The turn at the end of each primitive; () for a lone full circle."""
+    n = len(prims)
+    return tuple(_turn(p, prims[(i + 1) % n]) for i, p in enumerate(prims)) if n > 1 else ()
+
+
+def _is_cusp(turn: float) -> bool:
+    """The ring doubles back on itself at this vertex (a zero-angle spike or
+    slit): the turn is +-180 degrees and its sign is float noise, so the vertex
+    is judged by the cusp rule alone, never as a corner (inset refuses it)."""
+    return abs(turn) > math.pi - _CUSP_RAD
+
+
+def _circle_of(prims: Sequence[Prim]) -> tuple[Point, float] | None:
+    """(centre, radius) when every primitive of the ring is an arc of one
+    circle (within _SAME_CIRCLE_MM): a round hole however it is drawn, a
+    Circle or arcs such as a DXF LWPOLYLINE's two bulge-1 halves."""
+    first = prims[0]
+    if all(isinstance(p, Arc) and dist(p.c, first.c) <= _SAME_CIRCLE_MM
+           and abs(p.r - first.r) <= _SAME_CIRCLE_MM for p in prims):
+        return first.c, first.r
+    return None
+
+
+def _router_excess(turn: float, r_bit: float) -> float:
+    """Material a bit of radius r_bit leaves beyond a vertex turning `turn`
+    (0 for a left turn: only reflex vertices, where the material turns right,
+    trap it). Finite for every vertex that is not a cusp."""
+    return 0.0 if turn >= 0 else r_bit * (1.0 / math.cos(turn / 2.0) - 1.0)
+
+
+def _vertex_problems(lim: FabLimits, k: int, at: Point, turn: float) -> list[dict]:
+    """The cusp error, or the sharp-corner warning, for one vertex."""
+    if _is_cusp(turn):
+        return [_problem(lim, "cusp", "error",
+                         f"{ring_name(k)} doubles back on itself at {_fmt(at)} (a zero-angle "
+                         "spike or slit): no router bit fits the tip, so it cannot be milled "
+                         "as drawn. Give the tip a width or a radius", at, 0.0, 0.0)]
+    r_min = lim.min_internal_radius
+    excess = _router_excess(turn, r_min)
+    if excess <= _CORNER_EXCESS_MM:
+        return []
+    return [_problem(lim, "internal_corner_radius", "warning",
+                     f"{ring_name(k)}: sharp internal corner at {_fmt(at)}; the R{r_min:g} "
+                     f"router bit leaves {excess:.3f} mm of material there. Draw a fillet "
+                     f">= {r_min:g} mm (or a dog-bone) if a part must fit the corner", at, 0.0,
+                     r_min)]
 
 
 def _corner_problems(o: Outline, lim: FabLimits) -> list[dict]:
     """Concave (material-reflex) corners the router bit cannot cut: arcs whose
     centre is in the void (sweep < 0, material on the left) with r < the bit
-    radius, and sharp reflex vertices where the bit leaves > _CORNER_EXCESS_MM.
-    Polyline-approximated fillets are judged vertex by vertex."""
+    radius, and sharp reflex vertices where the bit leaves > _CORNER_EXCESS_MM;
+    and one error per cusp. Polyline-approximated fillets are judged vertex
+    by vertex; the arcs of a round ring (_circle_of) are a hole, judged by
+    the slot rule."""
     out = []
     r_min = lim.min_internal_radius
     for k, prims in enumerate(o.rings):
-        n = len(prims)
+        round_ring = _circle_of(prims) is not None
+        turns = _vertex_turns(prims)
         for i, p in enumerate(prims):
-            if isinstance(p, Arc) and not p.is_circle and p.sweep < 0 and p.r < r_min - 1e-9:
+            if isinstance(p, Arc) and not round_ring and p.sweep < 0 and p.r < r_min - 1e-9:
                 out.append(_problem(lim, "internal_corner_radius", "warning",
                                     f"{ring_name(k)}: internal arc R{p.r:g} at {_fmt(p.mid)} "
                                     f"is tighter than the R{r_min:g} router bit; it will be "
                                     "milled wider", p.mid, p.r, r_min))
-            excess = _router_excess(p, prims[(i + 1) % n], r_min) if n > 1 else 0.0
-            if excess > _CORNER_EXCESS_MM:
-                out.append(_problem(lim, "internal_corner_radius", "warning",
-                                    f"{ring_name(k)}: sharp internal corner at {_fmt(p.end)}; "
-                                    f"the R{r_min:g} router bit leaves {excess:.3f} mm of "
-                                    f"material there. Draw a fillet >= {r_min:g} mm (or a "
-                                    "dog-bone) if a part must fit the corner", p.end, 0.0,
-                                    r_min))
+            if turns:
+                out += _vertex_problems(lim, k, p.end, turns[i])
     return out
 
 
@@ -318,13 +363,17 @@ class _Corner:
 
 
 def _corners(o: Outline) -> dict[tuple[int, int], _Corner]:
-    """Every vertex, keyed (ring, index of the primitive ending there)."""
+    """Every vertex but the cusps (their normal cone would be a half-plane
+    reaching across the material), keyed (ring, index of the primitive ending
+    there). A full circle has no vertex."""
     out = {}
     for k, prims in enumerate(o.rings):
         n = len(prims)
-        for i, p in enumerate(prims if n > 1 else ()):     # a full circle has no vertex
-            t1, t2 = p.tangent(1.0), prims[(i + 1) % n].tangent(0.0)
-            out[(k, i)] = _Corner(k, p.end, t1, t2, math.atan2(cross(t1, t2), dot(t1, t2)))
+        for i, turn in enumerate(_vertex_turns(prims)):
+            if not _is_cusp(turn):
+                p = prims[i]
+                out[(k, i)] = _Corner(k, p.end, p.tangent(1.0), prims[(i + 1) % n].tangent(0.0),
+                                      turn)
     return out
 
 
@@ -346,18 +395,20 @@ def _foot(p: Prim, x: Point) -> Point | None:
 class _RingWalk:
     """Signed tangent turning along one ring from its first primitive's start
     (arc sweeps plus vertex turns): tells a corner's own wedge from a neck or
-    slot by the boundary between two points, however it is split into edges."""
+    slot by the boundary between two points, however it is split into edges.
+    A cusp adds no turn: its +-180 degrees has a float-noise sign, and without
+    it a ray across the cusp's own zero-angle wedge sees only the edges'
+    curvature there, so it is a wedge (the cusp rule reports the tip)."""
     sweeps: tuple[float, ...]          # signed arc sweep (0 for a line)
     start_turn: tuple[float, ...]      # turning at each primitive's start; [-1] = total
 
     @classmethod
     def of(cls, prims: Sequence[Prim]) -> _RingWalk:
-        n = len(prims)
         sweeps = tuple(p.sweep if isinstance(p, Arc) else 0.0 for p in prims)
+        turns = _vertex_turns(prims) or (0.0,)
         start_turn = [0.0]
-        for i, p in enumerate(prims):
-            t1, t2 = p.tangent(1.0), prims[(i + 1) % n].tangent(0.0)
-            start_turn.append(start_turn[-1] + sweeps[i] + math.atan2(cross(t1, t2), dot(t1, t2)))
+        for sweep, turn in zip(sweeps, turns, strict=True):
+            start_turn.append(start_turn[-1] + sweep + (0.0 if _is_cusp(turn) else turn))
         return cls(sweeps, tuple(start_turn))
 
     def is_wedge(self, i: int, t: float, j: int, u: float) -> bool:
@@ -539,7 +590,7 @@ def _width_problems(o: Outline, lim: FabLimits) -> list[dict]:
             where = " / ".join(ring_name(k) for k in rings)
             msg = (f"{where}: milled gap {w:.3f} mm at {_fmt(at)} is narrower than the "
                    f"{lim.min_slot_width:g} mm minimum non-plated slot")
-            if any(isinstance(([o.outer] + list(o.cutouts))[k], Circle) for k in rings):
+            if any(k > 0 and _circle_of(o.rings[k]) is not None for k in rings):
                 msg += (f"; a round hole this small should be an NPTH drill "
                         f"(>= {lim.min_npth_diameter:g} mm), not an Edge.Cuts cutout")
             out.append(_problem(lim, "slot_width", "error", msg, at, w, lim.min_slot_width))
@@ -587,9 +638,12 @@ def validate_fab(o: Outline, profile: str | FabLimits = "JLCPCB",
     Each problem: {rule, severity, message, at [x, y] | None, value, limit,
     source, assumption}. Rules: board_size, slot_width (void narrower than the
     router: cutouts and notches), internal_corner_radius (sharp or too-tight
-    concave corners), feature_width (thin necks/webs/fingers/slivers), and
-    for `holes` [(x, y, diameter)] drilled NPTHs: hole_size, hole_inside,
-    hole_to_edge. A width is measured where it is narrowest: between two
+    concave corners), feature_width (thin necks/webs/fingers/slivers), cusp
+    (one error per vertex where a ring doubles back on itself, a zero-angle
+    spike or slit; inset refuses the same input), and for `holes`
+    [(x, y, diameter)] drilled NPTHs: hole_size, hole_inside, hole_to_edge.
+    A ring of arcs on one circle is a round hole however it is drawn (a
+    Circle or DXF bulge halves). A width is measured where it is narrowest: between two
     edge interiors (rays along the edge normals, crossing square there) or
     at a vertex (exactly, from each vertex the region is reflex at: a web
     under a V-notch tip, a waist between two tips, a tooth tip near a wall,

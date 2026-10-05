@@ -7,17 +7,43 @@ This is the path the IPC API cannot do (it cannot instantiate library footprints
 so the server shells out to KiCad's interpreter to run this.
 
 Usage:
-  <kicad-python> swig_build_board.py <netlist.json> <out.kicad_pcb> <footprints_dir> \
-                                     [board_w_mm] [board_h_mm]
+  <kicad-python> swig_build_board.py <netlist.json> <out.kicad_pcb> <footprints> \
+                                     [board_w_mm] [board_h_mm] [placement.json]
+<footprints> is a directory of stock <nick>.pretty libraries (back-compat) or a
+*.json library map (libtable.LibraryResolver.library_map(): the netlist
+libraries block, the project fp-lib-table, then the stock directory; D1). Every
+footprint loaded, stock parts and mounting holes included, carries its library
+nickname (SetFPID(LIB_ID(nick, name))). A footprint this pcbnew does not load
+(e.g. a newer dialect, D0) fails with fp_dialect's message: the .kicad_mod, its
+(version N), pcbnew.GetBuildVersion() and the newest format that build loads.
+board_w_mm / board_h_mm <= 0 mean "not given" (an outline board's size is its
+outline bbox; a legacy fully placed board without a board block is 50 x 25).
+
+Board outline (ROADMAP_DECISIONS D2, F3-11; build_features has the details):
+env KICAD_EDA_OUTLINE names an outline_resolve sidecar whose board block
+replaces the netlist's; else the netlist board block. A board with
+outline.loop / corner_radius / cutouts / datum gets exact Edge.Cuts
+(board_outline.draw_outline), the aux + grid origin at its datum (default:
+bbox bottom-left), planes that follow the outline and the smallest landscape
+sheet that holds it (A4..A0, else User). An unresolved outline.dxf is refused.
+Plain w/h and auto-sized boards keep the legacy geometry exactly. KIIDs are
+seeded from sha256(netlist + sidecar), so rebuilds save the same file order.
 Emits a JSON result on stdout.
 """
 import json
 import os
 import sys
 import traceback
+from collections.abc import Callable
+from pathlib import Path
 
 import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
+
+import board_outline as bo
+import build_features as bf
+import fp_dialect
+import libtable
 
 
 def mm(v):
@@ -28,18 +54,71 @@ def vec(x, y):
     return pcbnew.VECTOR2I(mm(x), mm(y))
 
 
-def load_footprint(footprints_dir, lib_id):
-    lib, _, name = lib_id.partition(":")
-    libpath = f"{footprints_dir}/{lib}.pretty"
-    fp = pcbnew.FootprintLoad(libpath, name)
+def footprint_libraries(arg: str) -> str | dict:
+    """argv[3]: a stock footprints directory, returned as is (back-compat), or
+    a *.json library map, returned as the dict libtable.lookup() reads."""
+    if not arg.lower().endswith(".json"):
+        return arg
+    try:
+        with open(arg, encoding="utf-8-sig") as f:
+            lib_map = json.load(f)
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"cannot read the library map {arg}: {e}") from e
+    key = libtable.MAP_KEYS[libtable.FOOTPRINT]
+    if not isinstance(lib_map, dict) or not isinstance(lib_map.get(key, {}), dict):
+        raise RuntimeError(f"{arg} is not a library map (libtable.LibraryResolver."
+                           f"library_map(): a JSON object with a '{key}' object)")
+    if lib_map.get("version") != libtable.MAP_VERSION:
+        raise RuntimeError(f"library map {arg} has version {lib_map.get('version')!r}; this "
+                           f"builder reads version {libtable.MAP_VERSION}")
+    return lib_map
+
+
+def library_dir(footprints: str | dict, nick: str) -> str:
+    """The .pretty directory of library ``nick``: from the library map (its
+    entry, else its stock directory) or ``<footprints dir>/<nick>.pretty``."""
+    if not isinstance(footprints, dict):
+        return f"{footprints}/{nick}.pretty"
+    path = libtable.lookup(footprints, libtable.FOOTPRINT, nick)
+    if path is None:
+        stock = (footprints.get("stock") or {}).get(libtable.MAP_KEYS[libtable.FOOTPRINT])
+        raise RuntimeError(f"footprint library '{nick}' is not in the library map (netlist "
+                           f"libraries block, project fp-lib-table), or its row is disabled, "
+                           f"and the stock footprints ({stock}) have no {nick}.pretty")
+    return path
+
+
+def load_footprint(footprints: str | dict, lib_id: str) -> "pcbnew.FOOTPRINT":
+    """Load ``nick:name`` from its library (library_dir) and stamp the
+    nickname on it: SetFPID(LIB_ID(nick, name)), checked by reading it back
+    with GetUniStringLibId() (never LIB_ID.Format()). A footprint pcbnew does
+    not load raises RuntimeError with fp_dialect.load_failure_message."""
+    nick, _, name = lib_id.partition(":")
+    if not nick or not name:
+        raise RuntimeError(f"footprint {lib_id!r} is not '<library>:<footprint>'")
+    libpath = library_dir(footprints, nick)
+    mod = os.path.normpath(os.path.join(libpath, name + ".kicad_mod"))
+    build = pcbnew.GetBuildVersion()
+    fp = None
+    if os.path.isdir(libpath):          # a missing library makes FootprintLoad raise
+        try:
+            fp = pcbnew.FootprintLoad(libpath, name)
+        except Exception as e:          # KiCad's IO_ERROR on a file it cannot parse
+            raise RuntimeError(f"{fp_dialect.load_failure_message(mod, build, lib_id)} "
+                               f"({type(e).__name__}: {e})") from e
     if fp is None:
-        raise RuntimeError(f"FootprintLoad failed for {lib_id} (looked in {libpath})")
+        raise RuntimeError(fp_dialect.load_failure_message(mod, build, lib_id))
+    fp.SetFPID(pcbnew.LIB_ID(nick, name))
+    stamped = str(fp.GetFPID().GetUniStringLibId())
+    if stamped != f"{nick}:{name}":
+        raise RuntimeError(f"SetFPID(LIB_ID({nick!r}, {name!r})) reads back as {stamped!r} "
+                           f"in pcbnew {build}")
     return fp
 
 
-from board_shapes import add_keepout, add_outline, add_plane  # noqa: E402
-from place_engine import (fp_extent, fp_mouth, functional_place,  # noqa: E402
-                          shelf_pack)
+from place_engine import fp_extent, fp_mouth, functional_place  # noqa: E402
+
+DEFAULT_SIZE_MM = (50.0, 25.0)    # a fully placed legacy board with no board block
 
 # JLCPCB-class fab floors (mm), applied to the board design settings.
 # The via drill floor is ``m_MinThroughDrill`` (KiCad >= 9); the pre-9 field
@@ -74,19 +153,101 @@ def apply_design_rules(board, rules_mm=FAB_RULES_MM):
     return skipped
 
 
-def main():
-    netlist_path, out_path, fp_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-    board_w = float(sys.argv[4]) if len(sys.argv) > 4 else 50.0
-    board_h = float(sys.argv[5]) if len(sys.argv) > 5 else 25.0
-    placement = {}
-    if len(sys.argv) > 6 and sys.argv[6] not in ("", "-"):
-        placement = json.load(open(sys.argv[6], encoding="utf-8"))
-    design = json.load(open(netlist_path, encoding="utf-8"))
-    # merge placement overrides (ref -> [x, y, rot]) into components
+def argv_dims(argv: list[str]) -> tuple[float, float]:
+    """argv[4] / argv[5] (mm); absent or <= 0 means 'not given' (DEFAULT_SIZE_MM)."""
+    dims = []
+    for i, default in ((4, DEFAULT_SIZE_MM[0]), (5, DEFAULT_SIZE_MM[1])):
+        value = float(argv[i]) if len(argv) > i else default
+        dims.append(value if value > 0 else default)
+    return dims[0], dims[1]
+
+
+def read_design(netlist_path: str, placement_arg: str | None) -> tuple[bytes, dict]:
+    """(netlist bytes, design) with the placement overrides (ref -> [x, y,
+    rot], argv[6]) merged into NEW component dicts."""
+    raw = Path(netlist_path).read_bytes()
+    design = json.loads(raw.decode("utf-8"))
+    if not placement_arg or placement_arg in ("", "-"):
+        return raw, design
+    with open(placement_arg, encoding="utf-8") as f:
+        placement = json.load(f)
+    comps = [{**c, **dict(zip(("x", "y", "rot"), placement[c["ref"]], strict=True))}
+             if c["ref"] in placement else c for c in design["components"]]
+    return raw, {**design, "components": comps}
+
+
+def load_parts(design: dict, footprints: str | dict) -> tuple[dict, dict, dict, dict]:
+    """Every component's footprint loaded (reference + value set) and measured
+    at the origin: (fps, extents (w, h, cx_off, cy_off) at rot 0, pad counts,
+    connector mouths), each keyed by ref."""
+    fps, extents, pincount, mouth = {}, {}, {}, {}
     for c in design["components"]:
-        if c["ref"] in placement:
-            x, y, rot = placement[c["ref"]]
-            c["x"], c["y"], c["rot"] = x, y, rot
+        fp = load_footprint(footprints, c["footprint"])
+        fp.SetReference(c["ref"])
+        fp.SetValue(c.get("value", ""))
+        fps[c["ref"]] = fp
+        extents[c["ref"]] = fp_extent(fp)
+        pincount[c["ref"]] = fp.GetPadCount()
+        mouth[c["ref"]] = fp_mouth(fp)
+    return fps, extents, pincount, mouth
+
+
+def assign_pads(design: dict, placed: dict,
+                get_net: Callable[[str], object]) -> tuple[int, list[str]]:
+    """Net every netlist (ref, pad): (pads assigned, missing "ref.pad (why)").
+    A pad "number" can map to several copper elements (e.g. a split
+    thermal/EP pad): net ALL of them, or they short on the empty net."""
+    assigned, missing = 0, []
+    for net_name, conns in design.get("nets", {}).items():
+        ni = get_net(net_name)
+        for ref, pad_num in conns:
+            fp = placed.get(ref)
+            if fp is None:
+                missing.append(f"{ref}.{pad_num} (no footprint)")
+                continue
+            matched = [p for p in fp.Pads() if p.GetNumber() == str(pad_num)]
+            if not matched:
+                missing.append(f"{ref}.{pad_num} (no pad)")
+                continue
+            for p in matched:
+                p.SetNet(ni)
+            assigned += len(matched)
+    return assigned, missing
+
+
+def save_and_fill(board: "pcbnew.BOARD", out_path: str, zones: list[str], sheet: tuple,
+                  legacy: bool, warnings: list[str]) -> None:
+    """SaveBoard, the sheet splice (outline boards), then the zone fill on a
+    FRESHLY LOADED board: the in-memory CreateEmptyBoard board lacks the
+    connectivity the headless ZONE_FILLER needs and segfaults 9.0.4. The
+    splice runs first so the fill saves the final sheet. An unfilled plane is
+    a board with no ground/power copper, so a fill failure is fatal."""
+    try:
+        board.BuildConnectivity()
+    except Exception as e:
+        warnings.append(f"BuildConnectivity failed before save "
+                        f"({type(e).__name__}: {e}); ratsnest rebuilt on load")
+    pcbnew.SaveBoard(out_path, board)
+    if not legacy:
+        bf.splice_paper(out_path, sheet)
+    if zones:
+        b2 = bo.load_board(out_path)
+        b2.BuildConnectivity()
+        pcbnew.ZONE_FILLER(b2).Fill(b2.Zones())
+        pcbnew.SaveBoard(out_path, b2)
+
+
+def main() -> None:
+    netlist_path, out_path = sys.argv[1], sys.argv[2]
+    footprints = footprint_libraries(sys.argv[3])
+    board_w, board_h = argv_dims(sys.argv)
+    netlist_bytes, design = read_design(netlist_path, sys.argv[6] if len(sys.argv) > 6 else None)
+    # the outline source (env sidecar / board block / legacy), then KIIDs
+    # seeded from the inputs so every rebuild saves the same file order
+    src = bf.resolve_outline_source(design, os.environ)
+    design = src.design
+    pcbnew.KIID.SeedGenerator(bf.kiid_seed(netlist_bytes, src.sidecar_bytes))
+    outline_wh = bf.outline_dims(src)          # None: legacy
 
     board = pcbnew.CreateEmptyBoard()
     board.SetCopperLayerCount(4)
@@ -102,34 +263,19 @@ def main():
                         f"{pcbnew.GetBuildVersion()} and skipped: "
                         f"{', '.join(skipped_rules)}")
 
-    # The board is centred on an A4 sheet. CreateEmptyBoard() already defaults
-    # the page to A4 (verified: the saved file carries ``(paper "A4")`` under
-    # pcbnew 9.0.4, whose GetPageSettings() is an opaque SWIG object with no
-    # PAGE_INFO API at all). The explicit set is only attempted where a real
-    # SetType exists, so a version that genuinely fails to apply it is
-    # reported and one that simply has no API is not.
-    SHEET_W, SHEET_H = 297.0, 210.0
-    ps = board.GetPageSettings()
-    if hasattr(ps, "SetType"):
-        try:
-            ps.SetType("A4")
-            board.SetPageSettings(ps)
-        except Exception as e:
-            warnings.append(f"page settings not applied ({type(e).__name__}: "
-                            f"{e}); sheet stays at the pcbnew default")
+    # The board is centred on its sheet: A4 for legacy boards (CreateEmptyBoard's
+    # default, saved as (paper "A4")); an outline board gets the smallest
+    # landscape size holding it + 20 mm margins, spliced in after SaveBoard
+    # (page settings are an opaque SWIG object on 9.0.4 and 10.0.5).
+    sheet = bf.LEGACY_SHEET if outline_wh is None else bf.choose_sheet(*outline_wh)
+    warnings += bf.apply_page(board, sheet[0])
+    SHEET_W, SHEET_H = sheet[1], sheet[2]
 
     # --- load + measure every footprint (at the origin) ---
-    placed, missing_pads = {}, []
-    fps, extents = {}, {}
-    pincount, mouth = {}, {}
-    for c in design["components"]:
-        fp = load_footprint(fp_dir, c["footprint"])
-        fp.SetReference(c["ref"])
-        fp.SetValue(c.get("value", ""))
-        fps[c["ref"]] = fp
-        extents[c["ref"]] = fp_extent(fp)  # (w, h, cx_off, cy_off) at rot 0
-        pincount[c["ref"]] = fp.GetPadCount()
-        mouth[c["ref"]] = fp_mouth(fp)
+    placed = {}
+    fps, extents, pincount, mouth = load_parts(design, footprints)
+    # ref -> "nick:name" as stamped (D1), mounting holes added below
+    fpids = {ref: str(fp.GetFPID().GetUniStringLibId()) for ref, fp in fps.items()}
 
     auto_rots = {}
     board_spec = design.get("board") or {}
@@ -137,21 +283,26 @@ def main():
     auto_comps = [c for c in design["components"] if c["ref"] not in fixed_refs]
     have_full_placement = not auto_comps
     if have_full_placement:
-        # caller supplied coords + board size: honor them verbatim.
+        # caller supplied coords + board size: honor them verbatim. An
+        # outline board's size is its outline bbox (it may have no w/h).
         targets = {c["ref"]: (c["x"], c["y"]) for c in design["components"]}
-        if board_spec:
+        if outline_wh is not None:
+            board_w, board_h = outline_wh
+        elif board_spec:
             board_w, board_h = float(board_spec["w"]), float(board_spec["h"])
-    elif fixed_refs:
+    elif fixed_refs or outline_wh is not None:
         # MIXED placement: mechanically-spec'd parts (a HAT's header, holes,
         # connectors) sit at their exact board-relative coordinates; everything
         # else is functionally packed into the remaining field. Requires a
         # fixed board size — a spec'd part position is meaningless on an
         # auto-sized outline. Collisions surface at the G3 courtyard gate.
+        # An outline board (fixed by its outline) packs its auto parts here
+        # too, into fields of its bbox (F3-12 refines them with board_field).
         if not board_spec:
             print(json.dumps({"ok": False, "error":
                   'mixed placement requires "board": {"w": mm, "h": mm}'}))
             sys.exit(1)
-        board_w, board_h = float(board_spec["w"]), float(board_spec["h"])
+        board_w, board_h = outline_wh or (float(board_spec["w"]), float(board_spec["h"]))
         scale = float(os.environ.get("PACK_SCALE", "1.0"))
         edge = 2.0 * scale
         has_conn = any(c["ref"][:1] == "J" and not c.get("interior")
@@ -282,149 +433,36 @@ def main():
     # --- nets + pad assignment ---
     netmap = {}
 
-    def get_net(name):
+    def get_net(name: str) -> "pcbnew.NETINFO_ITEM":
         if name not in netmap:
             ni = pcbnew.NETINFO_ITEM(board, name)
             board.Add(ni)
             netmap[name] = ni
         return netmap[name]
 
-    assigned = 0
-    for net_name, conns in design.get("nets", {}).items():
-        ni = get_net(net_name)
-        for ref, pad_num in conns:
-            fp = placed.get(ref)
-            if fp is None:
-                missing_pads.append(f"{ref}.{pad_num} (no footprint)")
-                continue
-            # a pad "number" can map to several copper elements (e.g. a split
-            # thermal/EP pad) — net ALL of them, or they short on the empty net.
-            matched = [p for p in fp.Pads() if p.GetNumber() == str(pad_num)]
-            if not matched:
-                missing_pads.append(f"{ref}.{pad_num} (no pad)")
-                continue
-            for p in matched:
-                p.SetNet(ni)
-            assigned += len(matched)
+    assigned, missing_pads = assign_pads(design, placed, get_net)
 
-    add_outline(board, board_w, board_h, ox, oy)
+    # --- Edge.Cuts (+ aux origin), then the build_features: preroutes,
+    # mounting holes, planes, antenna keep-out (each ONE function) ---
+    frame = bf.Frame(board_w, board_h, ox, oy, src.outline, src.source)
+    outline_info, notes = bf.add_board_outline(board, design, frame, sheet)
+    warnings += notes
+    preroute_count, notes = bf.add_preroutes(board, design, placed, get_net, ox, oy)
+    warnings += notes
+    def load_hole(mh_fp: str) -> "pcbnew.FOOTPRINT":
+        """A mounting-hole footprint, nickname-stamped like every part (D1)."""
+        fp = load_footprint(footprints, mh_fp)
+        return fp
 
-    # --- preroutes: designer-authored power copper laid BEFORE the router.
-    # A deterministic router cannot neck down, so an IPC-width class makes
-    # signal taps on power nets (an FB divider leg, a boot cap, a sense pin)
-    # unreachable. The hand layout answer: the designer routes the fat
-    # current path; the autorouter then connects the taps at signal width
-    # (these nets carry NO width class — netclass_writer exempts them).
-    # Spec: "preroutes": [{"net", "width", "layer", "path": [point...],
-    #   "vias": [[x,y],...], "via_size": [dia,drill]}] where point is
-    #   ["pad", ref, padnum] (pad center after placement) or ["xy", x, y]
-    #   (board-relative mm). G4 still polices these nets at the preroute
-    #   width via the gate checks.
-    preroute_count = 0
-    for pr in design.get("preroutes", []):
-        ni = get_net(pr["net"])
-        layer = getattr(pcbnew, pr.get("layer", "F.Cu").replace(".", "_"))
-
-        def _resolve(pt):
-            # ["pad", ref, num, (width)] or ["xy", x, y, (width)] — the
-            # optional trailing width applies to the segment STARTING here
-            # (neck-down out of a small pin, widen in the open field)
-            if pt[0] == "pad":
-                fp = placed[pt[1]]
-                pad = next(p for p in fp.Pads()
-                           if p.GetNumber() == str(pt[2]))
-                w = float(pt[3]) if len(pt) > 3 else None
-                return pad.GetPosition(), w
-            w = float(pt[3]) if len(pt) > 3 else None
-            return vec(float(pt[1]) + ox, float(pt[2]) + oy), w
-
-        pts = [_resolve(p) for p in pr["path"]]
-        for (a, wa), (b, _) in zip(pts, pts[1:]):
-            t = pcbnew.PCB_TRACK(board)
-            t.SetStart(a)
-            t.SetEnd(b)
-            t.SetWidth(mm(wa if wa is not None else pr["width"]))
-            t.SetLayer(layer)
-            t.SetNet(ni)
-            board.Add(t)
-            preroute_count += 1
-        via_d, via_drill = pr.get("via_size", [1.2, 0.9])
-        for vx, vy in pr.get("vias", []):
-            v = pcbnew.PCB_VIA(board)
-            v.SetPosition(vec(float(vx) + ox, float(vy) + oy))
-            v.SetWidth(mm(via_d))
-            v.SetDrill(mm(via_drill))
-            v.SetViaType(pcbnew.VIATYPE_THROUGH)
-            v.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
-            v.SetNet(ni)
-            board.Add(v)
-            preroute_count += 1
-
-    # --- mounting holes (a practical board must be mechanically fixable) ---
-    # netlist: "mounting_holes": true  (or {"footprint": ..., "inset": mm}).
-    # Four corner NPTH holes, M3 by default. Refs H1-H4.
-    mh = design.get("mounting_holes")
-    holes_added = []
-    if mh:
-        spec = mh if isinstance(mh, dict) else {}
-        mh_fp = spec.get("footprint", "MountingHole:MountingHole_3.2mm_M3")
-        inset = float(spec.get("inset", 4.0))
-        # exact spec coordinates (e.g. the RPi HAT pattern) override the
-        # uniform corner-inset default
-        corners = spec.get("positions") or [
-            (inset, inset), (board_w - inset, inset),
-            (board_w - inset, board_h - inset), (inset, board_h - inset)]
-        for i, (hx, hy) in enumerate(corners, 1):
-            fp = load_footprint(fp_dir, mh_fp)
-            fp.SetReference(f"H{i}")
-            fp.SetPosition(vec(hx + ox, hy + oy))
-            board.Add(fp)
-            holes_added.append(f"H{i}")
-
-    # --- copper planes (4-layer Sig/GND/PWR/Sig) ---
-    # Default: In1.Cu = solid GND plane, In2.Cu = first power rail. Signal layers
-    # are left un-poured: pouring GND on the outer layers fragments it into islands
-    # that need stitching vias, so for a clean autorouted flow we keep the return
-    # current on the inner plane. Override via netlist "planes": {"<layer>":"<net>"}.
-    nets_avail = [n for n in design.get("nets", {}) if n != "GND"]
-    # prefer a regulated logic rail (+3V3, +5V, +1V8) over a raw input (VBUS/VIN)
-    default_power = (next((n for n in nets_avail if n.startswith("+")), None)
-                     or next((n for n in nets_avail if "V" in n.upper()), None))
-    planes = design.get("planes")
-    if planes is None:
-        planes = {"In1.Cu": "GND"}
-        if default_power:
-            planes["In2.Cu"] = default_power
-    zones_added = []
-    for layer_name, net_name in planes.items():
-        if net_name not in netmap:
-            continue
-        lid = board.GetLayerID(layer_name)
-        if lid < 0:
-            continue
-        add_plane(board, lid, netmap[net_name], board_w, board_h, ox, oy)
-        zones_added.append(f"{layer_name}:{net_name}")
-
-    # --- antenna keep-out (no ground/power pour under the radiator) ---
-    # Spec in the netlist: "antenna_keepout": {"edge":"top|bottom|left|right",
-    # "depth": mm} for an edge strip, or {"rect":[x,y,w,h]} board-relative.
-    ako = design.get("antenna_keepout")
-    keepout_added = None
-    if ako:
-        if "rect" in ako:
-            kx, ky, kw, kh = ako["rect"]
-            kx, ky = ox + kx, oy + ky
-        else:
-            depth = float(ako.get("depth", 8.0))
-            edge = ako.get("edge", "top")
-            kx, ky, kw, kh = {
-                "top": (ox, oy, board_w, depth),
-                "bottom": (ox, oy + board_h - depth, board_w, depth),
-                "left": (ox, oy, depth, board_h),
-                "right": (ox + board_w - depth, oy, depth, board_h),
-            }.get(edge, (ox, oy, board_w, depth))
-        if add_keepout(board, kx, ky, kw, kh, ako.get("name", "ANTENNA")):
-            keepout_added = ako
+    holes, notes = bf.add_mounting_holes(board, design, load_hole, frame,
+                                         libtable.DEFAULT_MOUNTING_HOLE_FOOTPRINT)
+    warnings += notes
+    fpids.update(holes)
+    zones_added, notes = bf.add_planes(board, design, netmap, frame,
+                                       FAB_RULES_MM["m_CopperEdgeClearance"])
+    warnings += notes
+    keepout_added, notes = bf.add_antenna_keepout(board, design, frame)
+    warnings += notes
 
     # --- silkscreen hygiene: refs placed ADJACENT to their part (visible
     # after assembly), center-on-body only as the dense fallback, everything
@@ -438,24 +476,7 @@ def main():
         warnings.append(f"silkscreen ref placement failed ({type(e).__name__}: "
                         f"{e}); refs left at their footprint defaults")
 
-    # connectivity rebuild + save
-    try:
-        board.BuildConnectivity()
-    except Exception as e:
-        warnings.append(f"BuildConnectivity failed before save "
-                        f"({type(e).__name__}: {e}); ratsnest rebuilt on load")
-    pcbnew.SaveBoard(out_path, board)
-
-    # Fill zones on a FRESHLY LOADED board — the in-memory board built from
-    # CreateEmptyBoard lacks the connectivity the headless ZONE_FILLER needs and
-    # segfaults; a reloaded board fills cleanly. An unfilled plane is a board
-    # with no ground/power copper, so a fill failure is fatal (the __main__
-    # wrapper reports it as ok=false with the trace).
-    if zones_added:
-        b2 = pcbnew.LoadBoard(out_path)
-        b2.BuildConnectivity()
-        pcbnew.ZONE_FILLER(b2).Fill(b2.Zones())
-        pcbnew.SaveBoard(out_path, b2)
+    save_and_fill(board, out_path, zones_added, sheet, src.outline is None, warnings)
 
     print(json.dumps({
         "ok": not missing_pads,
@@ -466,8 +487,11 @@ def main():
         "missing_pads": missing_pads,
         "zones": zones_added,
         "antenna_keepout": keepout_added,
-        "mounting_holes": holes_added,
+        "mounting_holes": list(holes),
+        "preroutes": preroute_count,
         "board_mm": [board_w, board_h],
+        "outline": outline_info,
+        "fpids": fpids,
         "warnings": warnings,
     }))
 
@@ -475,6 +499,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except bf.BuildError as e:          # a board the builder refuses: no trace
+        print(json.dumps({"ok": False, "error": str(e)}))
+        sys.exit(1)
     except Exception as e:
         print(json.dumps({"ok": False, "error": str(e),
                           "trace": traceback.format_exc()}))

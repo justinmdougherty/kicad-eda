@@ -1,18 +1,28 @@
-"""place_engine — the pure geometry half (shelf_pack / functional_place).
+"""place_engine — the pure geometry half (shelf_pack / functional_place), the
+connector edges of place_conn (F3-08), and fp_extent / fp_mouth on stub
+footprints (no KiCad).
 
-place_engine imports pcbnew at module level for fp_extent/fp_mouth, which are
-not exercised here. When pcbnew is not importable (the dev venv, CI) a stub
-module is registered for the duration of the place_engine import ONLY and is
-removed again afterwards, so it never leaks into other test modules that expect
-`import pcbnew` to fail (board_shapes, emc_stitch, silk_place, _kicad_python).
+place_engine imports pcbnew at module level for fp_extent/fp_mouth. When pcbnew
+is not importable (the dev venv, CI) a stub module is registered for the
+duration of the place_engine import ONLY and is removed again afterwards, so it
+never leaks into other test modules that expect `import pcbnew` to fail
+(board_shapes, emc_stitch, silk_place, _kicad_python). The fp_extent/fp_mouth
+tests swap place_engine's own pcbnew reference for a namespace via monkeypatch.
 """
 from __future__ import annotations
 
+import ast
 import importlib
+import math
+import os
+import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
+
+import place_conn as pconn
 
 
 def _import_place_engine() -> types.ModuleType:
@@ -282,3 +292,489 @@ def test_functional_place_all_passive_field_honours_width_limit():
     _, _, w, h = pe.functional_place(design, extents, pincount, width_limit=8.0)
     _, _, w_free, h_free = pe.functional_place(design, extents, pincount)
     assert w <= 8.0 and h > h_free
+
+
+# --- F3-08: default placement is bit-identical to the pre-F3-08 engine ----------
+#
+# GOLDEN_DEFAULT was captured by running the HEAD (pre-F3-08) functional_place on
+# the conftest examples (buck_design, hat_design and the hat's F/B auto halves as
+# swig_build_board splits them) and on _mcu_design, with _stub_inputs standing in
+# for fp_extent / GetPadCount / fp_mouth. Every conn_edges form that leaves all
+# connectors on the default (top) edge must reproduce it exactly: repr equality,
+# i.e. the same float bits, ints and dict order. The full-hat case breaks
+# net-fanout ties in str-set order, which follows PYTHONHASHSEED, so it is
+# compared in a child process pinned to the seed it was captured under.
+
+GOLDEN_SEED = "1"
+_MOUTHS = ((0.0, 1.0), (1.0, 0.0), (0.0, -1.0), (-1.0, 0.0), (0.0, 0.0))
+EDGE_MODES = ("none", "empty", "all_top", "foreign")
+
+
+def _stub_inputs(design: dict) -> tuple[dict, dict, dict]:
+    """Deterministic stand-ins for fp_extent / GetPadCount / fp_mouth on an
+    example netlist: pad count from the nets, a size per reference class, and
+    the J* mouths cycling through every direction (and mouthless)."""
+    pads: dict[str, set] = {c["ref"]: set() for c in design["components"]}
+    for conns in design["nets"].values():
+        for ref, pad in conns:
+            pads.setdefault(ref, set()).add(pad)
+    extents, pincount = {}, {}
+    for i, c in enumerate(design["components"]):
+        ref, n = c["ref"], len(pads[c["ref"]])
+        kind = ref.rstrip("0123456789")
+        if kind == "U":
+            w, h = 2.0 + 0.25 * n, 2.4 + 0.25 * n
+        elif kind == "J":
+            w, h = 1.5 + 1.27 * n, 5.0 + i % 3
+        elif kind == "L":
+            w, h = 7.0, 6.6
+        else:
+            w, h = 1.6 + 0.4 * (i % 3), 0.8 + 0.2 * (i % 2)
+        extents[ref] = (round(w, 3), round(h, 3), 0.0, 0.0)
+        pincount[ref] = n
+    jrefs = [c["ref"] for c in design["components"] if c["ref"][:1] == "J"]
+    mouth = {r: _MOUTHS[k % len(_MOUTHS)] for k, r in enumerate(jrefs)}
+    return extents, pincount, mouth
+
+
+def _connectors(design: dict) -> list[str]:
+    return [c["ref"] for c in design["components"]
+            if (c["ref"][:1] == "J" or c.get("edge_row")) and not c.get("interior")]
+
+
+def _edges_for(mode: str, design: dict, universe: list[str]) -> dict | None:
+    """The conn_edges forms that keep every connector on the default top edge."""
+    if mode == "none":
+        return None
+    if mode == "empty":
+        return {}
+    if mode == "all_top":
+        return {r: "top" for r in _connectors(design)}
+    # one mapping for a whole board: entries naming parts outside this
+    # (sub-)design -- fixed parts, the other side's half -- are ignored
+    refs = {c["ref"] for c in design["components"]}
+    return {**{r: "left" for r in universe if r not in refs}, "NOT_A_PART": "right"}
+
+
+def golden_outputs(buck: dict, hat: dict, mode: str) -> dict:
+    """functional_place on every golden case with the `mode` conn_edges form."""
+    auto = [c for c in hat["components"] if not ("x" in c and "y" in c)]
+    cases = {"buck": (buck, buck, {}), "buck_scaled": (buck, buck, {"margin": 2.25}),
+             "hat": (hat, hat, {}),
+             "hat_f": (hat, {**hat, "components": [c for c in auto if c.get("side", "F") != "B"]},
+                       {"margin": 1.5, "width_limit": 23.0}),
+             "hat_b": (hat, {**hat, "components": [c for c in auto if c.get("side", "F") == "B"]},
+                       {"margin": 1.5, "width_limit": 25.0})}
+    out = {}
+    for name, (board, design, kw) in cases.items():
+        ext, pins, mouth = _stub_inputs(board)
+        edges = _edges_for(mode, design, [c["ref"] for c in board["components"]])
+        out[name] = pe.functional_place(design, ext, pins, mouth, conn_edges=edges, **kw)
+    mcu, ext, pins = _mcu_design()
+    universe = [c["ref"] for c in mcu["components"]]
+    row = {**mcu, "components": [dict(c, edge_row=True) if c["ref"] == "Y1" else c
+                                 for c in mcu["components"]]}
+    for name, m in (("up", (0.0, -1.0)), ("right", (1.0, 0.0)), ("down", (0.0, 1.0)),
+                    ("left", (-1.0, 0.0)), ("edge_row", (0.0, 1.0))):
+        design = row if name == "edge_row" else mcu
+        out[f"mcu_{name}"] = pe.functional_place(
+            design, ext, pins, mouth={"J1": m}, conn_edges=_edges_for(mode, design, universe))
+    return out
+
+
+def _golden_hat_in_pinned_child() -> dict:
+    """{mode: golden_outputs(...)["hat"]} from a child pinned to GOLDEN_SEED."""
+    here = Path(__file__).resolve().parent
+    code = ("import test_place_engine as t; from conftest import load_example as ld; "
+            "print(repr({m: t.golden_outputs(ld('buck_5v3a'), ld('rpi5_battery_hat'), m)"
+            "['hat'] for m in t.EDGE_MODES}))")
+    path = os.pathsep.join(str(p) for p in (here, here.parent / "server" / "tools",
+                                            here.parent / "server"))
+    proc = subprocess.run([sys.executable, "-c", code], cwd=str(here), timeout=120,
+                          env={**os.environ, "PYTHONHASHSEED": GOLDEN_SEED, "PYTHONPATH": path},
+                          capture_output=True, encoding="utf-8", errors="replace",
+                          stdin=subprocess.DEVNULL)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    return ast.literal_eval(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize("mode", EDGE_MODES)
+def test_default_placement_is_bit_identical_to_the_captured_literals(
+        mode: str, buck_design: dict, hat_design: dict) -> None:
+    got = golden_outputs(buck_design, hat_design, mode)
+    assert set(got) == set(GOLDEN_DEFAULT)
+    for name, golden in GOLDEN_DEFAULT.items():
+        if name != "hat":            # hash-seed dependent: the pinned child below
+            assert repr(got[name]) == repr(golden), name
+
+
+def test_default_full_hat_placement_is_bit_identical_under_the_capture_seed() -> None:
+    got = _golden_hat_in_pinned_child()
+    assert set(got) == set(EDGE_MODES)
+    for mode, result in got.items():
+        assert repr(result) == repr(GOLDEN_DEFAULT["hat"]), mode
+
+
+# functional_place outputs of the pre-F3-08 engine (see the section comment)
+GOLDEN_DEFAULT = {
+    "buck": ({
+        "J1": (2.02, 2.5), "J2": (8.04, 2.02), "U1": (6.02, 8.325), "C1": (2.295, 7.0),
+        "C3": (2.495, 8.5), "F1": (9.545, 7.0), "C4": (9.745, 8.4), "L1": (4.77, 14.35),
+        "D1": (9.77, 11.45), "C2": (2.07, 18.55)}, {"J1": 180, "J2": 90}, 10.94, 18.95),
+    "buck_scaled": ({
+        "J1": (2.02, 2.5), "J2": (8.79, 2.02), "U1": (6.77, 9.075), "C1": (2.595, 7.75),
+        "C3": (2.795, 9.25), "F1": (10.745, 7.75), "C4": (10.945, 9.15), "L1": (5.52, 15.55),
+        "D1": (10.52, 12.65), "C2": (2.82, 19.75)}, {"J1": 180, "J2": 90}, 12.14, 20.15),
+    "hat": ({
+        "J1": (11.035, 2.5), "C3": (1.2, 0.5), "C5": (1.4, 2.0), "C6": (1.2, 3.4),
+        "C15": (20.87, 0.5), "TP5": (20.67, 2.0), "C7": (20.47, 3.5), "TP1": (7.685, 6.4),
+        "C14": (9.985, 6.3), "C4": (12.285, 6.3), "C22": (14.385, 6.3), "J5": (29.87, 11.545),
+        "R12": (24.77, 0.5), "TP3": (24.77, 2.0), "R14": (24.97, 3.5), "R15": (24.77, 4.9),
+        "C24": (24.77, 6.2), "C19": (25.17, 7.6), "TP4": (25.17, 9.0), "C21": (34.97, 0.5),
+        "D3": (34.77, 2.0), "C23": (34.77, 3.5), "C18": (34.97, 4.9), "Q7": (34.57, 6.3),
+        "Q2": (34.57, 7.7), "J2": (39.69, 3.5), "J3": (45.71, 3.29), "U1": (8.73, 41.315),
+        "C1": (3.905, 38.49), "C2": (13.755, 38.39), "U2": (8.405, 26.79), "C9": (4.305, 25.09),
+        "C8": (12.305, 24.99), "R1": (12.105, 26.29), "L1": (8.205, 33.19), "U3": (19.705, 26.79),
+        "C17": (15.805, 25.09), "C20": (15.805, 26.49), "R9": (23.805, 24.99),
+        "R10": (23.405, 26.39), "L2": (19.905, 33.19), "U4": (21.78, 40.815),
+        "R2": (17.255, 38.49), "U5": (30.93, 40.315), "R8": (26.905, 38.49), "R7": (34.755, 38.39),
+        "C16": (34.755, 39.69), "U6": (31.405, 26.79), "R11": (27.505, 24.99),
+        "J4": (29.955, 32.89), "Q1": (37.355, 25.09), "C11": (35.905, 26.99),
+        "R4": (38.205, 26.99), "C13": (35.705, 28.49), "R3": (38.205, 28.39),
+        "C12": (36.105, 29.89), "D1": (38.805, 29.89), "RS1": (35.905, 31.19),
+        "C10": (38.205, 31.19), "Q3": (43.955, 25.09), "D2": (42.505, 26.99),
+        "RS2": (45.405, 26.99), "R6": (42.505, 28.49), "Q4": (45.405, 28.39),
+        "R5": (42.305, 29.89), "TP2": (44.805, 29.89), "D4": (42.105, 31.19),
+        "R13": (44.205, 31.19)}, {"J1": 180, "J5": 90, "J2": 0, "J3": 270}, 48.21, 44.64),
+    "hat_f": ({
+        "U1": (8.065, 3.325), "J4": (2.02, 3.0), "R12": (13.29, 0.5), "C3": (13.29, 2.0),
+        "D3": (13.09, 3.5), "TP5": (13.09, 5.0), "C1": (1.595, 8.05), "TP1": (3.695, 8.05),
+        "C2": (5.995, 7.95), "C14": (8.495, 7.95), "C4": (10.795, 7.95), "TP4": (12.895, 7.95)
+        }, {}, 14.49, 8.55),
+    "hat_b": ({
+        "U4": (5.925, 2.825), "D2": (1.2, 0.5), "R2": (1.4, 2.0), "R3": (1.2, 3.4),
+        "D1": (1.4, 4.7), "R6": (10.65, 0.5), "C23": (10.45, 2.0), "C24": (10.65, 3.4),
+        "R5": (10.45, 4.7), "C22": (5.925, 6.95), "U6": (18.25, 2.2), "R14": (14.35, 0.5),
+        "Q7": (14.55, 2.0), "R11": (14.35, 3.4), "Q4": (22.35, 0.4), "R15": (22.35, 1.7),
+        "R4": (21.95, 3.1), "Q2": (16.35, 5.7), "D4": (18.45, 5.7), "R13": (20.55, 5.7)
+        }, {}, 23.55, 7.35),
+    "mcu_up": ({
+        "J1": (4.0, 2.0), "U1": (6.6, 8.0), "Y1": (1.6, 6.75), "C3": (2.4, 8.9), "C1": (10.8, 5.9),
+        "C2": (10.8, 7.2), "R1": (10.8, 8.5)}, {"J1": 0}, 11.6, 10.5),
+    "mcu_right": ({
+        "J1": (2.0, 4.0), "U1": (6.6, 12.0), "Y1": (1.6, 10.75), "C3": (2.4, 12.9),
+        "C1": (10.8, 9.9), "C2": (10.8, 11.2), "R1": (10.8, 12.5)}, {"J1": 90}, 11.6, 14.5),
+    "mcu_down": ({
+        "J1": (4.0, 2.0), "U1": (6.6, 8.0), "Y1": (1.6, 6.75), "C3": (2.4, 8.9), "C1": (10.8, 5.9),
+        "C2": (10.8, 7.2), "R1": (10.8, 8.5)}, {"J1": 180}, 11.6, 10.5),
+    "mcu_left": ({
+        "J1": (2.0, 4.0), "U1": (6.6, 12.0), "Y1": (1.6, 10.75), "C3": (2.4, 12.9),
+        "C1": (10.8, 9.9), "C2": (10.8, 11.2), "R1": (10.8, 12.5)}, {"J1": 270}, 11.6, 14.5),
+    "mcu_edge_row": ({
+        "J1": (4.0, 2.0), "Y1": (11.1, 1.25), "U1": (7.1, 8.0), "C1": (2.9, 5.9), "R1": (2.9, 7.2),
+        "C2": (11.3, 5.9), "C3": (11.3, 7.2)}, {"J1": 180, "Y1": 0}, 12.7, 10.5),
+}
+
+
+# --- F3-08: connectors on any board edge (conn_edges) ----------------------------
+
+NORMAL = {"top": (0.0, -1.0), "bottom": (0.0, 1.0), "left": (-1.0, 0.0), "right": (1.0, 0.0)}
+AXES = ((0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0))
+FOUR_EDGES = {"J1": "top", "J2": "bottom", "J3": "left", "J4": "right"}
+
+
+def _rot_cw(vec: tuple, rot: int) -> tuple[float, float]:
+    """KiCad's clockwise-positive rotation in the Y-down frame (the NOTE in
+    swig_build_board's placement loop), written independently of place_conn."""
+    a = math.radians(rot)
+    x, y = vec
+    return (round(x * math.cos(a) + y * math.sin(a), 9) + 0.0,
+            round(-x * math.sin(a) + y * math.cos(a), 9) + 0.0)
+
+
+def _rot_sizes(extents: dict, rots: dict) -> dict:
+    return {r: (e[1], e[0]) if rots.get(r, 0) in (90, 270) else (e[0], e[1])
+            for r, e in extents.items()}
+
+
+def _edge_gap(result: tuple, sizes: dict, ref: str, edge: str) -> float:
+    """Distance from ref's (rotated) bbox to `edge` of the placement extent."""
+    pos, _, w, h = result
+    cx, cy = pos[ref]
+    sw, sh = sizes[ref]
+    return {"top": cy - sh / 2, "bottom": h - (cy + sh / 2),
+            "left": cx - sw / 2, "right": w - (cx + sw / 2)}[edge]
+
+
+def _check_on_edge(result: tuple, extents: dict, ref: str, edge: str, mouth: tuple) -> None:
+    """ref's rotated mouth is `edge`'s outward normal, its courtyard bbox is
+    flush with that edge of the placement, and nothing overlaps."""
+    pos, rots, _, _ = result
+    sizes = _rot_sizes(extents, rots)
+    assert _rot_cw(mouth, rots[ref]) == NORMAL[edge], (ref, edge, rots[ref])
+    assert _edge_gap(result, sizes, ref, edge) == pytest.approx(0.0, abs=0.01), (ref, edge)
+    assert set(pos) == set(extents)
+    _assert_no_overlap(pos, sizes)
+
+
+def _box_gap(pos: dict, sizes: dict, a: str, b: str) -> float:
+    """Chebyshev gap between two bboxes (0 when they touch)."""
+    gx = abs(pos[a][0] - pos[b][0]) - (sizes[a][0] + sizes[b][0]) / 2
+    gy = abs(pos[a][1] - pos[b][1]) - (sizes[a][1] + sizes[b][1]) / 2
+    return max(gx, gy, 0.0)
+
+
+def _four_edge_design() -> tuple[dict, dict, dict]:
+    """Two ICs and four connectors; J3 (a 6-pin USB-C-like head) owns its CC
+    pulldown R3, which must travel with it to whatever edge J3 is given."""
+    refs = ["U1", "U2", "J1", "J2", "J3", "J4", "R3", "C1", "C2"]
+    nets = {"GND": [["U1", "1"], ["U2", "1"], ["J1", "1"], ["J2", "1"], ["J3", "1"],
+                    ["J4", "1"], ["R3", "2"], ["C1", "2"], ["C2", "2"]],
+            "V": [["U1", "2"], ["U2", "2"], ["C1", "1"], ["C2", "1"]],
+            "CC": [["J3", "2"], ["R3", "1"]],
+            "A": [["U1", "3"], ["J1", "2"]], "B": [["U1", "4"], ["J2", "2"]],
+            "D": [["U2", "3"], ["J3", "3"]], "E": [["U2", "4"], ["J4", "2"]]}
+    extents = {"U1": (5, 5, 0, 0), "U2": (4, 6, 0, 0), "J1": (8, 4, 0, 0),
+               "J2": (6, 3, 0, 0), "J3": (9, 7, 0, 0), "J4": (7, 5, 0, 0),
+               "R3": (1.6, 0.8, 0, 0), "C1": (1.6, 0.8, 0, 0), "C2": (1.6, 0.8, 0, 0)}
+    pincount = {"U1": 8, "U2": 8, "J1": 2, "J2": 2, "J3": 6, "J4": 2, "R3": 2, "C1": 2,
+                "C2": 2}
+    return {"components": [{"ref": r} for r in refs], "nets": nets}, extents, pincount
+
+
+@pytest.mark.parametrize("edge,rot", [("top", 180), ("bottom", 0), ("left", 270),
+                                      ("right", 90)])
+def test_right_angle_connector_mouth_faces_out_of_each_edge(edge: str, rot: int) -> None:
+    # a right-angle stub whose mouth is +y at rot 0, placed on each edge in turn
+    design, extents, pincount = _mcu_design()
+    result = pe.functional_place(design, extents, pincount, mouth={"J1": (0.0, 1.0)},
+                                 conn_edges={"J1": edge})
+    assert result[1] == {"J1": rot}
+    _check_on_edge(result, extents, "J1", edge, (0.0, 1.0))
+
+
+@pytest.mark.parametrize("edge", pconn.EDGES)
+@pytest.mark.parametrize("mouth", AXES)
+def test_rot_face_points_every_mouth_along_every_edge_normal(mouth: tuple, edge: str) -> None:
+    assert _rot_cw(mouth, pconn.rot_face(mouth, edge)) == NORMAL[edge]
+    assert pconn.rotate_cw(mouth, pconn.rot_face(mouth, edge)) == NORMAL[edge]
+    assert pconn.rot_face((0.0, 0.0), edge) == pconn.rot_face((0.3, 0.2), edge) == 0
+
+
+@pytest.mark.parametrize("rot", (0, 90, 180, 270))
+@pytest.mark.parametrize("vec", AXES + ((0.6, -0.8),))
+def test_rotate_cw_matches_kicads_clockwise_formula(vec: tuple, rot: int) -> None:
+    assert pconn.rotate_cw(vec, rot) == pytest.approx(_rot_cw(vec, rot), abs=1e-9)
+
+
+def test_mixed_edges_put_each_connector_on_its_edge_without_overlap() -> None:
+    design, extents, pincount = _four_edge_design()
+    result = pe.functional_place(design, extents, pincount,
+                                 {j: (0.0, 1.0) for j in FOUR_EDGES}, conn_edges=FOUR_EDGES)
+    for ref, edge in FOUR_EDGES.items():
+        _check_on_edge(result, extents, ref, edge, (0.0, 1.0))
+    sizes = _rot_sizes(extents, result[1])
+    assert _box_gap(result[0], sizes, "R3", "J3") < 1.0     # CC pulldown at its connector
+
+
+@pytest.mark.parametrize("edge", pconn.EDGES)
+def test_connectors_sharing_an_edge_form_a_row_or_column_along_it(edge: str) -> None:
+    design, extents, pincount = _four_edge_design()
+    result = pe.functional_place(design, extents, pincount,
+                                 {j: (0.0, 1.0) for j in FOUR_EDGES},
+                                 conn_edges={j: edge for j in FOUR_EDGES})
+    for ref in FOUR_EDGES:
+        _check_on_edge(result, extents, ref, edge, (0.0, 1.0))
+    along = 0 if edge in ("top", "bottom") else 1
+    assert len({result[0][j][along] for j in FOUR_EDGES}) == 4   # spread along the edge
+    assert _box_gap(result[0], _rot_sizes(extents, result[1]), "R3", "J3") < 1.0
+
+
+def test_bottom_row_stays_flush_below_a_long_side_column() -> None:
+    design, extents, pincount = _four_edge_design()
+    edges = {"J1": "left", "J3": "left", "J4": "left", "J2": "bottom"}
+    result = pe.functional_place(design, extents, pincount, {j: (0.0, 1.0) for j in edges},
+                                 conn_edges=edges)
+    for ref, edge in edges.items():
+        _check_on_edge(result, extents, ref, edge, (0.0, 1.0))
+
+
+def test_side_columns_narrow_the_anchor_field_to_width_limit() -> None:
+    design = {"components": [{"ref": f"U{i}"} for i in range(6)] + [{"ref": "J1"}],
+              "nets": {}}
+    extents = {**{f"U{i}": (6, 6, 0, 0) for i in range(6)}, "J1": (8, 4, 0, 0)}
+    pincount = {**{f"U{i}": 8 for i in range(6)}, "J1": 3}
+    for edge in ("left", "right"):
+        result = pe.functional_place(design, extents, pincount, {"J1": (0.0, 1.0)},
+                                     width_limit=40.0, conn_edges={"J1": edge})
+        assert result[2] <= 40.0                  # 5 anchors per row would need 41.5
+        _check_on_edge(result, extents, "J1", edge, (0.0, 1.0))
+
+
+def _ble_design() -> tuple[dict, dict, dict]:
+    """An MCU, a BLE module flagged edge_row + "edge": "right" (antenna toward
+    -y in its rot-0 frame, like the Raytac MDBT42Q) with its own decoupling
+    cap C2, and a USB connector J1 left on the default edge."""
+    design = {"components": [{"ref": "U1"}, {"ref": "U2", "edge_row": True, "edge": "right"},
+                             {"ref": "J1"}, {"ref": "C1"}, {"ref": "C2"}],
+              "nets": {"GND": [["U1", "1"], ["U2", "1"], ["J1", "1"], ["C1", "2"],
+                               ["C2", "2"]],
+                       "VBLE": [["U2", "2"], ["C2", "1"]],
+                       "VCC": [["U1", "2"], ["C1", "1"], ["J1", "2"]],
+                       "TX": [["U1", "3"], ["U2", "3"]]}}
+    extents = {"U1": (5, 5, 0, 0), "U2": (10, 16, 0, 0), "J1": (9, 7, 0, 0),
+               "C1": (1.6, 0.8, 0, 0), "C2": (1.6, 0.8, 0, 0)}
+    return design, extents, {"U1": 8, "U2": 40, "J1": 6, "C1": 2, "C2": 2}
+
+
+def test_edge_row_module_with_edge_right_lands_on_the_right_edge() -> None:
+    design, extents, pincount = _ble_design()
+    # what the builder (F3-12) passes: the component key "edge"
+    edges = {c["ref"]: c["edge"] for c in design["components"] if "edge" in c}
+    mouth = {"U2": (0.0, -1.0), "J1": (0.0, 1.0)}
+    result = pe.functional_place(design, extents, pincount, mouth, conn_edges=edges)
+    assert result[1] == {"U2": 270, "J1": 180}
+    _check_on_edge(result, extents, "U2", "right", (0.0, -1.0))
+    _check_on_edge(result, extents, "J1", "top", (0.0, 1.0))
+    sizes = _rot_sizes(extents, result[1])
+    assert _box_gap(result[0], sizes, "C2", "U2") < 1.0     # module decoupling at the module
+
+
+def test_conn_edges_rejects_an_unknown_edge_name() -> None:
+    design, extents, pincount = _mcu_design()
+    with pytest.raises(ValueError, match="'north'"):
+        pe.functional_place(design, extents, pincount, conn_edges={"J1": "north"})
+
+
+@pytest.mark.parametrize("ref,flag", [("U1", None), ("Y1", None), ("J1", "interior")])
+def test_conn_edges_rejects_a_part_that_is_not_an_edge_connector(ref: str, flag) -> None:
+    design, extents, pincount = _mcu_design()
+    if flag:
+        design = {**design, "components": [dict(c, **{flag: True}) if c["ref"] == ref else c
+                                           for c in design["components"]]}
+    with pytest.raises(ValueError, match=f"'{ref}'"):
+        pe.functional_place(design, extents, pincount, conn_edges={ref: "left"})
+
+
+def test_orient_cluster_puts_the_head_on_the_side_facing_its_edge() -> None:
+    # laid out for the top edge: head H on y = 0..2, satellite S below it
+    top = ({"H": (2.5, 1.0), "S": (2.5, 3.5)}, 5.0, 4.0)
+    assert pconn.orient_cluster(top, "top") is top
+    assert pconn.orient_cluster(top, "bottom") == ({"H": (2.5, 3.0), "S": (2.5, 0.5)}, 5.0, 4.0)
+    # left/right take a cluster laid out on TRANSPOSED sizes and transpose it back
+    assert pconn.orient_cluster(top, "left") == ({"H": (1.0, 2.5), "S": (3.5, 2.5)}, 4.0, 5.0)
+    assert pconn.orient_cluster(top, "right") == ({"H": (3.0, 2.5), "S": (0.5, 2.5)}, 4.0, 5.0)
+
+
+# --- fp_extent / fp_mouth: courtyard caches (empty on KiCad 9.0.4) ----------------
+
+NM = 1_000_000
+
+
+class _Box:
+    def __init__(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        self.x0, self.y0, self.x1, self.y1 = (round(v * NM) for v in (x0, y0, x1, y1))
+
+    def GetWidth(self) -> int:  # noqa: N802 (pcbnew API)
+        return self.x1 - self.x0
+
+    def GetHeight(self) -> int:  # noqa: N802
+        return self.y1 - self.y0
+
+    def GetCenter(self) -> types.SimpleNamespace:  # noqa: N802
+        return types.SimpleNamespace(x=(self.x0 + self.x1) // 2, y=(self.y0 + self.y1) // 2)
+
+
+class _Poly:
+    def __init__(self, box: _Box | None) -> None:
+        self.box = box
+
+    def OutlineCount(self) -> int:  # noqa: N802
+        return 1 if self.box else 0
+
+    def BBox(self) -> _Box:  # noqa: N802  (an empty set's bbox: a zero box at the origin)
+        return self.box or _Box(0, 0, 0, 0)
+
+
+_PCB = types.SimpleNamespace(VECTOR2I=lambda x, y: (x, y), F_CrtYd=46, B_CrtYd=47,
+                             ToMM=lambda v: v / NM)
+
+
+class _LazyFootprint:
+    """KiCad 10.0-like: GetCourtyard is always current; no BuildCourtyardCaches."""
+
+    def __init__(self, courtyard: _Box | None, bbox: _Box, pads: tuple = ()) -> None:
+        self.courtyard, self.bbox, self.pads = courtyard, bbox, list(pads)
+        self.calls: list[str] = []
+        self.built = True
+
+    def SetPosition(self, _p: tuple) -> None:  # noqa: N802
+        self.calls.append("SetPosition")
+
+    def GetCourtyard(self, layer: int) -> _Poly:  # noqa: N802
+        self.calls.append("GetCourtyard")
+        return _Poly(self.courtyard if self.built and layer == _PCB.F_CrtYd else None)
+
+    def GetBoundingBox(self) -> _Box:  # noqa: N802
+        return self.bbox
+
+    def Pads(self) -> list:  # noqa: N802
+        return self.pads
+
+
+class _Footprint904(_LazyFootprint):
+    """KiCad 9.0.4-like: the courtyard cache is EMPTY until BuildCourtyardCaches()."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.built = False
+
+    def BuildCourtyardCaches(self) -> None:  # noqa: N802
+        self.calls.append("BuildCourtyardCaches")
+        self.built = True
+
+
+def _pad(x: float, y: float) -> types.SimpleNamespace:
+    at = types.SimpleNamespace(x=round(x * NM), y=round(y * NM))
+    return types.SimpleNamespace(GetPosition=lambda: at)
+
+
+def _cap(cls: type) -> _LazyFootprint:
+    """A 0603 cap: courtyard 3.05 x 1.55 centred at (0, 0.1); silk+text bbox 14.9 x 4.6."""
+    return cls(_Box(-1.525, -0.675, 1.525, 0.875), _Box(-7.45, -2.3, 7.45, 2.3))
+
+
+def _edge_jack(cls: type) -> _LazyFootprint:
+    """Pads on y = 0.2, courtyard centred 1.8 mm further toward +y: mouth (0, 1)."""
+    return cls(_Box(-3, -1, 3, 5), _Box(-8, -3, 8, 6), pads=(_pad(-1, 0.2), _pad(1, 0.2)))
+
+
+@pytest.fixture
+def stub_pcbnew(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pe, "pcbnew", _PCB)
+
+
+@pytest.mark.parametrize("cls", [_Footprint904, _LazyFootprint])
+def test_fp_extent_builds_courtyard_caches_before_reading_them(stub_pcbnew, cls: type) -> None:
+    fp = _cap(cls)
+    assert pe.fp_extent(fp) == pytest.approx((3.05, 1.55, 0.0, 0.1))   # not the silk bbox
+    built = ["BuildCourtyardCaches"] if cls is _Footprint904 else []  # hasattr-guarded
+    assert fp.calls[:2 + len(built)] == ["SetPosition", *built, "GetCourtyard"]
+
+
+def test_fp_extent_falls_back_to_the_bounding_box_without_a_courtyard(stub_pcbnew) -> None:
+    fp = _Footprint904(None, _Box(-2, -1, 2, 1))
+    assert pe.fp_extent(fp) == pytest.approx((4.0, 2.0, 0.0, 0.0))
+
+
+@pytest.mark.parametrize("cls", [_Footprint904, _LazyFootprint])
+def test_fp_mouth_reads_the_built_courtyard(stub_pcbnew, cls: type) -> None:
+    fp = _edge_jack(cls)
+    assert pe.fp_mouth(fp) == (0.0, 1.0)
+    assert ("BuildCourtyardCaches" in fp.calls) == (cls is _Footprint904)
+
+
+def test_fp_mouth_is_indeterminate_without_a_front_courtyard(stub_pcbnew) -> None:
+    # no F.CrtYd at all: no mouth, rather than one measured from the origin
+    fp = _Footprint904(None, _Box(-8, -3, 8, 6), pads=(_pad(-1, 3.0), _pad(1, 3.0)))
+    assert pe.fp_mouth(fp) == (0.0, 0.0)

@@ -1,0 +1,54 @@
+{
+  "schema": "kicad-eda/test-vectors@1",
+  "source": {
+    "title": "Design Equations for Broadside and Edgewise Stripline Couplers",
+    "publisher": "Rogers Corporation, Advanced Circuit Materials Division, design note 3.2.1",
+    "url": "https://www.rogerscorp.com (design note 3.2.1)",
+    "copyright": "1982-2003 Rogers Corporation",
+    "transcribed": "2026-10-05, task D7-05, from page 2 of the note (the D7 impedance research copy rogers_bcs.pdf): the two 'Example designs' tables, values exactly as printed"
+  },
+  "units": {"lengths": "inch (as printed)", "z0": "ohm", "coupling": "dB"},
+  "conventions": {
+    "assumptions": "the note's: conductor thickness negligible (t = 0), equal widths, equal distance to both ground planes, dielectric fills the space between the planes, one relative permittivity for every layer",
+    "broadside": "three boards: outer / center / outer; b = 2 * outer_board_in + center_board_in (the note: 'the sum of the thicknesses of the three boards'); strip spacing s = center_board_in; strip width = line_width_in",
+    "edge": "two boards with one signal layer between them; b = 2 * board_in (ground plane spacing); s = spacing_in; w = width_in",
+    "z0": "Z0 = sqrt(Z0even * Z0odd)",
+    "coupling": "D = -8.68589 * ln((Z0even - Z0odd) / (Z0even + Z0odd))",
+    "printed_constants": "the note writes Z0even = 188.3 / sqrt(er) * K(k')/K(k) and Z0odd = 296.1 * s / (sqrt(er) * atanh(k)) for broadside, and 30 * pi / sqrt(er) for the edgewise K-ratio prefactor (eta0/2, eta0*pi/4 and eta0/4 rounded)"
+  },
+  "printed_constants": {"broadside_even": 188.3, "broadside_odd": 296.1, "edge_prefactor": "30*pi"},
+  "er": {
+    "_source": "not printed in the note: the Rogers data-sheet Dk of each laminate (RT/duroid 5880 2.20, 5870 2.33, 6002 2.94, 6006 6.15, 6010 10.2; TMM 3 3.27, TMM 4 4.50, TMM 6 6.00, TMM 10 9.20). The 5880/5870 rows share their geometry, and their printed Z0 ratio (9.83 / 9.55, 68.53 / 66.59) equals sqrt(2.33 / 2.20)",
+    "5880": 2.20,
+    "5870": 2.33,
+    "6002": 2.94,
+    "6006": 6.15,
+    "6010": 10.2,
+    "TMM-3": 3.27,
+    "TMM-4": 4.50,
+    "TMM-6": 6.00,
+    "TMM-10": 9.20
+  },
+  "broadside": [
+    {"substrate": "5880", "outer_board_in": 0.031, "center_board_in": 0.005, "line_width_in": 0.200, "coupling_db": 1.47, "z0_ohm": 9.83},
+    {"substrate": "5870", "outer_board_in": 0.031, "center_board_in": 0.005, "line_width_in": 0.200, "coupling_db": 1.47, "z0_ohm": 9.55},
+    {"substrate": "6002", "outer_board_in": 0.030, "center_board_in": 0.005, "line_width_in": 0.060, "coupling_db": 1.88, "z0_ohm": 23.53},
+    {"substrate": "6006", "outer_board_in": 0.050, "center_board_in": 0.010, "line_width_in": 0.100, "coupling_db": 2.22, "z0_ohm": 17.50},
+    {"substrate": "6010", "outer_board_in": 0.050, "center_board_in": 0.010, "line_width_in": 0.125, "coupling_db": 2.11, "z0_ohm": 11.39},
+    {"substrate": "TMM-3", "outer_board_in": 0.060, "center_board_in": 0.015, "line_width_in": 0.200, "coupling_db": 2.42, "z0_ohm": 17.36},
+    {"substrate": "TMM-4", "outer_board_in": 0.060, "center_board_in": 0.015, "line_width_in": 0.200, "coupling_db": 2.42, "z0_ohm": 14.80},
+    {"substrate": "TMM-6", "outer_board_in": 0.050, "center_board_in": 0.015, "line_width_in": 0.200, "coupling_db": 2.76, "z0_ohm": 11.81},
+    {"substrate": "TMM-10", "outer_board_in": 0.050, "center_board_in": 0.015, "line_width_in": 0.175, "coupling_db": 2.82, "z0_ohm": 10.68}
+  ],
+  "edge": [
+    {"substrate": "5880", "board_in": 0.031, "spacing_in": 0.005, "width_in": 0.025, "coupling_db": 9.74, "z0_ohm": 68.53},
+    {"substrate": "5870", "board_in": 0.031, "spacing_in": 0.005, "width_in": 0.025, "coupling_db": 9.74, "z0_ohm": 66.59},
+    {"substrate": "6002", "board_in": 0.030, "spacing_in": 0.005, "width_in": 0.020, "coupling_db": 9.30, "z0_ohm": 64.96},
+    {"substrate": "6006", "board_in": 0.025, "spacing_in": 0.005, "width_in": 0.015, "coupling_db": 9.65, "z0_ohm": 47.77},
+    {"substrate": "6010", "board_in": 0.025, "spacing_in": 0.005, "width_in": 0.010, "coupling_db": 8.89, "z0_ohm": 43.78},
+    {"substrate": "TMM-3", "board_in": 0.030, "spacing_in": 0.005, "width_in": 0.025, "coupling_db": 9.95, "z0_ohm": 55.47},
+    {"substrate": "TMM-4", "board_in": 0.030, "spacing_in": 0.005, "width_in": 0.020, "coupling_db": 9.30, "z0_ohm": 52.50},
+    {"substrate": "TMM-6", "board_in": 0.025, "spacing_in": 0.005, "width_in": 0.015, "coupling_db": 9.65, "z0_ohm": 48.36},
+    {"substrate": "TMM-10", "board_in": 0.025, "spacing_in": 0.005, "width_in": 0.010, "coupling_db": 8.89, "z0_ohm": 46.10}
+  ]
+}

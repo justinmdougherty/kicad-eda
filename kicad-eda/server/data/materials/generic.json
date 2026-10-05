@@ -1,0 +1,21 @@
+{
+  "schema": "kicad-eda/materials@1",
+  "retrieved": "2026-10-04",
+  "note": "Generic materials for designs that name no laminate. Labelled typical.",
+  "materials": {
+    "generic.fr4": {
+      "vendor": "generic", "product": "FR-4", "family": "fr4", "category": "fr4",
+      "forms": ["core", "prepreg"], "ptfe": false, "process": "fr4",
+      "dk": [
+        {"value": 4.5, "freq_hz": 1e9, "basis": "typical", "freq_assumed": true, "note": "JLCPCB's 2-layer FR-4 Dk and KiCad's FR4 default; neither states a frequency (1 GHz assumed)", "source": "https://jlcpcb.com/capabilities/pcb-capabilities"}
+      ],
+      "df": [
+        {"value": 0.02, "freq_hz": 1e9, "basis": "typical", "freq_assumed": true, "note": "KiCad's FR4 default loss tangent; no frequency stated (1 GHz assumed)", "source": "https://gitlab.com/kicad/code/kicad/-/blob/9.0/pcbnew/board_stackup_manager/dielectric_material.cpp"}
+      ],
+      "sources": [
+        {"title": "JLCPCB PCB capabilities: FR-4 dielectric constant 4.5 (2-layer PCB) (fetched 2026-10-04)", "url": "https://jlcpcb.com/capabilities/pcb-capabilities"},
+        {"title": "KiCad 9.0 dielectric_material.cpp: FR4 4.5 / 0.02", "url": "https://gitlab.com/kicad/code/kicad/-/blob/9.0/pcbnew/board_stackup_manager/dielectric_material.cpp"}
+      ]
+    }
+  }
+}

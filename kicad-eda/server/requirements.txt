@@ -14,3 +14,14 @@ typing_extensions>=4.13.2
 # Venv only: KiCad's bundled Python does not have it, so SWIG scripts get the
 # outline as normalised JSON loops, never as DXF (ROADMAP_DECISIONS D2).
 ezdxf==1.4.4
+# D7 field-solver tier (server/tools/fieldsolve2d.py, ADR D7.6): scipy SuperLU,
+# else a numpy-only PCG about 34x slower. fieldsolve2d imports them lazily: with
+# neither, the impedance flow uses the closed forms (class C -> fallback_unverified).
+# numpy 2.5 / scipy 1.18 need Python >= 3.12 (CI and dev venv 3.12, Docker 3.13);
+# the plugin supports 3.10+, so 3.10 / 3.11 get the last releases with their wheels
+# (an unsatisfiable pin would fail the whole install and stop the MCP server).
+# numpy is also ezdxf's dependency; one pin of each applies per Python.
+numpy==2.5.3; python_version >= "3.12"
+scipy==1.18.1; python_version >= "3.12"
+numpy==2.2.6; python_version < "3.12"
+scipy==1.15.3; python_version < "3.12"

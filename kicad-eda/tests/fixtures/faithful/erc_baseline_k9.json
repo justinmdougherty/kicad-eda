@@ -1,0 +1,60 @@
+{
+    "$schema": "https://schemas.kicad.org/erc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-10-05T03:15:29-0400",
+    "kicad_version": "9.0.4",
+    "sheets": [
+        {
+            "path": "/",
+            "uuid_path": "/28f865a0-4433-4a53-bbd7-b62f276848e4",
+            "violations": [
+                {
+                    "description": "Unconnected wire endpoint",
+                    "items": [
+                        {
+                            "description": "Horizontal Wire, length 0.0254 mm",
+                            "pos": {
+                                "x": 1.9812,
+                                "y": 0.8128
+                            },
+                            "uuid": "10537025-ad57-4a68-a3ad-97783b6e906f"
+                        }
+                    ],
+                    "severity": "warning",
+                    "type": "unconnected_wire_endpoint"
+                },
+                {
+                    "description": "Pin not connected",
+                    "items": [
+                        {
+                            "description": "Symbol #PWR01 Hidden pin 1 [GND, Power input, Line]",
+                            "pos": {
+                                "x": 1.9558,
+                                "y": 0.8382
+                            },
+                            "uuid": "ffd8d9c0-407c-42f3-9854-4c5baebeb6bc"
+                        }
+                    ],
+                    "severity": "error",
+                    "type": "pin_not_connected"
+                },
+                {
+                    "description": "Pin not connected",
+                    "items": [
+                        {
+                            "description": "Symbol P2 Pin 2 [PM, Passive, Inverted]",
+                            "pos": {
+                                "x": 1.9812,
+                                "y": 0.8128
+                            },
+                            "uuid": "0a09657c-35de-4de7-9dfe-7d3a0d792dc3"
+                        }
+                    ],
+                    "severity": "error",
+                    "type": "pin_not_connected"
+                }
+            ]
+        }
+    ],
+    "source": "ecc83-pp.kicad_sch"
+}

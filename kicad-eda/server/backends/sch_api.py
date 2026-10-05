@@ -32,6 +32,7 @@ which was verified against KiCad's own netlist.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Iterable
 
@@ -43,13 +44,17 @@ from backends import sch_items as items
 from backends import sch_session as sess
 from backends.errors import PinNotFoundError, SchematicApiError
 
+if str(env.TOOLS_DIR) not in sys.path:      # server/tools holds libtable (stdlib-only)
+    sys.path.insert(0, str(env.TOOLS_DIR))
+import libtable  # noqa: E402
+
 __all__ = ["SchematicApi", "SchematicApiError", "PinNotFoundError", "build_from_netlist",
            "BACKEND", "PWR_FLAG_LIB_ID"]
 
 BACKEND = "api"
 SCH_SUFFIX = ".kicad_sch"
 POWER_LIB = "power"
-PWR_FLAG_LIB_ID = "power:PWR_FLAG"
+PWR_FLAG_LIB_ID = f"{libtable.POWER_LIBRARY}:PWR_FLAG"
 POWER_REF_PREFIX = "#PWR"
 FLAG_REF_PREFIX = "#FLG"
 Point = tuple[float, float]
@@ -99,6 +104,7 @@ class SchematicApi:
         self._pending: dict[tuple[str, int], tuple[str, str]] = {}   # (ref, unit) -> fields
         self._closed = False              # this object: no further operations
         self._document_closed = False     # the headless document was closed already
+        self.netlist_warnings: list[str] = []    # pins the last netlist() left out
 
     # --- availability -------------------------------------------------------
     @staticmethod
@@ -244,7 +250,9 @@ class SchematicApi:
             inst = self._sch.place_symbol_from_library(
                 lib_id, kb.vec(x, y), orientation=kb.DEG_TO_ORIENT[deg], unit=unit, reference=ref)
         except kb.KIPY_EXCEPTIONS as exc:
-            hint = f"; {sess.LIB_TABLE_HINT}" if "not found" in str(exc).lower() else ""
+            hint = ("; " + sess.library_hint(Path(self._path).parent,
+                                             self._session.global_tables_missing)
+                    if "not found" in str(exc).lower() else "")
             raise SchematicApiError(f"placing {lib_id} as {ref}: {exc}{hint}") from exc
         self._remember(inst)
         out = items.symbol_dict(inst, with_pins=True)
@@ -268,7 +276,8 @@ class SchematicApi:
         for (ref, unit), (value, footprint) in pending.items():
             inst = next((i for i in self._instances_of(ref) if i.unit == unit), None)
             if inst is None:
-                raise SchematicApiError(f"cannot set fields of {ref} unit {unit}: it is no longer placed")
+                raise SchematicApiError(
+                    f"cannot set fields of {ref} unit {unit}: it is no longer placed")
             self._remember(self._set_fields(inst, value, footprint))
         return len(pending)
 
@@ -318,7 +327,8 @@ class SchematicApi:
         b = self.pin_xy(ref_b, pin_b)
         segments = geo.route(a, b)
         if not segments:
-            raise SchematicApiError(f"{ref_a}.{pin_a} and {ref_b}.{pin_b} sit on the same point {a}")
+            raise SchematicApiError(
+                f"{ref_a}.{pin_a} and {ref_b}.{pin_b} sit on the same point {a}")
         self._create([items.wire_item(*seg) for seg in segments])
         return {"from": {"ref": ref_a, "pin": str(pin_a), "x_mm": a[0], "y_mm": a[1]},
                 "to": {"ref": ref_b, "pin": str(pin_b), "x_mm": b[0], "y_mm": b[1]},
@@ -433,15 +443,22 @@ class SchematicApi:
                 "footprint": footprint or symbol["footprint"]}
 
     def netlist(self) -> dict[str, list[list[str]]]:
-        """{net: [[ref, pin], ...]} from KiCad's connectivity (leading '/' stripped)."""
+        """{net: [[ref, pin], ...]} from KiCad's connectivity (leading '/' stripped).
+        Pins are matched by (sheet path, KIID): the instances of a reused sheet
+        share their pins' KIIDs, each has its own references. A pin that cannot
+        be attributed is left out and named in ``netlist_warnings`` (refreshed
+        by every call, read by the schematic_netlist tool)."""
         self._cache = None
         pins = items.pin_map(self._instances())
+        by_kiid = items.kiid_index(pins)
         nets = self._call("reading the netlist", self._sch.get_netlist)
         out: dict[str, list[list[str]]] = {}
+        warnings: list[str] = []
         for net in nets:
             name = net.name[1:] if net.name.startswith("/") else net.name
-            ids = [kiid.value for sheet in net.sheets for kiid in sheet.items]
-            out[name] = sorted(list(pins[kiid]) for kiid in ids if kiid in pins)
+            out[name], notes = items.net_members(net, name, pins, by_kiid)
+            warnings.extend(notes)
+        self.netlist_warnings = warnings
         return dict(sorted(out.items()))
 
     def labels(self) -> list[dict]:
@@ -552,8 +569,10 @@ class SchematicApi:
         return found
 
     def _remember(self, inst) -> None:
-        ident = inst.id.value
-        self._cache = [i for i in self._instances() if i.id.value != ident] + [inst]
+        """Replace the cached copy of ``inst``: by (sheet path, KIID), since the
+        instances of a reused sheet share the symbol's KIID."""
+        key = items.instance_key(inst)
+        self._cache = [i for i in self._instances() if items.instance_key(i) != key] + [inst]
 
     def _resolve_pin(self, ref: str, pin: str, unit: int | None = None) -> tuple:
         """(instance, SchematicPin) for a pin number or name, on the placement
@@ -571,7 +590,8 @@ class SchematicApi:
         if unit is not None:
             match = [(inst, p) for inst, p, _u in found if inst.unit == unit]
             if not match:
-                raise PinNotFoundError(f"{ref} unit {unit} is not placed (placed units: {placed_units})")
+                raise PinNotFoundError(
+                    f"{ref} unit {unit} is not placed (placed units: {placed_units})")
             return match[0]
         owners = [(inst, p) for inst, p, u in found if items.owns_pin(inst, u)]
         if not owners:

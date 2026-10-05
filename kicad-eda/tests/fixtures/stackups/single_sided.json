@@ -1,0 +1,25 @@
+{
+  "description": "ADR D7.2.6 single-sided: copper_layers 1 is a KiCad 2-layer board (generic:2L-1.6 geometry) with B.Cu role unused; through-hole parts on side B are allowed",
+  "design": {
+    "name": "single_sided",
+    "copper_layers": 1,
+    "components": [
+      {"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+       "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"},
+      {"ref": "R1", "lib_id": "Device:R", "side": "B",
+       "footprint": "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal"}],
+    "nets": {"GND": [["J1", "1"], ["R1", "1"]], "+5V": [["J1", "2"]], "SIG": [["J1", "3"], ["R1", "2"]]}
+  },
+  "expect": {
+    "source": "default",
+    "fab": "jlcpcb",
+    "copper_layers": 1,
+    "kicad_copper_count": 2,
+    "thickness": 1.641,
+    "gbrjob_rows": 5,
+    "roles": [["F.Cu", "signal", null], ["B.Cu", "unused", null]],
+    "mask_source": "fab",
+    "issues": [],
+    "drafts": 0
+  }
+}

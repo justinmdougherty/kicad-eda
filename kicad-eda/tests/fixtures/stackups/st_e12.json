@@ -1,0 +1,13 @@
+{
+  "description": "ST-E12: an SMD part on side B of a single-sided board",
+  "design": {
+    "name": "st_e12",
+    "copper_layers": 1,
+    "components": [
+      {"ref": "J1", "lib_id": "Connector_Generic:Conn_01x02",
+       "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"},
+      {"ref": "R1", "lib_id": "Device:R", "side": "B", "footprint": "Resistor_SMD:R_0603_1608Metric"}],
+    "nets": {"GND": [["J1", "1"], ["R1", "1"]], "SIG": [["J1", "2"], ["R1", "2"]]}
+  },
+  "expect": {"error": "ST-E12", "path": "$.components[1].side"}
+}

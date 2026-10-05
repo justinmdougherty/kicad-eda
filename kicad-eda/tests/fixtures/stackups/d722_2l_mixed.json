@@ -1,0 +1,25 @@
+{
+  "description": "ADR D7.2.2 example: 2L 1.6 mm FR-4 (generic:2L-1.6 geometry), B.Cu mixed GND (LoRa node, CPWG on F.Cu)",
+  "design": {
+    "name": "d722_2l_mixed",
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]], "SIG": [["J1", "3"]]},
+    "stackup": {"fab": "jlcpcb", "finish": "ENIG", "rationale": "2L: one RF feed, low density", "layers": [
+      {"type": "copper", "oz": 1, "role": "signal"},
+      {"type": "dielectric", "kind": "core", "material": "generic.fr4", "thickness": 1.51, "dk": 4.5},
+      {"type": "copper", "oz": 1, "role": "mixed", "net": "GND"}]}
+  },
+  "expect": {
+    "source": "layers",
+    "fab": "jlcpcb",
+    "copper_layers": 2,
+    "kicad_copper_count": 2,
+    "thickness": 1.641,
+    "gbrjob_rows": 5,
+    "roles": [["F.Cu", "signal", null], ["B.Cu", "mixed", "GND"]],
+    "mask_source": "fab",
+    "issues": [],
+    "drafts": 0
+  }
+}

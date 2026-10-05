@@ -1,0 +1,133 @@
+{
+    "$schema": "https://schemas.kicad.org/drc.v1.json",
+    "coordinate_units": "mm",
+    "kicad_version": "synthetic: item descriptions in the KiCad 9.0.4 formats",
+    "source": "synthetic.kicad_pcb",
+    "schematic_parity": [],
+    "unconnected_items": [
+        {
+            "description": "Missing connection between items",
+            "items": [
+                {"description": "Pad 1 [N1] of R1 on F.Cu", "pos": {"x": 10.0, "y": 10.0}, "uuid": "u-01"},
+                {"description": "Track [N1] on F.Cu, length 1.0000 mm", "pos": {"x": 12.0, "y": 10.0}, "uuid": "u-02"}
+            ],
+            "severity": "error",
+            "type": "unconnected_items"
+        },
+        {
+            "description": "Missing connection between items",
+            "items": [
+                {"description": "Pad 2 [N2] of R1 on F.Cu", "pos": {"x": 11.0, "y": 10.0}, "uuid": "u-03"},
+                {"description": "Pad 1 [N2] of R2 on F.Cu", "pos": {"x": 14.0, "y": 10.0}, "uuid": "u-04"}
+            ],
+            "severity": "error",
+            "type": "unconnected_items"
+        }
+    ],
+    "violations": [
+        {
+            "description": "Clearance violation (netclass 'Default' clearance 0.2000 mm; actual 0.1000 mm)",
+            "items": [
+                {"description": "Via [GND] on F.Cu - B.Cu", "pos": {"x": 1.0, "y": 1.0}, "uuid": "v-01"},
+                {"description": "Pad 1 [VCC] of U1 on F.Cu", "pos": {"x": 1.2, "y": 1.0}, "uuid": "v-02"}
+            ],
+            "severity": "error",
+            "type": "clearance"
+        },
+        {
+            "description": "Clearance violation (netclass 'Default' clearance 0.2000 mm; actual 0.1500 mm)",
+            "items": [
+                {"description": "Zone [GND] on B.Cu, priority 0", "pos": {"x": 2.0, "y": 2.0}, "uuid": "v-03"},
+                {"description": "PTH pad 1 [VCC] of J1", "pos": {"x": 2.1, "y": 2.0}, "uuid": "v-04"}
+            ],
+            "severity": "error",
+            "type": "clearance"
+        },
+        {
+            "description": "Board edge clearance violation (board setup constraints edge clearance 0.5000 mm; actual 0.3000 mm)",
+            "items": [
+                {"description": "Arc on Edge.Cuts", "pos": {"x": 0.0, "y": 3.0}, "uuid": "v-05"},
+                {"description": "Track (arc) [SIG] on F.Cu, length 2.0000 mm", "pos": {"x": 0.3, "y": 3.0}, "uuid": "v-06"}
+            ],
+            "severity": "error",
+            "type": "copper_edge_clearance"
+        },
+        {
+            "description": "Board edge clearance violation (board setup constraints edge clearance 0.5000 mm; actual 0.2000 mm)",
+            "items": [
+                {"description": "Segment on Edge.Cuts", "pos": {"x": 0.0, "y": 5.0}, "uuid": "v-07"},
+                {"description": "Pad 2 [SIG] of J1 on F.Cu", "pos": {"x": 0.2, "y": 5.0}, "uuid": "v-08"}
+            ],
+            "severity": "error",
+            "type": "copper_edge_clearance"
+        },
+        {
+            "description": "Board has malformed outline (self-intersecting outline)",
+            "items": [
+                {"description": "Segment on Edge.Cuts", "pos": {"x": 0.0, "y": 6.0}, "uuid": "v-09"},
+                {"description": "Rectangle on Edge.Cuts", "pos": {"x": 0.0, "y": 7.0}, "uuid": "v-10"}
+            ],
+            "severity": "error",
+            "type": "invalid_outline"
+        },
+        {
+            "description": "Hole clearance violation (board setup constraints hole clearance 0.2500 mm; actual 0.1000 mm)",
+            "items": [
+                {"description": "NPTH pad of H1", "pos": {"x": 8.0, "y": 8.0}, "uuid": "v-11"},
+                {"description": "Pad 1 [GND] of U1 on F.Cu", "pos": {"x": 8.1, "y": 8.0}, "uuid": "v-12"}
+            ],
+            "severity": "error",
+            "type": "hole_clearance"
+        },
+        {
+            "description": "Items shorting two nets (nets A and B)",
+            "items": [
+                {"description": "Pad 1 [A] of JP2 on F.Cu", "pos": {"x": 9.0, "y": 9.0}, "uuid": "v-13"},
+                {"description": "Pad 2 [B] of JP2 on F.Cu", "pos": {"x": 9.5, "y": 9.0}, "uuid": "v-14"}
+            ],
+            "severity": "error",
+            "type": "shorting_items"
+        },
+        {
+            "description": "Clearance violation (netclass 'Default' clearance 0.2000 mm; actual 0.0500 mm)",
+            "items": [
+                {"description": "Segment [GND] on F.Cu", "pos": {"x": 10.0, "y": 1.0}, "uuid": "v-15"},
+                {"description": "Pad 1 [VCC] of U1 on F.Cu", "pos": {"x": 10.1, "y": 1.0}, "uuid": "v-16"}
+            ],
+            "severity": "error",
+            "type": "clearance"
+        },
+        {
+            "description": "Items not allowed (footprint in rule area 'ANT')",
+            "items": [
+                {"description": "Rule Area 'ANT' on F.Cu, B.Cu", "pos": {"x": 11.0, "y": 1.0}, "uuid": "v-17"},
+                {"description": "Footprint U3", "pos": {"x": 11.5, "y": 1.0}, "uuid": "v-18"}
+            ],
+            "severity": "error",
+            "type": "items_not_allowed"
+        },
+        {
+            "description": "Text height out of range",
+            "items": [
+                {"description": "Text 'made of R1' on F.Silkscreen", "pos": {"x": 12.0, "y": 1.0}, "uuid": "v-19"}
+            ],
+            "severity": "warning",
+            "type": "text_height"
+        },
+        {
+            "description": "An item this classifier has never seen",
+            "items": [
+                {"description": "Mystery item", "pos": {"x": 13.0, "y": 1.0}, "uuid": "v-20"},
+                {"description": "Footprint U1", "pos": {"x": 13.5, "y": 1.0}, "uuid": "v-21"}
+            ],
+            "severity": "error",
+            "type": "mystery"
+        },
+        {
+            "description": "A violation without items",
+            "items": [],
+            "severity": "error",
+            "type": "malformed_courtyard"
+        }
+    ]
+}

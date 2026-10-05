@@ -1,0 +1,24 @@
+{
+  "description": "ADR D7.2.2 (a) legacy shorthand {h, er} (rf_coupon_50r style): 4 copper layers with the D7.2.4 default roles, both outer dielectrics one unmasked ply of h / er (t defaults to 0.035 mm), the rest of the JLC04161H-7628 default geometry; no rail in the design, so In2 is GND (M7); ST-W7",
+  "design": {
+    "name": "legacy",
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"}],
+    "nets": {"RF_IN": [["J1", "1"]], "RF_OUT": [["J1", "2"]], "GND": [["J1", "3"]]},
+    "net_specs": {"RF_IN": {"impedance": 50}, "RF_OUT": {"impedance": 50}},
+    "stackup": {"h": 0.2, "er": 4.2}
+  },
+  "expect": {
+    "source": "legacy",
+    "fab": null,
+    "copper_layers": 4,
+    "kicad_copper_count": 4,
+    "thickness": 1.5654,
+    "gbrjob_rows": 9,
+    "roles": [["F.Cu", "signal", null], ["In1.Cu", "plane", "GND"], ["In2.Cu", "plane", "GND"],
+              ["B.Cu", "signal", null]],
+    "mask_source": "none",
+    "issues": ["ST-W7"],
+    "drafts": 2
+  }
+}

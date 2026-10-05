@@ -43,6 +43,13 @@ every run.
 - `kipy/kicad_api_version.py` is `"unknown"`: there is no KiCad submodule to
   `git describe`, and `"unknown"` makes `KiCad.check_version()` a no-op instead
   of raising `FutureVersionError` against the nightly.
+- `kipy/kicad.py`: `KiCad.reload_library` rejects `LTS_BOTH` by checking
+  `scope` (upstream checks `type`; `LT_DESIGN_BLOCK == LTS_BOTH == 3`, so a
+  design-block reload was refused and `scope=LTS_BOTH` reached KiCad
+  unvalidated). This and every other local source fix is a `SourcePatch` in
+  `update_kipy.KIPY_PATCHES` (`server/tools/update_kipy.py`), re-applied on
+  every refresh; a fix that no longer applies because upstream changed the
+  code stops the refresh instead of being dropped silently.
 - `__pycache__`, `build/`, `dist/` and egg-info are not copied.
 
 ### Regenerating

@@ -1,0 +1,15 @@
+{
+  "description": "ST-E1: copper/dielectric not alternating (two copper layers in a row)",
+  "design": {
+    "name": "st_e1",
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x02",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]]},
+    "stackup": {"layers": [
+      {"type": "copper", "oz": 1, "role": "signal"},
+      {"type": "copper", "oz": 1, "role": "plane", "net": "GND"},
+      {"type": "dielectric", "kind": "core", "material": "generic.fr4", "thickness": 1.5},
+      {"type": "copper", "oz": 1, "role": "signal"}]}
+  },
+  "expect": {"error": "ST-E1", "path": "$.stackup.layers[1]"}
+}

@@ -1,0 +1,65 @@
+{
+  "schema": "kicad-eda/fabs@1",
+  "id": "oshpark",
+  "name": "OSH Park",
+  "retrieved": "2026-10-04",
+  "sources": [
+    {"title": "OSH Park 2 layer prototype service (fetched 2026-10-04)", "url": "https://docs.oshpark.com/services/two-layer/"},
+    {"title": "OSH Park 4 layer prototype service (fetched 2026-10-04)", "url": "https://docs.oshpark.com/services/four-layer/"},
+    {"title": "OSH Park 6 layer prototype service (fetched 2026-10-04)", "url": "https://docs.oshpark.com/services/six-layer/"}
+  ],
+  "capabilities": {
+    "layer_counts": [2, 4, 6],
+    "impedance_layer_counts": null,
+    "impedance_tolerance_pct": null,
+    "impedance_note": "no controlled-impedance tolerance stated; the stackup pages publish Dk for design",
+    "thicknesses_mm": [1.6],
+    "thickness_note": "1.6 mm nominal; a 2 oz 0.8 mm 2-layer service exists",
+    "thickness_tolerance": null,
+    "outer_cu_oz": [1],
+    "inner_cu_oz": [0.5],
+    "min_track_mm": {"2": 0.1524, "4-6": 0.127},
+    "min_clearance_mm": {"2": 0.1524, "4-6": 0.127},
+    "materials": ["isola.fr408hr", "generic.fr4"],
+    "materials_note": "4/6 layers FR408HR; 2 layers Kingboard KB6167F 175Tg FR-4 (Dk 4.5 at 10 MHz), represented by generic.fr4",
+    "rf": null,
+    "hybrid": false,
+    "ptfe_multilayer": false
+  },
+  "soldermask": {
+    "material": "lpi", "over_substrate": 0.0152, "over_trace": 0.0152, "between_traces": 0.0152, "dk": 3.8,
+    "dk_basis": "typical",
+    "published": "solder resist 0.6 mil (0.0152 mm) +/- 0.2 mil, one value for the whole coat; no Er published (generic LPI 3.8, typical)",
+    "source": "https://docs.oshpark.com/services/four-layer/"
+  },
+  "dk_basis": "fab",
+  "default_templates": {"by_count": {"4": "4L", "6": "6L"}},
+  "templates": {
+    "4L": {
+      "copper_layers": 4, "thickness_mm": 1.6, "outer_oz": 1, "inner_oz": 0.5,
+      "default_roles": ["signal", "plane", "plane", "signal"],
+      "note": "FR408HR 2113 prepreg 0.1999 +/- 0.0202 (Dk 3.61 at 1 GHz), core 0.9906 +/- 0.0991 (no Dk published); 1 oz clad+plated outer copper 0.0432",
+      "source": "https://docs.oshpark.com/services/four-layer/",
+      "stack": [
+        {"cu": 0.0432, "oz": 1}, {"pp": "isola.fr408hr", "c": "2113", "t": 0.1999},
+        {"cu": 0.0175, "oz": 0.5}, {"core": "isola.fr408hr", "c": "core", "t": 0.9906},
+        {"cu": 0.0175, "oz": 0.5}, {"pp": "isola.fr408hr", "c": "2113", "t": 0.1999},
+        {"cu": 0.0432, "oz": 1}
+      ]
+    },
+    "6L": {
+      "copper_layers": 6, "thickness_mm": 1.6, "outer_oz": 1, "inner_oz": 0.5,
+      "default_roles": ["signal", "plane", "signal", "signal", "plane", "signal"],
+      "note": "FR408HR 106 75% prepreg 0.1107 (Dk 3.23 at 1 GHz), 2113 cores 0.1016 (Dk 3.66 at 1 GHz), centre core 0.9256 (no Dk published)",
+      "source": "https://docs.oshpark.com/services/six-layer/",
+      "stack": [
+        {"cu": 0.0432, "oz": 1}, {"pp": "isola.fr408hr", "c": "106", "t": 0.1107},
+        {"cu": 0.0175, "oz": 0.5}, {"core": "isola.fr408hr", "c": "2113", "t": 0.1016},
+        {"cu": 0.0175, "oz": 0.5}, {"core": "isola.fr408hr", "c": "core", "t": 0.9256},
+        {"cu": 0.0175, "oz": 0.5}, {"core": "isola.fr408hr", "c": "2113", "t": 0.1016},
+        {"cu": 0.0175, "oz": 0.5}, {"pp": "isola.fr408hr", "c": "106", "t": 0.1107},
+        {"cu": 0.0432, "oz": 1}
+      ]
+    }
+  }
+}

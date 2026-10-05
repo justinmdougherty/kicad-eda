@@ -36,16 +36,41 @@ _ARRAY_THRESHOLD = 4
 _PULL_HINTS = ("SDA", "SCL", "I2C", "NRST", "RESET", "BOOT")
 # a pin the symbol itself marks no-connect/unconnected is intentionally open
 _NC_TYPES = {"no_connect", "unconnected", "free", "not_connected"}
+# pin names that carry no name (KiCad's "~")
+_ANON_PIN_NAMES = ("~", "")
 
 
 class DesignReportError(Exception):
     """The netlist is malformed in a way the report cannot work around."""
 
 
-def _pin_types(design: dict, symbols_dir: str) -> tuple[dict, dict, list]:
-    """({ref: {pad_num: electrical_type}}, {ref: {pin_name: pad_num}}, errors)
-    from the KiCad symbols. The alias map lets a netlist that keys pads by pin
-    NAME ("V+") resolve to the NUMBER the type map is keyed by.
+def _pin_names(flat: list) -> dict:
+    """{pin number: pin name} over every unit of a flattened symbol, anonymous
+    names left out. Unlike the alias map (first name wins), every STACKED pin
+    keeps its shared name (D1: the LG290P's GND pads)."""
+    names = {}
+    for sub in symlib.kids(flat, "symbol"):
+        for pin in symlib.kids(sub, "pin"):
+            num, name = symlib.first(pin, "number"), symlib.first(pin, "name")
+            if (num is not None and name is not None and isinstance(name[1], str)
+                    and name[1] not in _ANON_PIN_NAMES):
+                names[str(num[1])] = name[1]
+    return names
+
+
+def _symbol_maps(flat: list) -> tuple[dict, dict, dict]:
+    """(types, aliases, names) of one flattened symbol: {pad_num: electrical
+    type}, {pin_name: pad_num} (first name wins) and {pad_num: pin_name}."""
+    aliases = {k: v["number"] for k, v in symlib.pin_offsets(flat).items()
+               if v.get("number") and k != v["number"]}
+    return symlib.pin_etypes(flat), aliases, _pin_names(flat)
+
+
+def _pin_types(design: dict, symbols_dir: str) -> tuple[dict, dict, dict, list]:
+    """({ref: {pad_num: electrical_type}}, {ref: {pin_name: pad_num}},
+    {ref: {pad_num: pin_name}}, errors) from the KiCad symbols. The alias map
+    lets a netlist that keys pads by pin NAME ("V+") resolve to the NUMBER the
+    type map is keyed by; the name map names every pin (stacked ones too).
 
     An empty symbols_dir yields an empty map and no errors (the caller chose
     not to supply symbols; the report marks symbols_available False). A symbol
@@ -58,9 +83,10 @@ def _pin_types(design: dict, symbols_dir: str) -> tuple[dict, dict, list]:
     Raises DesignReportError only when ``components`` is not a list of dicts."""
     out: dict = {}
     aliases: dict = {}
+    names: dict = {}
     errors: list = []
     if not symbols_dir:
-        return out, aliases, errors
+        return out, aliases, names, errors
     comps = design.get("components", [])
     if not isinstance(comps, list) or not all(isinstance(c, dict) for c in comps):
         raise DesignReportError("netlist 'components' must be a list of objects")
@@ -78,16 +104,15 @@ def _pin_types(design: dict, symbols_dir: str) -> tuple[dict, dict, list]:
         lib, _, name = lib_id.partition(":")
         try:
             flat = symlib.flatten(cache, symbols_dir, lib, name)
-            out[ref] = symlib.pin_etypes(flat)
-            aliases[ref] = {k: v["number"] for k, v in symlib.pin_offsets(flat).items()
-                            if v.get("number") and k != v["number"]}
+            out[ref], aliases[ref], names[ref] = _symbol_maps(flat)
         except (symlib.SymbolLibError, ValueError, IndexError, TypeError) as e:
-            out.pop(ref, None)
+            for m in (out, aliases, names):
+                m.pop(ref, None)
             failed[lib_id] = (f"{type(e).__name__}: {e}", [ref])
     for lib_id, (reason, refs) in failed.items():
         errors.append(f"pin types unavailable for {lib_id} "
                       f"({', '.join(refs)}): {reason}")
-    return out, aliases, errors
+    return out, aliases, names, errors
 
 
 def _canon(aliases: dict, ref: str, pad) -> str:
@@ -100,10 +125,44 @@ def _prefix(ref: str) -> str:
     return "".join(ch for ch in ref if ch.isalpha())
 
 
+def _same_name_net(ref: str, pad: str, name: str | None, pin_names: dict,
+                   net_of: dict) -> str | None:
+    """The one net the OTHER pins named ``name`` on ``ref`` sit on, else None
+    (no such pin netted, or they disagree)."""
+    if name is None:
+        return None
+    nets = {net_of[(ref, n)] for n, nm in pin_names.items()
+            if nm == name and n != pad and (ref, n) in net_of}
+    return next(iter(nets)) if len(nets) == 1 else None
+
+
+def _floating(comps: list, ptypes: dict, names: dict, net_of: dict,
+              no_connect: set) -> tuple[list, list]:
+    """(floating_pins, floating_detail), both sorted by "<ref>.<pad>": pins
+    neither netted, nor declared no_connect, nor typed no-connect by the
+    symbol. A detail entry is {pin, ref, pad, type, name, same_name_net,
+    lib_id, footprint} (the napkin floating-pin policy's input, D5)."""
+    detail = []
+    for c in comps:
+        ref, pin_names = c["ref"], names.get(c["ref"], {})
+        for p, t in ptypes.get(ref, {}).items():
+            pad = str(p)
+            key = (ref, pad)
+            if key in net_of or key in no_connect or t in _NC_TYPES:
+                continue
+            name = pin_names.get(pad)
+            detail.append({"pin": f"{ref}.{p}", "ref": ref, "pad": pad, "type": t,
+                           "name": name,
+                           "same_name_net": _same_name_net(ref, pad, name, pin_names, net_of),
+                           "lib_id": c.get("lib_id"), "footprint": c.get("footprint")})
+    detail.sort(key=lambda d: d["pin"])
+    return [d["pin"] for d in detail], detail
+
+
 def analyze(design: dict, symbols_dir: str = "") -> dict:
     comps = design.get("components", [])
     nets = design.get("nets", {})
-    ptypes, aliases, errors = _pin_types(design, symbols_dir)
+    ptypes, aliases, names, errors = _pin_types(design, symbols_dir)
     net_of = {}                                   # (ref,pad_number) -> net
     for net, conns in nets.items():
         for r, p in conns:
@@ -171,12 +230,7 @@ def analyze(design: dict, symbols_dir: str = "") -> dict:
 
     # --- intent flags: floating pins + missing pulls ---
     no_connect = {(r, _canon(aliases, r, p)) for r, p in design.get("no_connect", [])}
-    floating = []
-    for c in comps:
-        for p, t in ptypes.get(c["ref"], {}).items():
-            key = (c["ref"], str(p))
-            if key not in net_of and key not in no_connect and t not in _NC_TYPES:
-                floating.append(f"{c['ref']}.{p}")
+    floating, floating_detail = _floating(comps, ptypes, names, net_of, no_connect)
     pulls = []
     for net in nets:
         if any(h in net.upper() for h in _PULL_HINTS):
@@ -197,7 +251,8 @@ def analyze(design: dict, symbols_dir: str = "") -> dict:
         "dfa": dfa,
         "decoupling": decoupling,
         "power_tree": rails,
-        "flags": {"floating_pins": sorted(floating),
+        "flags": {"floating_pins": floating,
+                  "floating_detail": floating_detail,
                   "nets_missing_pull": sorted(pulls),
                   "rails_missing_testpoint": sorted(tp_missing)},
         "symbols_available": bool(ptypes and any(ptypes.values())),

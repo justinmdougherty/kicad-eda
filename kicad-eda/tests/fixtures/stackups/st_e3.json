@@ -1,0 +1,14 @@
+{
+  "description": "ST-E3: both 'preset' and 'layers'",
+  "design": {
+    "name": "st_e3",
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x02",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]]},
+    "stackup": {"preset": "jlcpcb:JLC04161H-7628", "layers": [
+      {"type": "copper", "oz": 1, "role": "signal"},
+      {"type": "dielectric", "kind": "core", "material": "generic.fr4", "thickness": 1.51},
+      {"type": "copper", "oz": 1, "role": "mixed", "net": "GND"}]}
+  },
+  "expect": {"error": "ST-E3", "path": "$.stackup"}
+}

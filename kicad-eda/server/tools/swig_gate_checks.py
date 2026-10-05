@@ -425,11 +425,11 @@ def check_routed_widths(board, pro_path, design=None):
     p = Path(pro_path)
     if not p.is_file():
         return issues
-    ns = json.loads(p.read_text(encoding="utf-8")).get("net_settings", {})
-    cls_w = {c.get("name"): c.get("track_width", 0) for c in ns.get("classes", [])}
-    bound = {pt.get("pattern"): pt.get("netclass")
-             for pt in ns.get("netclass_patterns", [])}
-    targets = {net: cls_w.get(cls, 0) for net, cls in bound.items()}
+    import netclass_read
+    classed = netclass_read.net_class_widths(
+        p, nets={t.GetNetname() for t in board.GetTracks()})
+    bound = {net: cls for net, (cls, _w) in classed.items()}
+    targets = {net: w for net, (_cls, w) in classed.items()}
     bound = dict(bound)
     # preroute nets carry no class (their taps route at signal width), but
     # the designer-authored fat path itself must survive the router intact:

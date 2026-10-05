@@ -8,6 +8,10 @@ name: regression
 # Runs in the official KiCad container (kicad-cli + system python3 with the
 # pcbnew SWIG module — exactly what the headless pipeline shells into).
 # Freerouting 1.9.0 ships in the repo; only a JRE is installed here.
+#
+# The KiCad container is pinned by digest (KiCad 10.0.5), the same digest the
+# Dockerfile's FROM uses; bump both together, and only after run_all is ALL PASS
+# on the new image.
 
 on:
   push:
@@ -29,8 +33,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install server requirements + pytest
-        run: pip install -r kicad-eda/server/requirements.txt pytest pytest-cov
+      # requirements-optional.txt holds the optional extras (PyMuPDF for the
+      # vision path's rasterize tests; gerbonara/shapely for the Gerber import
+      # in a later wave). Installed here so those tests run instead of skipping.
+      - name: Install server requirements + optional extras + pytest
+        run: >-
+          pip install
+          -r kicad-eda/server/requirements.txt
+          -r kicad-eda/server/requirements-optional.txt
+          pytest pytest-cov
 
       - name: Unit tests
         working-directory: kicad-eda
@@ -40,7 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150            # dense boards can route for a long time
     container:
-      image: kicad/kicad:10.0
+      # kicad/kicad:10.0 at KiCad 10.0.5 (same digest as the Dockerfile's FROM)
+      image: kicad/kicad:10.0@sha256:182c8005cb775a2c448a4c18681d489f1ff472a761885eba3e08b07e3c0564de
       options: --user root
     steps:
       - uses: actions/checkout@v4
@@ -53,10 +65,39 @@ jobs:
           java -version
           kicad-cli version
 
+      # Mirrors the Dockerfile's /opt/venv (requirements + optional extras), so
+      # the CI suite and `docker run --rm kicad-eda` run the same environment.
       - name: Server venv
         run: |
           python3 -m venv /tmp/venv
-          /tmp/venv/bin/pip install --quiet -r kicad-eda/server/requirements.txt
+          /tmp/venv/bin/pip install --quiet \
+            -r kicad-eda/server/requirements.txt \
+            -r kicad-eda/server/requirements-optional.txt
+
+      # Optional, no step yet (F4a): the cross-pcbnew import test
+      # (kicad-eda/tests/test_kicad_import_live.py,
+      # test_live_one_footprint_on_many_sheets_is_one_library_footprint) extracts
+      # the KiCad 9 format complex_hierarchy demo with this image's pcbnew 10. It
+      # reads $KICAD9_DEMOS, a KiCad 9 share/kicad/demos directory, and skips
+      # cleanly when it is unset. A host mount cannot supply that tree on a
+      # GitHub-hosted runner (the job container starts before any step), so the
+      # step fetches it: the 9.0.4 source tag's demos/ (git is in the image,
+      # about 8 s; identical to an installed 9.0.4 share/kicad/demos).
+      # - name: Cross-pcbnew import test (KiCad 9 demos, pcbnew 10)
+      #   env:
+      #     KICAD9_DEMOS: /tmp/k9/demos
+      #   run: |
+      #     git clone -q --depth 1 --branch 9.0.4 --filter=blob:none --sparse \
+      #       https://gitlab.com/kicad/code/kicad.git /tmp/k9
+      #     git -C /tmp/k9 sparse-checkout set demos
+      #     /tmp/venv/bin/pip install --quiet pytest
+      #     cd kicad-eda && /tmp/venv/bin/python -m pytest -p no:cacheprovider \
+      #       tests/test_kicad_import_live.py -q -rs </dev/null
+      # Locally, mount a KiCad 9 install's demos into the image instead (one command):
+      #   docker run --rm -v "C:\Program Files\KiCad\9.0\share\kicad\demos:/kicad9-demos:ro"
+      #     -e KICAD9_DEMOS=/kicad9-demos --entrypoint sh kicad-eda -c
+      #     "cd /plugin && /opt/venv/bin/python -m pytest -p no:cacheprovider
+      #      tests/test_kicad_import_live.py -q -rs </dev/null"
 
       - name: Run the gated regression suite
         run: /tmp/venv/bin/python kicad-eda/pipeline/run_all.py
@@ -71,3 +112,31 @@ jobs:
             kicad-eda/examples/**/netlist_drc.json
             kicad-eda/examples/**/*.png
           retention-days: 7
+
+  # Placeholder (disabled): determinism regression. F5-17 recommends whether to
+  # enable it; pipeline/determinism_check.py comes from F5-15. To enable, remove
+  # the leading '# ' from the job below (same pinned container as `suite`).
+  # determinism:
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 120
+  #   container:
+  #     image: kicad/kicad:10.0@sha256:182c8005cb775a2c448a4c18681d489f1ff472a761885eba3e08b07e3c0564de
+  #     options: --user root
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Install JRE + venv support
+  #       run: |
+  #         apt-get update
+  #         apt-get install -y --no-install-recommends \
+  #           default-jre python3-venv python3-pip xvfb
+  #     - name: Server venv
+  #       run: |
+  #         python3 -m venv /tmp/venv
+  #         /tmp/venv/bin/pip install --quiet \
+  #           -r kicad-eda/server/requirements.txt \
+  #           -r kicad-eda/server/requirements-optional.txt
+  #     - name: buck_5v3a x5, identical fingerprints / DSN / SES hashes
+  #       working-directory: kicad-eda
+  #       run: >-
+  #         /tmp/venv/bin/python pipeline/determinism_check.py
+  #         examples/buck_5v3a/netlist.json --runs 5 --jobs 2

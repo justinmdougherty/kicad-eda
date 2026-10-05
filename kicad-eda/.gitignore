@@ -8,29 +8,75 @@ server/tools/*.jar.disabled
 server/tools/jre*/
 
 # generated board artifacts (examples/ keeps only netlist.json sources)
-*.erc.json
 *_gerbers/
 *.kicad_sch
 *.kicad_pcb
 *.kicad_pcb.attempt
+*.kicad_pcb.placed
+*.kicad_pcb.preheal
+*.kicad_pcb.alt*
 *.kicad_pro
 *.kicad_prl
 *.dsn
 *.ses
 *_drc.json
+# toolchain.erc_json writes <stem>_erc.json
+*_erc.json
 *.rpt
 *.zip
 examples/**/*.png
 examples/**/*.csv
 ~*.lck
 .venv*/
-# committed KiCad project fixtures (tests/test_kicad_import.py)
-!tests/fixtures/kicad/**/*.kicad_sch
-!tests/fixtures/kicad/**/*.kicad_pcb
-!tests/fixtures/kicad/**/*.kicad_pro
+
+# napkin-mode run artifacts (F5): decision log + its writer lock, review,
+# harness report, route handoff, route cache manifest, design_report Markdown
+*.decisions.jsonl
+*.decisions.jsonl.lock
+*_review.md
+*_pipeline_report.json
+*_route_handoff.json
+*.cache.json
+*_report.md
+
+# project library tables and pin sidecars the pipeline generates next to an
+# example (F2); authored libraries (examples/**/libs/) stay tracked
+examples/**/sym-lib-table
+examples/**/fp-lib-table
+examples/**/pins/
+
+# mechanical artifacts (F3)
+*_mech/
+*.outline.json
+*.step
+*.stp
+
+# stackup / fab artifacts (D7)
+*.stackup.json
+*_stackup.csv
+*_fab_notes.md
+*_ipc2581.xml
+examples/**/*.kicad_dru
+
+# committed fixtures stay trackable whatever the generated-artifact names
+# above match (tests/test_kicad_import.py, D7-03/D7-12b/D7-18a fixtures, the
+# D7-11 DRC canary in server/data/)
+!tests/fixtures/**/*.kicad_sch
+!tests/fixtures/**/*.kicad_pcb
+!tests/fixtures/**/*.kicad_pro
+!tests/fixtures/**/*.kicad_dru
+!tests/fixtures/**/*.json
+!tests/fixtures/**/*.jsonl
+!tests/fixtures/**/*.md
+!tests/fixtures/**/*.csv
+!tests/fixtures/**/*.xml
+!tests/fixtures/**/*.step
+!tests/fixtures/**/*.stp
+!server/data/*.kicad_pcb
+!server/data/*.kicad_pro
 
 # vendored kipy (server/vendor/kipy) ships source + generated *_pb2 only
 server/vendor/**/__pycache__/
 
-# coverage artefacts
-.coverage
+# coverage artefacts (pytest-cov writes .coverage in the directory it runs from)
+**/.coverage

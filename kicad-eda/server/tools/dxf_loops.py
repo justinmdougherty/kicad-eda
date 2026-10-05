@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Closed loops from DXF pieces: duplicates, chaining, gap reports and the
-outer / cutout split. dxf_io's geometry half; it needs no ezdxf.
+"""Closed loops from DXF pieces: duplicates, chaining, gap reports, degenerate
+loops and the outer / cutout split. dxf_io's geometry half; it needs no ezdxf.
 
-Everything is in the DXF frame (mm, Y up). A ``Piece`` is an open run of
-``(x0, y0, x1, y1, bulge)`` edges from one entity; bulges follow outline_geom
-(> 0 = math-CCW). dxf_io.read_dxf_loops runs:
+Everything is in the 2D drawing frame dxf_io picked (mm, Y up; ``frame`` names
+it in messages: "XY" = the DXF origin, or a Fusion sketch frame whose origin is
+the sketch origin). A ``Piece`` is an open run of ``(x0, y0, x1, y1, bulge)``
+edges from one entity; bulges follow outline_geom (> 0 = math-CCW).
+dxf_io.read_dxf_loops runs:
   drop_duplicates  closed pieces and circles repeating an earlier one within
                    ``tol`` (a hole or a whole outline drawn twice) are dropped
                    with a warning;
   chain_pieces     pieces join end to end within ``tol``; a repeated open
                    piece is dropped with a warning; 3+ ends meeting is a branch
                    (DxfOutlineError); chains left open go to
-  gap_error        which lists every gap (distance, both ends, entity handles).
-                   A chain whose own ends pair up across more than export noise
-                   (``export_noise_mm``) is an open path (construction geometry
-                   or a missing edge), and "raise tol" is only advised when
-                   every gap is within that noise.
+  gap_error        which pairs every dangling end (distance, both ends, entity
+                   handles), lists the first ``GAP_LIST_MAX`` and keeps them all
+                   in ``DxfOutlineError.gaps``. A chain whose own ends pair up
+                   across more than export noise (``export_noise_mm``) is an
+                   open path (construction geometry or a missing edge), and
+                   "raise tol" is only advised when every gap is within that noise;
+  drop_degenerate  loops enclosing (almost) nothing (|area| < tol^2 or mean
+                   width < tol, e.g. a hairline ELLIPSE) are dropped with a
+                   warning, so the board model never meets a zero-area cutout.
 dxf_io.read_board_outline then calls classify_loops: outer = largest |area|,
 the rest must be cutouts strictly inside it.
 """
@@ -43,6 +49,8 @@ _BULGE_SAME = 1e-6                 # bulges this close describe the same arc
 # export noise: widening the join tolerance to bridge it would merge real geometry
 _NOISE_TOLS = 50.0                 # join tolerances
 _NOISE_MM = 0.5
+GAP_LIST_MAX = 20                  # gaps / loops / entities spelled out in one message
+_PAIR_REACH_MM = 1.0               # first search radius when pairing dangling ends
 
 Vertex = tuple[float, float, float]
 Edge = tuple[float, float, float, float, float]   # x0, y0, x1, y1, bulge
@@ -58,6 +66,17 @@ def _names(sources: Sequence[str]) -> str:
     return ", ".join(sources[:3]) + more
 
 
+def frame_note(frame: str) -> str:
+    """How messages name the 2D frame their coordinates are in."""
+    return f"frame: {frame}, mm, Y up"
+
+
+def capped(lines: Sequence[str], limit: int = GAP_LIST_MAX) -> list[str]:
+    """The first ``limit`` lines, then '+K more' for the rest."""
+    head = list(lines[:limit])
+    return head + [f"+{len(lines) - limit} more"] if len(lines) > limit else head
+
+
 def export_noise_mm(tol: float) -> float:
     """The widest gap still taken for export noise at join tolerance ``tol``."""
     return max(_NOISE_TOLS * tol, _NOISE_MM)
@@ -65,7 +84,7 @@ def export_noise_mm(tol: float) -> float:
 
 @dataclass(frozen=True)
 class Gap:
-    """Two dangling chain ends, paired nearest-first (DXF frame, mm, Y up).
+    """Two dangling chain ends, paired nearest-first (drawing frame, mm, Y up).
     ``open_path`` names the entities of one open chain whose own two ends
     pair up across more than export noise: a stray path, not a joint."""
     distance: float
@@ -123,6 +142,10 @@ class Loop:
         """Closed polyline (last point not repeated), arcs within ``chord_tol``."""
         return [q for p in self.prims() for q in flatten_prim(p, chord_tol)]
 
+    def length(self) -> float:
+        """Perimeter, arcs measured along the arc."""
+        return sum(p.length for p in self.prims())
+
 
 def circle_loop(cx: float, cy: float, r: float, source: str) -> Loop:
     return Loop(((cx - r, cy, 1.0), (cx + r, cy, 1.0)), (source,), (cx, cy, r))
@@ -131,6 +154,66 @@ def circle_loop(cx: float, cy: float, r: float, source: str) -> Loop:
 def describe(loop: Loop) -> str:
     x0, y0, x1, y1 = loop.bbox()
     return f"loop {fmt((x0, y0))}-{fmt((x1, y1))} mm [{_names(loop.sources)}]"
+
+
+def drop_degenerate(loops: Sequence[Loop], tol: float, warnings: list[str]) -> list[Loop]:
+    """``loops`` without those enclosing (almost) nothing, each dropped with a
+    warning: |area| < tol^2, or a mean width 2 |area| / perimeter (the width
+    of a thin sliver; the radius of a circle) < tol. An ELLIPSE with a 1e-10
+    axis ratio is a 7e-9 mm^2 'cutout' the board model would refuse."""
+    kept: list[Loop] = []
+    for loop in loops:
+        area = abs(loop.area)
+        width = 2.0 * area / max(loop.length(), _EPS)
+        if area < tol * tol or width < tol:
+            warnings.append(f"ignored degenerate {describe(loop)}: area {area:.3g} mm^2, mean "
+                            f"width {width:.3g} mm (below the {tol:g} mm join tolerance)")
+        else:
+            kept.append(loop)
+    return kept
+
+
+# --- value checks and cutout hints --------------------------------------------------------
+MAX_COORD_MM = 1e6                 # |coordinate|, radius or arc height beyond 1 km: corrupt
+DRILL_HINT = "looks like a drill hole; export with --drill-shape-opt 0"
+
+
+def non_finite(value: object) -> bool:
+    """A float, or a vector / tuple holding one, that is inf or nan."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, (str, bytes)) or not hasattr(value, "__iter__"):
+        return False
+    return any(isinstance(c, float) and not math.isfinite(c) for c in value)
+
+
+def coord_problem(points: Sequence[Sequence[float]], bulges: Sequence[float],
+                  radius: float | None, scale: float) -> str | None:
+    """Why an entity's geometry (drawing units, ``scale`` mm each) is corrupt: a
+    coordinate, radius or bulge that is not finite, or a coordinate, radius or
+    arc height (sagitta = chord x |bulge| / 2) beyond MAX_COORD_MM."""
+    nums = [c for p in points for c in p] + list(bulges) + [radius or 0.0]
+    if not all(math.isfinite(v) for v in nums):
+        return "a coordinate, radius or bulge is not a finite number"
+    sagittas = (math.dist(tuple(p), tuple(q)) * abs(b) / 2.0
+                for p, q, b in zip(points, points[1:], bulges, strict=False))
+    reach = max(max((abs(c) for p in points for c in p), default=0.0), abs(radius or 0.0),
+                max(sagittas, default=0.0)) * scale
+    if reach > MAX_COORD_MM:
+        return (f"a coordinate, radius or arc reaches {reach:.3g} mm, beyond the "
+                f"{MAX_COORD_MM:g} mm limit (after unit scaling)")
+    return None
+
+
+def drill_warnings(cutouts: Sequence[Loop], frame: str, slot: float, fab: str) -> list[str]:
+    """A warning per circle cutout no wider than ``fab``'s minimum milled
+    ``slot``: kicad-cli pcb export dxf writes every drill as a CIRCLE unless
+    --drill-shape-opt 0 (the 1.0 mm pin-header drill of KiCad 9's default
+    export is exactly at JLCPCB's 1.0 mm, so 'no wider', not 'narrower')."""
+    return [f"cutout {lp.sources[0]}: a {2 * lp.circle[2]:.3f} mm circle at "
+            f"{fmt(lp.circle[:2])} ({frame_note(frame)}) is no wider than {fab}'s {slot:g} mm "
+            f"minimum milled slot, so it {DRILL_HINT} (or delete it)"
+            for lp in cutouts if lp.circle and 2 * lp.circle[2] <= slot + 1e-9]
 
 
 # --- outer / cutout classification -----------------------------------------------------
@@ -169,8 +252,8 @@ class _Shape:
         """'inside' | 'outside' | 'crossing' (touching included) of self vs other."""
         if _boxes_touch(self.box, other.box) and any(
                 _boxes_touch(bp, bq) and intersections(p, q)
-                for p, bp in zip(self.prims, self.boxes)
-                for q, bq in zip(other.prims, other.boxes)):
+                for p, bp in zip(self.prims, self.boxes, strict=True)
+                for q, bq in zip(other.prims, other.boxes, strict=True)):
             return "crossing"
         return "inside" if _inside(self.prims[0].start, other.polygon) else "outside"
 
@@ -224,7 +307,7 @@ def _edge_length(e: Edge) -> float:
 
 @dataclass(frozen=True)
 class Piece:
-    """An open run of edges from one entity (DXF frame, mm)."""
+    """An open run of edges from one entity (drawing frame, mm)."""
     edges: tuple[Edge, ...]
     source: str
     start_at: str
@@ -254,7 +337,7 @@ class Piece:
 def _same_edges(a: Sequence[Edge], b: Sequence[Edge], tol: float) -> bool:
     return len(a) == len(b) and all(
         dist(e[:2], f[:2]) <= tol and dist(e[2:4], f[2:4]) <= tol
-        and abs(e[4] - f[4]) <= _BULGE_SAME for e, f in zip(a, b))
+        and abs(e[4] - f[4]) <= _BULGE_SAME for e, f in zip(a, b, strict=True))
 
 
 def _same_ring(a: Piece, b: Piece, tol: float) -> bool:
@@ -304,8 +387,9 @@ def drop_duplicates(pieces: Sequence[Piece], circles: Sequence[Loop], tol: float
 class _Chainer:
     """Joins pieces whose ends are within ``tol`` (grid-bucketed lookup)."""
 
-    def __init__(self, pieces: Sequence[Piece], tol: float, warnings: list[str]) -> None:
-        self.pieces, self.tol, self.warnings = pieces, tol, warnings
+    def __init__(self, pieces: Sequence[Piece], tol: float, warnings: list[str],
+                 frame: str) -> None:
+        self.pieces, self.tol, self.warnings, self.frame = pieces, tol, warnings, frame
         self.used = [False] * len(pieces)
         self.grid: dict[tuple[int, int], list[tuple[int, int]]] = {}
         for i, p in enumerate(pieces):
@@ -335,7 +419,8 @@ class _Chainer:
                          if _same_edges(q.edges, o.edges, self.tol)), None)
             if twin is not None:
                 self.used[i] = True
-                self.warnings.append(f"ignored duplicate {p.source} (same geometry as {twin.source})")
+                self.warnings.append(f"ignored duplicate {p.source} "
+                                     f"(same geometry as {twin.source})")
             else:
                 keep.append((i, q))
         return keep
@@ -351,9 +436,9 @@ class _Chainer:
                 here += [q.start_at if at_end else q.end_at for _i, q in cands]
                 here += [chain[0].start_at if at_end else chain[-1].end_at] if closes else []
                 raise DxfOutlineError(
-                    f"{len(here)} entity ends meet at {fmt(tip)} mm ({', '.join(here)}; DXF "
-                    "frame, Y up): an outline must be a simple closed path. Delete the "
-                    "construction or duplicate geometry (Fusion exports construction lines, "
+                    f"{len(here)} entity ends meet at {fmt(tip)} mm ({', '.join(here)}; "
+                    f"{frame_note(self.frame)}): an outline must be a simple closed path. Delete "
+                    "the construction or duplicate geometry (Fusion exports construction lines, "
                     "e.g. a center rectangle's diagonals, as plain LINEs) or move it to another "
                     "layer and pass layer=", problems=(f"branch at {fmt(tip)}",))
             if closes or not cands:
@@ -385,28 +470,56 @@ class _Chainer:
         return loops, open_chains
 
 
-def chain_pieces(pieces: Sequence[Piece], tol: float,
-                 warnings: list[str]) -> tuple[list[Loop], list[list[Piece]]]:
-    """Closed loops and the chains that stay open (for gap_error)."""
-    return _Chainer(pieces, tol, warnings).run()
+def chain_pieces(pieces: Sequence[Piece], tol: float, warnings: list[str],
+                 frame: str = "XY") -> tuple[list[Loop], list[list[Piece]]]:
+    """Closed loops and the chains that stay open (for gap_error). ``frame``
+    names the drawing frame in the branch error."""
+    return _Chainer(pieces, tol, warnings, frame).run()
+
+
+def _close_pairs(pts: Sequence[Point], live: Sequence[int],
+                 reach: float) -> list[tuple[float, int, int]]:
+    """(distance, i, j), i < j, for the ``live`` points within ``reach`` of
+    each other (grid-bucketed), closest first."""
+    grid: dict[tuple[int, int], list[int]] = {}
+    for i in live:
+        grid.setdefault((math.floor(pts[i][0] / reach), math.floor(pts[i][1] / reach)),
+                        []).append(i)
+    pairs = []
+    for (cx, cy), members in grid.items():
+        near = [j for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                for j in grid.get((cx + dx, cy + dy), ())]
+        for i in members:
+            for j in near:
+                if j > i and (d := dist(pts[i], pts[j])) <= reach:
+                    pairs.append((d, i, j))
+    return sorted(pairs)
 
 
 def _pair_ends(open_chains: Sequence[Sequence[Piece]], noise: float) -> list[Gap]:
-    """Every dangling end paired with its nearest partner, closest pairs first;
-    a chain whose own two ends pair up wider than ``noise`` is an open path."""
+    """Every dangling end paired with its nearest partner, closest pairs first
+    (greedy over all pairs by distance, then index); a chain whose own two ends
+    pair up wider than ``noise`` is an open path. Pairs are searched within a
+    growing reach, so 1500 stray lines pair in well under a second; the result
+    is the same as sorting every pair (no pair within the reach of a round is
+    left for a later one)."""
     ends = [(pt, at, k) for k, c in enumerate(open_chains)
             for pt, at in ((c[0].start, c[0].start_at), (c[-1].end, c[-1].end_at))]
-    taken: set[int] = set()
+    pts = [e[0] for e in ends]
+    live, reach = list(range(len(ends))), _PAIR_REACH_MM
     gaps: list[Gap] = []
-    for d, i, j in sorted((dist(ends[i][0], ends[j][0]), i, j)
-                          for i in range(len(ends)) for j in range(i + 1, len(ends))):
-        if i in taken or j in taken:
-            continue
-        taken.update((i, j))
-        (a, a_at, ka), (b, b_at, kb) = ends[i], ends[j]
-        stray = ka == kb and d > noise
-        gaps.append(Gap(d, a, a_at, b, b_at,
-                        tuple(dict.fromkeys(p.source for p in open_chains[ka])) if stray else ()))
+    while len(live) > 1 and math.isfinite(reach):
+        taken: set[int] = set()
+        for d, i, j in _close_pairs(pts, live, reach):
+            if i in taken or j in taken:
+                continue
+            taken.update((i, j))
+            (a, a_at, ka), (b, b_at, kb) = ends[i], ends[j]
+            stray = ka == kb and d > noise
+            gaps.append(Gap(d, a, a_at, b, b_at, tuple(dict.fromkeys(
+                p.source for p in open_chains[ka])) if stray else ()))
+        live = [i for i in live if i not in taken]
+        reach *= 4.0
     return gaps
 
 
@@ -415,10 +528,11 @@ def _plural(n: int, word: str) -> str:
 
 
 def gap_error(path: str | Path, open_chains: Sequence[Sequence[Piece]], tol: float,
-              closed: int) -> DxfOutlineError:
-    """The error for chains left open: every gap and open path, with advice
-    that never suggests a join tolerance wide enough to merge real geometry
-    ("pass tol >= X" only when every gap is within export noise)."""
+              closed: int, frame: str = "XY") -> DxfOutlineError:
+    """The error for chains left open: the first GAP_LIST_MAX gaps and open
+    paths ('+K more'; ``gaps`` keeps every one), in the drawing ``frame``, with
+    advice that never suggests a join tolerance wide enough to merge real
+    geometry ("pass tol >= X" only when every gap is within export noise)."""
     noise = export_noise_mm(tol)
     gaps = _pair_ends(open_chains, noise)
     joints = [g for g in gaps if not g.open_path]
@@ -443,5 +557,5 @@ def gap_error(path: str | Path, open_chains: Sequence[Sequence[Piece]], tol: flo
                              f"{math.ceil(worst * 1001) / 1000:.3f} mm") + ".")
     return DxfOutlineError(
         f"{path}: the outline does not close: {' and '.join(counts)} ({closed} closed loop(s) "
-        "found; DXF frame, mm, Y up):\n  " + "\n  ".join(g.describe() for g in gaps)
+        f"found; {frame_note(frame)}):\n  " + "\n  ".join(capped([g.describe() for g in gaps]))
         + "\n" + "\n".join(advice), gaps=gaps, problems=tuple(g.describe() for g in paths))

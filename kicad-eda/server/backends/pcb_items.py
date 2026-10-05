@@ -14,12 +14,16 @@ through-hole pad reports the board's enabled copper layers instead; an SMD
 padstack's layer set holds its copper layer plus mask/paste. Enabled layers
 come back in enum order (F, B, In1, ...), so ``copper_layer_names`` re-sorts
 them top to bottom.
+
+``outline_geometry`` alone is handed the board: it reads the Edge.Cuts shapes
+(the board's and every footprint's) and the aux origin as exact primitives.
 """
 from __future__ import annotations
 
 import math
 from typing import Any, Iterable, Sequence
 
+import route_outline as ro           # pure Edge.Cuts primitive builders (server/)
 from backends import kipy_bridge as kb
 
 MM_DECIMALS = 4
@@ -36,6 +40,7 @@ RULE_FIELDS = {"min_clearance": "min_clearance", "min_track_width": "min_track_w
 _SHAPE_NAMES = {"PSS_CIRCLE": "circle", "PSS_RECTANGLE": "rect", "PSS_OVAL": "oval",
                 "PSS_TRAPEZOID": "trapezoid", "PSS_ROUNDRECT": "roundrect",
                 "PSS_CHAMFEREDRECT": "chamfered", "PSS_CUSTOM": "custom"}
+DRILL_ORIGIN = 2                     # kipy BoardOriginType.BOT_DRILL: the aux (drill/place) origin
 Point = tuple[float, float]
 
 
@@ -246,6 +251,100 @@ def outline(shapes: Iterable) -> dict:
         out = {"bbox": [x0, y0, x1, y1], "width": round(x1 - x0, MM_DECIMALS),
                "height": round(y1 - y0, MM_DECIMALS), "segments": len(edges)}
     return {**out, "skipped": skipped} if skipped else out
+
+
+# --- exact outline (route_outline) --------------------------------------------
+def _node_piece(node: Any) -> tuple:
+    """A PolyLineNode as a route_outline.closed_chain piece."""
+    if node.has_arc:
+        return ("arc", point(node.arc.start), point(node.arc.mid), point(node.arc.end))
+    return ("point", point(node.point))
+
+
+def _rect_radius(shape: Any) -> float:
+    """A rectangle's corner radius in mm (KiCad 10+), from the proto (the
+    vendored wrapper has no property for it); 0 when unset."""
+    radius = getattr(shape, "corner_radius", None)
+    if radius is None:
+        rect = getattr(getattr(getattr(shape, "proto", None), "shape", None), "rectangle", None)
+        radius = getattr(getattr(rect, "corner_radius", None), "value_nm", 0)
+    return mm(radius or 0)
+
+
+def _shape_prims(shape: Any) -> list[dict] | None:
+    """KiCad primitives (mm) of one Edge.Cuts shape, told apart by the kipy
+    wrapper attributes; None for a geometry with no wrapper (an ellipse). A
+    polygon is closed rings (outline and holes), a bezier straight chords."""
+    if hasattr(shape, "polygons"):
+        return [prim for poly in shape.polygons for ring in (poly.outline, *poly.holes)
+                for prim in ro.closed_chain([_node_piece(n) for n in ring.nodes])]
+    if hasattr(shape, "top_left"):
+        return ro.rect_prims(point(shape.top_left), point(shape.bottom_right),
+                             _rect_radius(shape))
+    if hasattr(shape, "radius_point"):
+        centre, rim = shape.center, shape.radius_point
+        return [ro.kicad_prim("circle", center=point(centre),
+                              radius=mm(math.hypot(rim.x - centre.x, rim.y - centre.y)))]
+    if hasattr(shape, "control1"):
+        return ro.bezier_prims(*(point(getattr(shape, k))
+                                 for k in ("start", "control1", "control2", "end")))
+    if hasattr(shape, "mid"):
+        return [ro.arc_prim(point(shape.start), point(shape.mid), point(shape.end))]
+    if hasattr(shape, "start") and hasattr(shape, "end"):
+        return [ro.kicad_prim("line", start=point(shape.start), end=point(shape.end))]
+    return None
+
+
+def _shape_id(shape: Any) -> str | None:
+    value = getattr(getattr(shape, "id", None), "value", None)
+    return str(value) if value else None
+
+
+def _edge_shapes(board: Any) -> list:
+    """The board's Edge.Cuts shapes, then those inside footprint definitions
+    (KiCad hands them out with absolute positions), each shape once."""
+    edge = kb.BoardLayer.BL_Edge_Cuts
+    own = [shape for shape in board.get_shapes() if shape.layer == edge]
+    seen = {_shape_id(shape) for shape in own} - {None}
+    inner = [shape for fp in board.get_footprints()
+             for shape in (getattr(getattr(fp, "definition", None), "shapes", None) or [])
+             if shape.layer == edge and _shape_id(shape) not in seen]
+    return own + inner
+
+
+def _drill_origin(board: Any) -> tuple[list[float] | None, str | None]:
+    """(aux origin in mm or None, note): None when it is KiCad's unset (0, 0)
+    or this KiCad has no GetBoardOrigin handler (the note says so)."""
+    getter = getattr(board, "get_origin", None)
+    if getter is None:
+        return None, None
+    try:
+        at = getter(DRILL_ORIGIN)
+    except kb.ApiError as exc:
+        codes = kb.ApiStatusCode
+        if exc.code not in (codes.AS_UNHANDLED, codes.AS_UNIMPLEMENTED) \
+                and "no handler" not in str(exc):
+            raise
+        return None, f"the aux origin (datum) could not be read: {exc}"
+    if at is None or (at.x == 0 and at.y == 0):
+        return None, None
+    return point(at), None
+
+
+def outline_geometry(board: Any) -> dict:
+    """The exact board outline: {"prims": [{kind: line|arc|circle, start,
+    mid, end, center, radius}] in mm (outline.from_kicad_primitives input),
+    "origin": the prims' bbox top-left (None without Edge.Cuts), "datum": the
+    aux (drill / place) origin, None when unset}, plus "skipped" (shapes no
+    primitive describes, e.g. an ellipse) and "notes" when they apply. Reads
+    board.get_shapes / get_footprints / get_origin; kipy errors propagate."""
+    converted = [_shape_prims(shape) for shape in _edge_shapes(board)]
+    prims = [prim for found in converted if found is not None for prim in found]
+    skipped = sum(found is None for found in converted)
+    datum, note = _drill_origin(board)
+    out = {"prims": prims, "origin": ro.prims_origin(prims), "datum": datum,
+           **({"skipped": skipped} if skipped else {})}
+    return {**out, "notes": [note]} if note else out
 
 
 # --- rules / classes ----------------------------------------------------------

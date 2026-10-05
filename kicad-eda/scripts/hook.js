@@ -27,6 +27,14 @@ const IPC_PROBE = `import sys; sys.path.insert(0, ${JSON.stringify(VENDOR_DIR)})
   + 'from kipy import KiCad; k=KiCad(); print(k.get_version())';
 const ENABLE_API_HINT = 'Preferences > Plugins and Content Manager > Enable KiCad API '
   + '(KiCad 9: Preferences > API)';
+// What a blocked live board tool can do instead without the GUI: the
+// Freerouting-era headless pipeline, and the KiCad 11 board-API routing tools
+// (skills/agent-routing; a headless nightly api-server) that replace
+// add_trace / add_via. tests/test_hook_message.py checks these are registered.
+const HEADLESS_PIPELINE_TOOLS = ['create_pcb', 'build_board_from_netlist', 'autoroute_board',
+  'drc_pcb', 'export_fab_package'];
+const BOARD_API_ROUTING_TOOLS = ['open_board', 'board_pads', 'route_net', 'add_vias',
+  'route_check', 'remove_routing', 'route_status'];
 
 function tryRun(cmd, args) {
   const r = spawnSync(cmd, args, { encoding: 'utf8' });
@@ -129,9 +137,11 @@ function blockMessage(running) {
       ? `KiCad is running but its API server is not enabled (${ENABLE_API_HINT}).`
       : `KiCad's API server did not answer (is KiCad running with ${ENABLE_API_HINT}?).`;
   return 'BLOCKED: this tool needs KiCad\'s IPC API. ' + why
-    + ' Open the board in KiCad with the API enabled and retry — or use the '
-    + 'headless tools (create_pcb, build_board_from_netlist, autoroute_board, '
-    + 'drc_pcb, export_fab_package), which do not need the GUI.\n';
+    + ' Open the board in KiCad with the API enabled and retry — or work without the GUI: '
+    + `the headless pipeline tools (${HEADLESS_PIPELINE_TOOLS.join(', ')}), or, to lay `
+    + 'tracks and vias in place of add_trace / add_via, the KiCad 11 board-API routing tools '
+    + `(${BOARD_API_ROUTING_TOOLS.join(', ')}), which run on a headless KiCad 11 nightly `
+    + '(see the agent-routing skill).\n';
 }
 
 if (mode === 'session-start') {

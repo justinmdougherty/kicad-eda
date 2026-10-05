@@ -320,6 +320,41 @@ def test_explicit_side_wins_over_the_type_default():
     assert side == {"1": "right", "2": "left"}
 
 
+@pytest.mark.parametrize("spec", [
+    sym_author.lg290p_spec(), _small_spec(),
+    sym_author.SymbolSpec(name="IO", pins=(sym_author.PinSpec("1", "IN", "input"),
+                                           sym_author.PinSpec("2", "OUT", "output")))],
+    ids=["lg290p", "small", "no_top_pins"])
+def test_reference_and_value_sit_above_every_pin(spec):
+    lay = sym_author.layout(spec)
+    at = {n[1]: n[3] for n in sym_author.symbol_node(spec, lay)
+          if isinstance(n, list) and n and n[0] == S("property")}
+    top_pins = [p.y for p in lay.pins if p.side == "top"]
+    for name in ("Reference", "Value"):     # the text (FONT high, centred) clears the pin ends
+        assert at[name][2] - sym_author.FONT / 2 > max([lay.half_h, *top_pins]), name
+        if not top_pins:
+            assert at[name][2] == pytest.approx(lay.half_h + sym_author.FONT), name
+
+
+def test_power_pins_sharing_a_name_but_not_a_type_are_a_spec_problem():
+    P = sym_author.PinSpec
+    pins = (P("1", "VCC", "power_in"), P("2", "VCC", "power_out"), P("3", "VCC", "power_in"))
+    spec = sym_author.SymbolSpec(name="M", pins=pins)
+    (problem,) = sym_author.spec_problems(spec)
+    assert "power pins named 'VCC' mix power_in (1, 3) and power_out (2)" in problem
+    with pytest.raises(sym_author.SymbolAuthorError, match="mix power_in"):
+        sym_author.layout(spec)
+    assert sym_author.power_stacks(spec) == {"VCC:power_in": ("1", "3")}   # grouped by type
+    unstacked = sym_author.SymbolSpec(name="M", pins=pins, stack_power=False)
+    assert sym_author.spec_problems(unstacked) == [] and sym_author.layout(unstacked).stacks == {}
+
+
+def test_a_body_that_cannot_be_fitted_fails_loudly(monkeypatch):
+    monkeypatch.setattr(sym_author, "_MAX_GROW_STEPS", 0)
+    with pytest.raises(sym_author.SymbolAuthorError, match="could not fit the symbol body"):
+        sym_author.layout(_small_spec())
+
+
 def test_text_length_ignores_overbar_markup_and_anonymous_names():
     assert sym_author.text_length("~{RESET}") == pytest.approx(5 * sym_author.CHAR_W)
     assert sym_author.text_length("~") == 0.0
@@ -381,6 +416,8 @@ def test_spec_from_dict_builds_the_spec_and_accepts_integer_pin_numbers():
     ({"name": "X", "pins": [{"name": "A"}]}, "'number' is required"),
     ({"name": "X", "pins": [{"number": 1.5, "name": "A"}]}, "must be a string"),
     ({"name": "X", "pins": [], "stack_power": "yes"}, "'stack_power' must be a boolean"),
+    ({"name": 5, "pins": []}, "'name' must be a string"),
+    ({"name": "X", "pins": ["1"]}, "pin #1 must be an object"),
     ("not a dict", "must be an object"),
 ])
 def test_spec_from_dict_rejects_malformed_input(data, match: str):
@@ -412,9 +449,11 @@ def test_rewrite_preserves_foreign_symbols_byte_for_meaning(tmp_path: Path):
         '(kicad_symbol_lib (version 20241209) (generator "kicad_symbol_editor")'
         ' (generator_version "9.0")'
         ' (symbol "R1" (property "Reference" "R" (at 0 0 0) (effects (font (size 1.27 1.27))))'
-        '  (property "Value" "a \\"quoted\\" 1/4\\\\W" (at 0 0 0) (effects (font (size 1.27 1.27))))'
+        '  (property "Value" "a \\"quoted\\" 1/4\\\\W" (at 0 0 0)'
+        ' (effects (font (size 1.27 1.27))))'
         '  (symbol "R1_1_1" (pin passive line (at 0 3.81 270) (length 1.27)'
-        '   (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))))'
+        '   (name "~" (effects (font (size 1.27 1.27))))'
+        ' (number "1" (effects (font (size 1.27 1.27)))))))'
         ' (symbol "R2" (extends "R1")'
         '  (property "Value" "R2" (at 0 0 0) (effects (font (size 1.27 1.27))))))\n',
         encoding="utf-8")
@@ -440,6 +479,7 @@ def test_refuses_to_extend_a_library_in_another_dialect(tmp_path: Path, version:
 @pytest.mark.parametrize("text,match", [
     ('(kicad_symbol_lib (version 20241209)', "cannot parse"),
     ('(kicad_pcb (version 20241229))', "not a KiCad symbol library"),
+    ('(kicad_symbol_lib (version 20241209) (symbol))', "entry without a name"),
 ])
 def test_refuses_unparseable_or_foreign_files(tmp_path: Path, text: str, match: str):
     lib = tmp_path / "Bad.kicad_sym"
@@ -457,6 +497,9 @@ def test_creates_missing_parent_directories(tmp_path: Path):
     lib = tmp_path / "libs" / "deep" / "New_parts.kicad_sym"
     assert sym_author.author_symbol(_small_spec(), lib)["ok"]
     assert lib.is_file()
+    (tmp_path / "plain").write_text("a file, not a directory", encoding="utf-8")
+    with pytest.raises(sym_author.SymbolAuthorError, match="cannot write"):
+        sym_author.author_symbol(_small_spec(), tmp_path / "plain" / "X_parts.kicad_sym")
 
 
 def test_strings_with_quotes_and_backslashes_round_trip(tmp_path: Path):
@@ -471,8 +514,8 @@ def test_library_text_is_kicad_style_and_round_trips():
     assert text.startswith("(kicad_symbol_lib\n\t(version 20241209)\n")
     assert "\t\t(pin_names\n\t\t\t(offset 1.016)\n\t\t)" in text
     root = sexpdata.loads(text, nil=None, true=None)
-    again = sexpdata.loads(sym_author.library_text(symlib.kids(root, "symbol")), nil=None, true=None)
-    assert again == root
+    again = sym_author.library_text(symlib.kids(root, "symbol"))
+    assert sexpdata.loads(again, nil=None, true=None) == root
 
 
 def test_number_formatting_has_no_exponents_or_negative_zero():
@@ -489,6 +532,8 @@ def test_unwritable_atoms_fail_loudly():
     with pytest.raises(sym_author.SymbolAuthorError, match="cannot write NoneType"):
         sym_author.library_text([[S("symbol"), "X", [S("at"), None]]])
     assert sym_author.library_text([[S("symbol"), "X", []]]).count("()") == 1
+    # an atom after a list child gets its own line, one tab deeper
+    assert '\n\t\t"tail"\n' in sym_author.library_text([[S("symbol"), "X", [S("a")], "tail"]])
 
 
 def test_refuses_a_directory_named_like_a_library(tmp_path: Path):
@@ -511,11 +556,17 @@ def test_validate_library_reports_a_kicad_cli_that_cannot_start(tmp_path: Path):
     assert any("did not run" in e for e in res["errors"]), res
 
 
-def _fake_cli(monkeypatch, console: str, write_output: bool = True) -> None:
-    """Stand-in for `kicad-cli sym upgrade -o OUT IN`: rc 0, copies IN to OUT."""
-    def run(args, **_kw):
-        if write_output:
-            shutil.copyfile(args[-1], args[args.index("-o") + 1])
+def _fake_cli(monkeypatch, console: str, write_output: bool | str = True) -> None:
+    """Stand-in for `kicad-cli sym upgrade -o OUT IN`: rc 0, copies IN to OUT
+    (or writes ``write_output`` there when it is a string)."""
+    def run(args, **kw):
+        assert kw["stdin"] is subprocess.DEVNULL and kw["timeout"]
+        assert (kw["encoding"], kw["errors"]) == ("utf-8", "replace")
+        out = Path(args[args.index("-o") + 1])
+        if isinstance(write_output, str):
+            out.write_text(write_output, encoding="utf-8")
+        elif write_output:
+            shutil.copyfile(args[-1], out)
         return subprocess.CompletedProcess(args, 0, stdout=console, stderr="")
     monkeypatch.setattr(sym_author.subprocess, "run", run)
 
@@ -524,14 +575,17 @@ def _fake_cli(monkeypatch, console: str, write_output: bool = True) -> None:
     ("Saving symbol library C:/work/error_logs/SPS_parts.kicad_sym\n", True, True),
     ("Error: unknown token 'bogus'\n", True, False),      # D0: rc 0 is not proof
     ("", False, False),                                    # rc 0 but nothing written
+    ("", "(kicad_symbol_lib (symbol", False),              # a re-saved copy symlib cannot read
 ])
 def test_validate_library_judges_the_console_and_the_output_not_just_rc(
-        tmp_path: Path, monkeypatch, console: str, write_output: bool, ok: bool):
+        tmp_path: Path, monkeypatch, console: str, write_output: bool | str, ok: bool):
     lib, _ = _write_lg290p(tmp_path)
     _fake_cli(monkeypatch, console, write_output)
     res = sym_author.validate_library(lib, "kicad-cli")
     assert res["ok"] is ok, res
     assert res["resaved_pins"] == ({"LG290P": 79} if ok else {})
+    if isinstance(write_output, str):
+        assert res["errors"][0].startswith("kicad-cli re-saved copy unreadable"), res
 
 
 def test_validate_library_flags_a_resave_that_drops_pins(tmp_path: Path, monkeypatch):
@@ -575,9 +629,14 @@ def test_cli_spec_file_errors_are_json_and_exit_1(tmp_path: Path, capsys):
     assert res["ok"] is False and "at least one pin" in res["error"]
 
 
-def test_cli_usage_exit_2(capsys):
-    assert sym_author.main([]) == 2
-    assert "Usage" in capsys.readouterr().out
+@pytest.mark.parametrize("argv", [
+    [], ["spec.json"], ["spec.json", "X.kicad_sym", "extra"], ["--lg290p"],
+    ["--lg290p", "X.kicad_sym", "SPS_parts:Quectel_LG290P", "extra"], ["--bogus", "X.kicad_sym"]])
+def test_cli_usage_errors_exit_2_and_write_nothing(argv: list[str], capsys, tmp_path: Path,
+                                                   monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert sym_author.main(argv) == 2
+    assert "Usage" in capsys.readouterr().out and not any(tmp_path.iterdir())
 
 
 # --- consumers: pin sidecar and the file schematic backend ------------------------

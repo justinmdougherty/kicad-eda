@@ -26,6 +26,7 @@ import kicad_server as k
 import library_tools
 import mechanical_tools
 import pcb_ipc_tools
+import physics_tools
 import review_tools
 import sch_file_model as sfm
 import tool_registry
@@ -37,8 +38,9 @@ NO_GUI = {"ipc_connected": False, "reason": "test: no GUI"}
 
 
 def _gui(docs: list[dict], kicad11: bool) -> dict:
-    return {"ipc_connected": True, "kicad": object(), "kicad_version": "10.99.0" if kicad11 else "9.0.4",
-            "open_documents": docs, "capabilities": ipc.capabilities((10, 99, 0) if kicad11 else (9, 0, 4))}
+    version = (10, 99, 0) if kicad11 else (9, 0, 4)
+    return {"ipc_connected": True, "kicad": object(), "kicad_version": ".".join(map(str, version)),
+            "open_documents": docs, "capabilities": ipc.capabilities(version)}
 
 
 @pytest.fixture(autouse=True)
@@ -153,8 +155,9 @@ def test_unknown_pin_is_an_ok_false_with_reason(sch):
 def test_batch_validates_before_placing_anything(sch):
     k.create_schematic(sch)
     with pytest.raises(ValueError, match="rot must be one of"):
-        k.add_components_batch(sch, [{"ref": "R1", "lib_id": "Device:R", "x": 0, "y": 0},
-                                     {"ref": "R2", "lib_id": "Device:R", "x": 0, "y": 0, "rot": 45}])
+        k.add_components_batch(sch, [
+            {"ref": "R1", "lib_id": "Device:R", "x": 0, "y": 0},
+            {"ref": "R2", "lib_id": "Device:R", "x": 0, "y": 0, "rot": 45}])
     assert k.list_symbols(sch)["symbols"] == []
 
 
@@ -368,7 +371,8 @@ def test_close_schematic_stops_the_api_session(sch, fake_api):
 def test_load_connects_to_a_kicad11_gui_that_has_the_file_open(sch, fake_api, monkeypatch):
     gui_path = str(Path(sch).parent / "gui.kicad_sch")
     Path(gui_path).write_text("(kicad_sch)", encoding="utf-8")
-    monkeypatch.setattr(ipc, "connect", lambda: _gui([{"type": "schematic", "path": gui_path}], True))
+    monkeypatch.setattr(ipc, "connect",
+                        lambda: _gui([{"type": "schematic", "path": gui_path}], True))
     res = k.load_schematic(gui_path)
     assert res["ok"] and res["backend"] == "api" and res["mode"] == "gui"
     assert k.save_schematic(gui_path)["ok"]                    # the GUI session may write
@@ -443,7 +447,8 @@ def test_status_reports_installs_and_backend(monkeypatch):
     monkeypatch.setattr(tc, "installs", lambda: [{"version": "9.0.4", "has_api_server": False}])
     st = k.server_status()
     assert st["installs"][0]["version"] == "9.0.4"
-    assert st["schematic_backend"] == "file" and st["schematic_backend_reason"] == "test: no backend"
+    assert st["schematic_backend"] == "file"
+    assert st["schematic_backend_reason"] == "test: no backend"
     conn = k.test_kicad_connection()
     assert conn["ipc_connected"] is False and conn["schematic_backend"] == "file"
     assert conn["installs"][0]["version"] == "9.0.4" and "api_kicad_version" in conn
@@ -470,7 +475,8 @@ def test_design_report_reports_ok_false_when_a_symbol_cannot_be_read(tmp_path, m
     monkeypatch.setattr(tc, "symbols_dir", lambda explicit="": str(nope))
     res = k.design_report(str(_write_netlist(tmp_path, "Nope:Chip")))
     assert res["ok"] is False
-    assert len(res["errors"]) == 1 and res["errors"][0].startswith("pin types unavailable for Nope:Chip (U1)")
+    assert len(res["errors"]) == 1
+    assert res["errors"][0].startswith("pin types unavailable for Nope:Chip (U1)")
     assert res["reason"].startswith("design review could not run for 1 symbol(s)")
     assert res["report"]["errors"] == res["errors"]
     assert Path(res["markdown_path"]).is_file() and "## Errors" in res["markdown"]
@@ -512,7 +518,9 @@ BASELINE_TOOLS = (
     "add_vias", "remove_routing", "route_check", "route_status", "save_board", "close_board",
     "list_open_boards",
 )
-FEATURE_MODULES = (library_tools, import_tools, review_tools, mechanical_tools)
+# the roadmap feature modules, in TOOL_MODULES order; physics_tools (D7) is
+# registered by X-04 and filled by D7-13a / D7-13b / D7-08b
+FEATURE_MODULES = (library_tools, import_tools, review_tools, mechanical_tools, physics_tools)
 _SPAWN_EVENTS = ("subprocess.Popen", "os.system", "os.posix_spawn", "os.spawn", "os.exec",
                  "os.startfile")
 
@@ -550,6 +558,11 @@ def test_tool_modules_is_the_one_explicit_list():
         assert "TOOLS" in (mod.__doc__ or "") and "ROADMAP_DECISIONS" in mod.__doc__, mod.__name__
 
 
+def test_physics_tools_is_the_last_registered_module():
+    assert FEATURE_MODULES[-2:] == (mechanical_tools, physics_tools)
+    assert k.TOOL_MODULES[-1] is physics_tools
+
+
 def test_every_served_tool_comes_from_a_tools_tuple():
     # no second registration path (an @mcp.tool decorator) next to the registry
     assert _names(k.mcp) == [fn.__name__ for mod in k.TOOL_MODULES for fn in mod.TOOLS]
@@ -561,6 +574,7 @@ def test_a_function_in_a_feature_module_tools_tuple_gets_registered(module, monk
     server = FastMCP("registry-probe")
     names = _register(server)
     assert names.count("probe_tool") == 1
+    assert names[:len(BASELINE_TOOLS)] == list(BASELINE_TOOLS)   # served after the baseline
     assert _names(server) == names == [fn.__name__ for m in k.TOOL_MODULES for fn in m.TOOLS]
     result = asyncio.run(server.call_tool("probe_tool", {"text": "hi"}))
     blocks = result[0] if isinstance(result, tuple) else result   # (content, structured) or content
@@ -574,7 +588,8 @@ def test_registration_refuses_a_name_two_modules_share(monkeypatch):
 
     monkeypatch.setattr(review_tools, "TOOLS", (drc_pcb,))
     server = FastMCP("registry-probe")
-    with pytest.raises(ValueError, match=r"review_tools\.TOOLS: .*'drc_pcb'.*taken by board_pipeline_tools"):
+    with pytest.raises(ValueError,
+                       match=r"review_tools\.TOOLS: .*'drc_pcb'.*taken by board_pipeline_tools"):
         _register(server)
     assert _names(server) == []                          # validated before registering anything
 
@@ -585,13 +600,15 @@ def test_registration_refuses_a_name_kicad_server_already_serves(monkeypatch):
         return {}
 
     monkeypatch.setattr(import_tools, "TOOLS", (design_report,))
-    with pytest.raises(ValueError, match=r"import_tools\.TOOLS: .*'design_report'.*taken by kicad_server"):
+    with pytest.raises(ValueError,
+                       match=r"import_tools\.TOOLS: .*'design_report'.*taken by kicad_server"):
         _register(FastMCP("registry-probe"))
 
 
 def test_registration_refuses_the_same_function_listed_twice(monkeypatch):
     monkeypatch.setattr(library_tools, "TOOLS", (probe_tool, probe_tool))
-    with pytest.raises(ValueError, match=r"library_tools\.TOOLS: .*'probe_tool'.*taken by library_tools"):
+    with pytest.raises(ValueError,
+                       match=r"library_tools\.TOOLS: .*'probe_tool'.*taken by library_tools"):
         _register(FastMCP("registry-probe"))
 
 

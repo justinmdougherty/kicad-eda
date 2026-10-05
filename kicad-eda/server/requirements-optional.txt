@@ -1,7 +1,9 @@
 # Optional kicad-generator dependencies: features that work without them say
-# so with an actionable error. NOT installed by CI's unit job or the
-# Dockerfile (server/requirements.txt), so the image and CI stay lean; the
-# tests that need a package here skip when it is absent.
+# so with an actionable error, and the tests that need a package here skip
+# when it is absent. Installed by CI (.github/workflows/regression.yml: the
+# unit job and the suite venv) and by the Dockerfile (into /opt/venv, next to
+# server/requirements.txt), so those tests run there instead of skipping.
+# A local server venv may leave them out.
 #
 # Install into the server venv:
 #   <venv-python> -m pip install -r server/requirements-optional.txt

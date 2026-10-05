@@ -4,11 +4,16 @@ kipy sys.path helper.
 
 The fake cases build install trees under tmp_path and feed canned probe
 answers through kicad_env._run, so they run on any OS with no KiCad present.
+The bundled-Python probe imports kicad_quiet before pcbnew (D0); that is
+proven by running its exact argv with the venv Python against a stub pcbnew
+that refuses to import unless kicad_quiet came first.
 The live case re-scans the real machine and skips when no kicad-cli exists.
 """
 from __future__ import annotations
 
+import ast
 import os
+import subprocess
 import sys
 import types
 from dataclasses import dataclass, field
@@ -19,6 +24,9 @@ import pytest
 import kicad_env as env
 
 PCBNEW_MISSING = "ModuleNotFoundError: No module named 'pcbnew'"
+# The exact argv tail of the bundled-Python probe: inline code that imports
+# kicad_quiet (from server/tools, passed as argv[1]) before pcbnew.
+PROBE_ARGS = ["-c", env.PCBNEW_PROBE, str(env.TOOLS_DIR)]
 
 
 # ----------------------------------------------------------------------------
@@ -41,12 +49,13 @@ class FakeProbes:
             return env.ProbeResult(1, "", "not a kicad-cli")
         if args == ["api-server", "--help"]:
             return env.ProbeResult(0 if exe in self.api_ok else 1, "", "unknown command")
-        if args == ["-c", "import pcbnew"]:
+        if args == PROBE_ARGS:
             return env.ProbeResult(0 if exe in self.pcbnew_ok else 1, "", PCBNEW_MISSING)
         raise AssertionError(f"unexpected probe {argv}")
 
     def count(self, exe: Path, *args: str) -> int:
-        return sum(1 for c in self.calls if env._key(c[0]) == env._key(exe) and c[1:] == list(args))
+        return sum(1 for c in self.calls
+                   if env._key(c[0]) == env._key(exe) and c[1:] == list(args))
 
 
 def make_install(root: Path, *, python: bool, share: bool = True) -> Path:
@@ -192,7 +201,7 @@ def test_probes_run_once_per_path(two_installs: tuple[Path, Path], fake_world: F
     assert len(fake_world.calls) == calls_after_first
     assert fake_world.count(cli9, "version") == 1
     assert fake_world.count(cli11, "version") == 1
-    assert fake_world.count(cli9.parent / "python.exe", "-c", "import pcbnew") == 1
+    assert fake_world.count(cli9.parent / "python.exe", *PROBE_ARGS) == 1
     assert fake_world.count(cli11, "api-server", "--help") == 1
     assert fake_world.count(cli9, "api-server", "--help") == 0   # too old to bother
 
@@ -220,7 +229,8 @@ def test_python_probe_failure_keeps_reason(tmp_path: Path, fake_world: FakeProbe
     fake_world.versions[env._key(cli)] = "9.0.4"          # python.exe exists, pcbnew does not
     (inst,) = env.discover()
     assert inst.python is None
-    assert inst.python_error == f"{cli.parent / 'python.exe'}: cannot import pcbnew: {PCBNEW_MISSING}"
+    assert inst.python_error == \
+        f"{cli.parent / 'python.exe'}: cannot import pcbnew: {PCBNEW_MISSING}"
     assert env.pick_swig() is None
 
 
@@ -238,7 +248,8 @@ def test_api_server_needs_version_and_probe(tmp_path: Path, fake_world: FakeProb
 
 def test_run_reports_launch_failure_and_timeout(tmp_path: Path) -> None:
     missing = env._run([str(tmp_path / "no-such-kicad-cli.exe"), "version"])
-    assert missing.returncode == env.TRANSIENT_RC and not missing.ok and "cannot start" in missing.stderr
+    assert missing.returncode == env.TRANSIENT_RC and not missing.ok
+    assert "cannot start" in missing.stderr
     slow = env._run([sys.executable, "-c", "import time; time.sleep(30)"], timeout_s=0.5)
     assert slow.returncode == env.TRANSIENT_RC and "timed out after 0.5 s" in slow.stderr
 
@@ -255,6 +266,14 @@ def test_run_detaches_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
     assert env._run(["kicad-cli", "version"]).ok
     assert seen["stdin"] is env.subprocess.DEVNULL
     assert seen["capture_output"] is True and seen["timeout"] == env.PROBE_TIMEOUT_S
+    # D0: decode child output as UTF-8 and never raise on a stray byte
+    assert seen["encoding"] == "utf-8" and seen["errors"] == "replace"
+
+
+def test_run_survives_undecodable_child_output() -> None:
+    r = env._run([sys.executable, "-c",
+                  "import sys; sys.stdout.buffer.write(b'9.0.4 \\xff\\xfe\\n')"])
+    assert r.ok and r.stdout.startswith("9.0.4 ") and "�" in r.stdout
 
 
 def test_python_probe_uses_the_longer_timeout(tmp_path: Path, fake_world: FakeProbes,
@@ -269,7 +288,8 @@ def test_python_probe_uses_the_longer_timeout(tmp_path: Path, fake_world: FakePr
     fake_world.versions[env._key(cli)] = "9.0.4"
     fake_world.pcbnew_ok.add(env._key(cli.parent / "python.exe"))
     env.discover()
-    assert env.PYTHON_PROBE_TIMEOUT_S in timeouts and env.PYTHON_PROBE_TIMEOUT_S > env.PROBE_TIMEOUT_S
+    assert env.PYTHON_PROBE_TIMEOUT_S in timeouts
+    assert env.PYTHON_PROBE_TIMEOUT_S > env.PROBE_TIMEOUT_S
 
 
 def test_python_probe_timeout_is_not_cached(tmp_path: Path, fake_world: FakeProbes,
@@ -282,10 +302,11 @@ def test_python_probe_timeout_is_not_cached(tmp_path: Path, fake_world: FakeProb
     slow = {"left": 1}
 
     def run(argv, timeout_s=0):
-        if argv[1:] == ["-c", "import pcbnew"] and slow["left"]:
+        if argv[1:] == PROBE_ARGS and slow["left"]:
             slow["left"] -= 1
             fake_world.calls.append(list(argv))
-            return env.ProbeResult(env.TRANSIENT_RC, "", f"{argv[0]}: timed out after {timeout_s:g} s")
+            return env.ProbeResult(env.TRANSIENT_RC, "",
+                                   f"{argv[0]}: timed out after {timeout_s:g} s")
         return fake_world.run(argv, timeout_s)
     monkeypatch.setattr(env, "_run", run)
     fake_world.pcbnew_ok.add(env._key(py))
@@ -296,9 +317,9 @@ def test_python_probe_timeout_is_not_cached(tmp_path: Path, fake_world: FakeProb
     (second,) = env.discover(refresh=True)                 # probes again, now answers
     assert second.python == py and second.python_error is None
     assert env.python_probe_error(cli) is None
-    assert fake_world.count(py, "-c", "import pcbnew") == 2
+    assert fake_world.count(py, *PROBE_ARGS) == 2
     env.discover(refresh=True)                             # a settled answer IS cached
-    assert fake_world.count(py, "-c", "import pcbnew") == 2
+    assert fake_world.count(py, *PROBE_ARGS) == 2
 
 
 def test_python_probe_real_failure_is_cached(tmp_path: Path, fake_world: FakeProbes) -> None:
@@ -306,8 +327,106 @@ def test_python_probe_real_failure_is_cached(tmp_path: Path, fake_world: FakePro
     fake_world.versions[env._key(cli)] = "9.0.4"          # pcbnew import fails for real
     env.discover()
     env.discover(refresh=True)
-    assert fake_world.count(cli.parent / "python.exe", "-c", "import pcbnew") == 1
+    assert fake_world.count(cli.parent / "python.exe", *PROBE_ARGS) == 1
     assert env.python_probe_error(cli) and PCBNEW_MISSING in env.python_probe_error(cli)
+
+
+# ----------------------------------------------------------------------------
+# the bundled-Python probe imports kicad_quiet before pcbnew (D0)
+# ----------------------------------------------------------------------------
+# A stub pcbnew that only imports when kicad_quiet is already loaded, so a
+# probe that skipped kicad_quiet fails exactly like a missing pcbnew would.
+STRICT_PCBNEW = '''\
+import sys
+if "kicad_quiet" not in sys.modules:
+    raise ImportError("stub pcbnew: kicad_quiet was not imported first")
+'''
+
+
+def _first_import_lines(source: str) -> dict[str, int]:
+    """{module: line} of the first module-level import of each module."""
+    first: dict[str, int] = {}
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                first.setdefault(alias.name, node.lineno * 1000 + node.col_offset)
+    return first
+
+
+def test_probe_code_imports_kicad_quiet_before_pcbnew() -> None:
+    first = _first_import_lines(env.PCBNEW_PROBE)
+    assert "pcbnew" in first and "kicad_quiet" in first, env.PCBNEW_PROBE
+    assert first["kicad_quiet"] < first["pcbnew"]
+    assert env.TOOLS_DIR == env.SERVER_DIR / "tools"
+    assert (env.TOOLS_DIR / "kicad_quiet.py").is_file()
+    assert env.python_probe_argv(Path("py")) == ["py", *PROBE_ARGS]
+
+
+@pytest.fixture
+def strict_pcbnew(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The venv Python stands in for KiCad's; children see STRICT_PCBNEW."""
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "pcbnew.py").write_text(STRICT_PCBNEW, encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(stub))
+    return stub
+
+
+def test_strict_stub_rejects_the_old_bare_probe(strict_pcbnew: Path) -> None:
+    """The stub really checks the order: `-c "import pcbnew"` alone fails."""
+    r = env._run([sys.executable, "-c", "import pcbnew"])
+    assert r.returncode == 1 and "kicad_quiet was not imported first" in r.stderr
+
+
+def test_real_probe_child_imports_kicad_quiet_first(
+        tmp_path: Path, strict_pcbnew: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """bundled_python runs the exact probe argv (real subprocess, stdin
+    detached): with kicad_quiet on argv[1] first, the strict stub imports."""
+    env.clear_cache()
+    monkeypatch.setattr(env, "python_candidates", lambda cli: [Path(sys.executable)])
+    cli = tmp_path / "bin" / "kicad-cli.exe"
+    try:
+        assert env.bundled_python(cli) == Path(sys.executable), env.python_probe_error(cli)
+        assert env.python_probe_error(cli) is None
+    finally:
+        env.clear_cache()
+
+
+def test_real_probe_child_reports_a_failing_pcbnew(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "pcbnew.py").write_text("raise ImportError('stub: no pcbnew here')\n",
+                                    encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(stub))
+    env.clear_cache()
+    monkeypatch.setattr(env, "python_candidates", lambda cli: [Path(sys.executable)])
+    cli = tmp_path / "bin" / "kicad-cli.exe"
+    try:
+        assert env.bundled_python(cli) is None
+        error = env.python_probe_error(cli) or ""
+        assert "cannot import pcbnew" in error and "stub: no pcbnew here" in error
+    finally:
+        env.clear_cache()
+
+
+def test_probe_child_gets_detached_stdin(monkeypatch: pytest.MonkeyPatch,
+                                         tmp_path: Path) -> None:
+    seen: list[dict] = []
+
+    def fake_run(argv: list[str], **kw: object) -> subprocess.CompletedProcess:
+        seen.append({"argv": list(argv), **kw})
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    env.clear_cache()
+    monkeypatch.setattr(env.subprocess, "run", fake_run)
+    monkeypatch.setattr(env, "python_candidates", lambda cli: [Path(sys.executable)])
+    try:
+        env.bundled_python(tmp_path / "kicad-cli.exe")
+    finally:
+        env.clear_cache()
+    (call,) = seen
+    assert call["argv"] == [sys.executable, *PROBE_ARGS]
+    assert call["stdin"] is subprocess.DEVNULL and call["timeout"] == env.PYTHON_PROBE_TIMEOUT_S
 
 
 # ----------------------------------------------------------------------------

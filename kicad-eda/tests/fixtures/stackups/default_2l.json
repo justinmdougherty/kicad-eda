@@ -1,0 +1,22 @@
+{
+  "description": "ADR D7.2.4 default for copper_layers 2: generic:2L-1.6 geometry (core 1.51 mm, Dk 4.5), F signal / B mixed GND (M6), JLC mask (the default fab is jlcpcb): 1.58 + 2 x 0.0305 = 1.641 mm",
+  "design": {
+    "name": "default_2l",
+    "copper_layers": 2,
+    "components": [{"ref": "J1", "lib_id": "Connector_Generic:Conn_01x03",
+                    "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x03_P2.54mm_Vertical"}],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]], "SIG": [["J1", "3"]]}
+  },
+  "expect": {
+    "source": "default",
+    "fab": "jlcpcb",
+    "copper_layers": 2,
+    "kicad_copper_count": 2,
+    "thickness": 1.641,
+    "gbrjob_rows": 5,
+    "roles": [["F.Cu", "signal", null], ["B.Cu", "mixed", "GND"]],
+    "mask_source": "fab",
+    "issues": [],
+    "drafts": 1
+  }
+}

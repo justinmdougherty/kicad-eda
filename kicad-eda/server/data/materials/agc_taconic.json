@@ -1,0 +1,35 @@
+{
+  "schema": "kicad-eda/materials@1",
+  "retrieved": "2026-10-04",
+  "note": "AGC (formerly Taconic) PTFE laminates.",
+  "materials": {
+    "agc.tly5": {
+      "vendor": "AGC (Taconic)", "product": "TLY-5", "family": "ptfe-woven-glass", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": true, "process": "ptfe",
+      "dk": [
+        {"value": 2.2, "tol": 0.02, "freq_hz": 1e10, "basis": "process", "method": "IPC-650 2.5.5.5", "note": "specifiable anywhere in 2.17-2.40 (+/- 0.02) for most thicknesses", "source": "https://agc-nelco.com/agc-downloads/AGC_TLY-5_TDS.pdf"}
+      ],
+      "df": [
+        {"value": 0.0009, "freq_hz": 1e10, "basis": "process", "method": "IPC-650 2.5.5.5", "source": "https://agc-nelco.com/agc-downloads/AGC_TLY-5_TDS.pdf"}
+      ],
+      "standard_thicknesses_mm": [0.09, 0.13, 0.19, 0.25, 0.51, 0.76, 0.79, 1.52],
+      "sources": [
+        {"title": "AGC TLY-5 technical data sheet", "url": "https://agc-nelco.com/agc-downloads/AGC_TLY-5_TDS.pdf"}
+      ]
+    },
+    "taconic.rf35": {
+      "vendor": "AGC (Taconic)", "product": "RF-35", "family": "ptfe-ceramic-woven-glass", "category": "rf-laminate",
+      "forms": ["core"], "ptfe": true, "process": "ptfe", "tg_c": 315,
+      "dk": [
+        {"value": 3.5, "tol": 0.1, "freq_hz": 1.9e9, "basis": "typical", "note": "typical value at 1.9 GHz; ordering designation 3.5 +/- 0.1", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/RF-35.pdf"}
+      ],
+      "df": [
+        {"value": 0.0018, "freq_hz": 1.9e9, "basis": "typical", "source": "https://a-contract.ru/fileadmin/datasheets/base-material/RF-35.pdf"}
+      ],
+      "standard_thicknesses_mm": [0.25, 0.5, 0.76, 1.52],
+      "sources": [
+        {"title": "Taconic RF-35 data sheet", "url": "https://a-contract.ru/fileadmin/datasheets/base-material/RF-35.pdf"}
+      ]
+    }
+  }
+}

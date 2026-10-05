@@ -1,12 +1,14 @@
 """server/tools/kicad_import_fplib.py: the footprint library of the KiCad
 project importer (ROADMAP D4), unit tier (no KiCad).
 
-Footprint identity and naming, instance-field stripping, the choice of the
-pcbnew that extracts (the oldest >= 9.0, D0) and of the kicad-cli that
-exports, the extraction driver run against a stand-in for
+Footprint identity and naming (instance noise, endpoint order, a rectangle
+drawn as a polygon, field values and flags), instance-field stripping, the
+choice of the pcbnew that extracts (the oldest >= 9.0, D0) and of the
+kicad-cli that exports, the extraction driver run against a stand-in for
 kicad_import_swig.py (one library directory per footprint, the dialect it
-wrote), and the project's own footprint libraries. The real pcbnew runs in
-tests/test_kicad_import_live.py.
+wrote) through kicad_import_d0's 'pcbnew9' route, and the project's own
+footprint libraries. The real pcbnew runs in tests/test_kicad_import_live.py;
+the other D0 routes in tests/test_kicad_import_d0.py.
 """
 from __future__ import annotations
 
@@ -18,9 +20,19 @@ from pathlib import Path
 import pytest
 
 import kicad_env
+import kicad_import_d0 as kd0
 import kicad_import_fplib as kf
 import kicad_import_pcb as kp
 import kicad_import_sch as ks
+
+# a property's name, quoted (with spaces: "Manufacturer Part Number") or bare (ki_fp_filters)
+PROPERTY_NAME = re.compile(r'\(\s*property\s+(?:"((?:[^"\\]|\\.)*)"|([^\s()"]+))')
+
+
+@pytest.fixture(autouse=True)
+def no_kicad9_check(monkeypatch) -> None:
+    """kicad_import_d0's KiCad 9 load check is the live tier's business."""
+    monkeypatch.setattr(kd0, "verify", lambda path, kind="fp": {"ok": None, "reason": "unit"})
 
 FIX = Path(__file__).resolve().parent / "fixtures" / "kicad" / "kimport"
 EQUIV = Path(__file__).resolve().parent / "fixtures" / "equiv"
@@ -112,13 +124,84 @@ def test_kicad10_instance_data_is_stripped_from_saved_footprints() -> None:
 
 
 def test_only_library_fields_survive_stripping() -> None:
-    names = re.compile(r'\(\s*property\s+("?)([^"\s()]+)\1')
     noisy = _k10_saved("/a/", "a.kicad_sch").replace(
         '\t(fp_text user', '\t(property "Footprint" "Lib:R" (at 0 0 0))\n'
+                           '\t(property "Manufacturer Part Number" "RC0603" (at 0 0 0))\n'
                            '\t(property "Datasheet" "~" (at 0 0 0))\n\t(fp_text user')
-    kept = [m.group(2) for m in names.finditer(kf.strip_instance_fields(noisy))]
+    names = [m.group(1) or m.group(2) for m in PROPERTY_NAME.finditer(noisy)]
+    assert "Manufacturer Part Number" in names and "ki_fp_filters" in names
+    kept = [m.group(1) or m.group(2)
+            for m in PROPERTY_NAME.finditer(kf.strip_instance_fields(noisy))]
     assert kept == ["Reference", "Value", "Footprint", "Datasheet"]
     assert set(kept) <= kf.KEEP_FIELDS
+
+
+# ----------------------------------------------------------------------------
+# footprint_identity: what two library copies of one footprint may differ in
+# ----------------------------------------------------------------------------
+def _with(item: str, **kw) -> str:
+    """_fp() with one more top-level item."""
+    return _fp(**kw).replace("\t(pad ", f"\t{item}\n\t(pad ", 1)
+
+
+def test_identity_treats_line_endpoints_as_unordered() -> None:
+    """pcbnew 9 un-flips a B-side copy's lines end to start (stickhub D_0402,
+    vme-wren, video)."""
+    first = kf.footprint_identity(_fp())
+    flipped = _fp().replace("(start -0.14058 -0.51) (end 0.14058 -0.51)",
+                            "(start 0.14058 -0.51) (end -0.14058 -0.51)")
+    assert flipped != _fp() and kf.footprint_identity(flipped) == first
+    moved = _fp().replace("(start -0.14058 -0.51)", "(start -0.14058 -0.61)")
+    assert kf.footprint_identity(moved) != first
+
+
+def test_identity_treats_arc_endpoints_as_unordered() -> None:
+    arc = '(fp_arc (start 1 0) (mid 0 1) (end -1 0) (stroke (width 0.1) (type solid)) ' \
+          '(layer "F.SilkS"))'
+    first = kf.footprint_identity(_with(arc))
+    assert kf.footprint_identity(_with(arc.replace("(start 1 0)", "(start -1 0)")
+                                       .replace("(end -1 0)", "(end 1 0)"))) == first
+    assert kf.footprint_identity(_with(arc.replace("(mid 0 1)", "(mid 0 -1)"))) != first
+
+
+def test_identity_reads_an_axis_aligned_four_point_polygon_as_its_rectangle() -> None:
+    rest = '(stroke (width 0) (type solid)) (fill yes) (layer "F.Adhes")'
+    rect = kf.footprint_identity(_with(f"(fp_rect (start 1 0.3) (end -1 -0.3) {rest})"))
+    poly = "(fp_poly (pts (xy {}) (xy {}) (xy {}) (xy {})) " + rest + ")"
+    corners = ["-1 0.3", "1 0.3", "1 -0.3", "-1 -0.3"]
+    assert kf.footprint_identity(_with(poly.format(*corners))) == rect
+    assert kf.footprint_identity(_with(poly.format(*corners[1:], corners[0]))) == rect
+    bowtie = [corners[0], corners[2], corners[1], corners[3]]
+    assert kf.footprint_identity(_with(poly.format(*bowtie))) != rect
+    diamond = ["0 0.3", "1 0", "0 -0.3", "-1 0"]
+    assert kf.footprint_identity(_with(poly.format(*diamond))) != rect
+    assert kf.footprint_identity(_with(f"(fp_rect (start 1 0.3) (end -1 -0.4) {rest})")) != rect
+
+
+def test_identity_ignores_datasheet_and_description_fields() -> None:
+    """KiCad copies the symbol's Datasheet / Description onto each placed
+    footprint, and leaves a B-side copy's hidden fields on B.Fab, mirrored
+    (vme-wren: 23 of 102 library footprints were such variants)."""
+    field = '(property "{}" "{}" (at 0 0 0) (unlocked yes) (layer "{}") (hide yes) ' \
+            '(effects (font (size 1.27 1.27) (thickness 0.15)){}))'
+    plain = _with(field.format("Datasheet", "", "F.Fab", "")
+                  + "\n\t" + field.format("Description", "", "F.Fab", ""))
+    noisy = _with(field.format("Datasheet", "https://x/a.pdf", "B.Fab", " (justify mirror)")
+                  + "\n\t" + field.format("Description", "BAR66", "B.Fab", " (justify mirror)"))
+    assert kf.footprint_identity(noisy) == kf.footprint_identity(plain)
+    assert kf.footprint_identity(noisy) == kf.footprint_identity(_fp())
+
+
+def test_identity_ignores_property_flags_but_not_text() -> None:
+    """(unlocked yes) and a mirrored justify are per-instance flags of a
+    text; its size, layer and justification are not."""
+    text = '(fp_text user "K" (at 1 2 0) {}(layer "F.Fab") (effects (font (size 1 1) ' \
+           '(thickness 0.15)) (justify left{})))'
+    first = kf.footprint_identity(_with(text.format("", "")))
+    assert kf.footprint_identity(_with(text.format("(unlocked yes) ", " mirror"))) == first
+    assert kf.footprint_identity(_with(text.format("", "").replace("left", "right"))) != first
+    assert kf.footprint_identity(_with(text.format("", "").replace("size 1 1", "size 1 2"))) \
+        != first
 
 
 def test_identical_footprints_share_a_name_and_variants_are_numbered() -> None:
@@ -133,13 +216,17 @@ def test_identical_footprints_share_a_name_and_variants_are_numbered() -> None:
 
 
 def test_extraction_refuses_boards_newer_than_kicad9(tmp_path: Path) -> None:
+    """extract_footprint_library is the 'pcbnew9' route: a newer board goes
+    through kicad_import_d0's other routes (save_footprints + downgrade)."""
     board = kp.read_board(_text(EQUIV / "board_k11.sexpr"))
     with pytest.raises(ValueError, match="KiCad 11 path"):
         kf.extract_footprint_library(tmp_path / "x.kicad_pcb", board, board.footprints, "n",
                                      tmp_path / "n.pretty", "python")
-    lib, info = kf.write_footprint_library(tmp_path / "x.kicad_pcb", board, [], "n",
-                                           tmp_path / "n.pretty", "python", True)
-    assert lib is None and info["kicad11_path_required"] is True
+
+
+def _write(pcb: Path, board: kp.BoardDesign, path: Path, python: str | None):
+    """The 'pcbnew9' route of kicad_import_d0.provide_footprints."""
+    return kd0.provide_footprints(pcb, board, "n", path, kicad_python=python)
 
 
 def _install(version: str, python: str | Path | None = "py") -> types.SimpleNamespace:
@@ -197,10 +284,10 @@ def test_extracted_library_records_the_dialect_pcbnew_wrote(
         tmp_path: Path, fake_swig: Path, monkeypatch, fmt: int, d0: bool) -> None:
     monkeypatch.setenv("FAKE_FP_FORMAT", str(fmt))
     board = kp.read_board(_text(PCB))
-    lib, info = kf.write_footprint_library(PCB, board, [], "n", tmp_path / "n.pretty",
-                                           sys.executable, True)
+    lib, info = _write(PCB, board, tmp_path / "n.pretty", sys.executable)
     assert set(lib.names) == {fp.index for fp in board.footprints}
     assert info["extracted"] and info["format"] == fmt and info["d0_dialect"] is d0
+    assert info["route"] == "pcbnew9" and info["k9_verified"] is None
     # every footprint read back from its own directory: 9 distinct geometries
     assert len(lib.files) == info["footprints"] == len(set(lib.names.values())) == 9
     assert all(Path(f).is_file() and f"(version {fmt})" in _text(Path(f)) for f in lib.files)
@@ -213,8 +300,7 @@ def test_one_footprint_placed_on_many_sheets_is_one_library_footprint(
     geometry from nine sheets are still one library footprint, no variants."""
     monkeypatch.setenv("FAKE_FP_SAME", "1")
     board = kp.read_board(_text(PCB))
-    lib, info = kf.write_footprint_library(PCB, board, [], "n", tmp_path / "n.pretty",
-                                           sys.executable, True)
+    lib, info = _write(PCB, board, tmp_path / "n.pretty", sys.executable)
     assert len(lib.files) == info["footprints"] == 1 and info["variants"] == []
     assert len(set(lib.names.values())) == 1 and set(lib.names) == {fp.index
                                                                      for fp in board.footprints}
@@ -222,16 +308,16 @@ def test_one_footprint_placed_on_many_sheets_is_one_library_footprint(
     assert "sheetname" not in text and "sheetfile" not in text and "ki_" not in text
 
 
-def test_write_footprint_library_picks_the_install_itself(
+def test_route_pcbnew9_picks_the_install_itself(
         tmp_path: Path, fake_swig: Path, monkeypatch) -> None:
     k9 = _install("9.0.4", sys.executable)
     monkeypatch.setattr(kicad_env, "discover", lambda refresh=False: [
         _install("10.0.5", tmp_path / "no-such-python"), k9])
     board = kp.read_board(_text(PCB))
-    _lib, info = kf.write_footprint_library(PCB, board, [], "n", tmp_path / "n.pretty", None, True)
+    _lib, info = _write(PCB, board, tmp_path / "n.pretty", None)
     assert info["python"] == sys.executable                # the 9.0 install, not the 10.0 one
     monkeypatch.setattr(kicad_env, "discover", lambda refresh=False: [_install("10.99.0", None)])
-    lib, info = kf.write_footprint_library(PCB, board, [], "n", tmp_path / "m.pretty", None, True)
+    lib, info = _write(PCB, board, tmp_path / "m.pretty", None)
     assert lib is None and "no KiCad >= 9.0" in info["reason"] and "10.99.0" in info["reason"]
 
 
@@ -239,11 +325,9 @@ def test_a_failed_extraction_fails_loudly(tmp_path: Path, fake_swig: Path, monke
     monkeypatch.setenv("FAKE_FP_FAIL", "1")
     board = kp.read_board(_text(PCB))
     with pytest.raises(RuntimeError, match="LoadBoard failed"):
-        kf.write_footprint_library(PCB, board, [], "n", tmp_path / "n.pretty", sys.executable,
-                                   True)
+        _write(PCB, board, tmp_path / "n.pretty", sys.executable)
     with pytest.raises(RuntimeError, match="cannot start KiCad's Python"):
-        kf.write_footprint_library(PCB, board, [], "n", tmp_path / "n.pretty",
-                                   str(tmp_path / "no-such-python.exe"), True)
+        _write(PCB, board, tmp_path / "n.pretty", str(tmp_path / "no-such-python.exe"))
 
 
 def test_kicad_cli_choice_follows_the_schematic_format(monkeypatch) -> None:

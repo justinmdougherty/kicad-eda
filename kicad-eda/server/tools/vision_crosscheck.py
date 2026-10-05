@@ -9,25 +9,48 @@ scores how far they agree.
 
 1. Components, keyed by reference: a part only one reading has, a reference
    listed twice, and per shared part its ``value`` (compared as a quantity:
-   100nF = 0.1uF, 4k7 = 4.7k, 2R2 = 2.2 ohm; 1M != 1m), ``lib_id`` and
-   ``footprint``.
+   100nF = 0.1uF, 4k7 = 4.7k, 2R2 = 2.2 ohm, 3V3 = 3.3V, 2A5 = 2.5A;
+   1M != 1m), ``lib_id`` and ``footprint``.
 2. Connectivity, through net_equivalence.compare (pad partitions; net names
    never matter): a net split or merged, connected pins one reading lacks, a
    pad on two nets, and a pin one reading marks no-connect that the other
-   does not list (a no-connect pin the other reading wires is a split/merge).
+   does not list (a no-connect pin the other reading wires is a split/merge;
+   one on a part the other reading lacks is covered by the part's row).
 
 Score = 0.25 components (shared refs / all refs) + 0.25 fields (agreeing /
-compared field values of shared parts) + 0.5 connectivity (pins on the
-corresponding net / pins connected in either reading, nets corresponding
-one-to-one by greatest pin overlap). 1.0 = identical readings; ``agree`` =
-no disagreement at all. With a ``ref_map`` {ref in A: ref in B}, A's parts
-are reported under B's references.
+compared field values of shared parts; 0 when parts exist but none is
+shared, 1 when both readings are empty or no shared part has any field) +
+0.5 connectivity (pins on the corresponding net / pins connected in either
+reading, nets corresponding one-to-one by greatest pin overlap). 1.0 =
+identical readings; ``agree`` = no disagreement at all. With a ``ref_map``
+{ref in A: ref in B}, A's parts are reported under B's references.
 
 ``pin_check(design)`` checks ONE reading against its KiCad symbols (netlist
 ``libraries`` block, project sym-lib-table, then the stock library, D1):
 pads that are not pin numbers of the symbol, symbol pins neither netted nor
 no_connect (an unread pin), and symbols that do not resolve; it also returns
-each symbol's pin table (number, name, electrical type).
+each symbol's pin table (number, name, electrical type). A symbol pin of
+electrical type no_connect (e.g. AP2112K-3.3 pin 4 'NC') that the reading
+leaves out is listed under ``nc_pins``: informational, not an issue.
+
+File-level helpers (what the MCP layer wraps, so it does not repeat the CLI):
+``crosscheck_files(a_path, b_path, ref_map=None, labels=('A', 'B'))`` ->
+CrosscheckResult (``as_dict()`` / ``markdown()``; ``ref_map`` a mapping, JSON
+text or a JSON file) and ``pin_check_file(netlist_path)`` -> dict (the
+report's ``as_dict()`` plus ``netlist`` and ``summary``; ``ok`` there means
+no pin issue, not that the call worked).
+
+Conventions D4 does not fix yet (this module and agents/schematic-reader.md
+follow them):
+- score = 0.25 components + 0.25 fields + 0.5 connectivity (WEIGHTS);
+- severity: value, a missing / extra / duplicated part and every
+  connectivity disagreement high; lib_id / footprint med; no-connect low;
+- a reader's unreadable or uncertain spots are netlist assumptions with ids
+  VIS-<n> (topic "vision: unreadable <what>", confidence low or med);
+- a reading carries source.kind "vision", source.tool
+  'schematic-reader (Claude vision) + pymupdf <ver> @ <dpi> dpi'
+  (the raster manifest's tool and dpi) and "rebuild": "reflow" (a drawing
+  has no placement).
 
 CLI (exit 0 agree / clean, 1 disagreements / pin issues, 2 error):
   vision_crosscheck.py compare A.json B.json [--ref-map JSON|file]
@@ -43,6 +66,7 @@ import argparse
 import copy
 import json
 import math
+import os
 import re
 import sys
 from collections import Counter
@@ -73,6 +97,7 @@ PAD_CONFLICT = "pad_conflict"               # one reading puts a pad on two nets
 NO_CONNECT_MISMATCH = "no_connect_mismatch"
 KINDS = (DUPLICATE_REF, COMPONENT_MISSING, COMPONENT_EXTRA, FIELD_MISMATCH, NET_SPLIT, NET_MERGE,
          PIN_MISSING, PIN_EXTRA, PAD_CONFLICT, NO_CONNECT_MISMATCH)
+NC_PIN_TYPE = "no_connect"          # symbol pin electrical type: unconnected by design
 
 # --- component values as quantities -------------------------------------------
 _SI = {"p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6, "μ": 1e-6, "m": 1e-3,
@@ -83,6 +108,7 @@ _UNIT = "Hz|ohms?|[FHVAWRΩΩ]"
 _PREFIX = "[pnuµμmkKMG]"
 _PLAIN = re.compile(rf"(\d+(?:\.\d*)?|\.\d+)({_PREFIX}?)({_UNIT})?")
 _RKM = re.compile(rf"(\d+)({_PREFIX}|R)(\d+)({_UNIT})?")         # 4k7, 2R2, 1u0
+_RKM_UNIT = re.compile(r"(\d+)([VAWFH])(\d+)")                    # 3V3, 2A5, 1W5
 _GLUE = re.compile(rf"(?<=[\d.])\s+(?=(?:{_PREFIX}|{_UNIT}))")   # "100 nF" -> "100nF"
 _TOKENS = re.compile(r"[\s/,;]+")
 _DIGITS = re.compile(r"([0-9]+)")
@@ -103,7 +129,8 @@ def _fmt(pads: Iterable[Any]) -> str:
 
 
 def parse_value(text: str) -> tuple[float, str] | None:
-    """'4k7' -> (4700.0, ''), '100nF' -> (1e-07, 'F'), '2R2' -> (2.2, 'ohm');
+    """'4k7' -> (4700.0, ''), '100nF' -> (1e-07, 'F'), '2R2' -> (2.2, 'ohm'),
+    '3V3' -> (3.3, 'V') (a unit letter V/A/W/F/H as the RKM decimal mark);
     None when the text is not a single quantity (a part number, a note)."""
     s = _GLUE.sub("", str(text).strip())
     m = _RKM.fullmatch(s)
@@ -112,6 +139,10 @@ def parse_value(text: str) -> tuple[float, str] | None:
         scale = 1.0 if mark == "R" else _SI[mark]
         return float(f"{whole}.{frac}") * scale, _UNITS[unit] if unit else (
             "ohm" if mark == "R" else "")
+    m = _RKM_UNIT.fullmatch(s)
+    if m:
+        whole, unit, frac = m.groups()
+        return float(f"{whole}.{frac}"), _UNITS[unit]
     m = _PLAIN.fullmatch(s)
     if m:
         number, prefix, unit = m.groups()
@@ -420,6 +451,16 @@ def _pin_agreement(ra: _Reading, rb: _Reading) -> tuple[int, int]:
     return agreeing, len(union)
 
 
+def _fields_score(ra: _Reading, rb: _Reading, compared: int, agreeing: int) -> float:
+    """Agreeing / compared field values; with nothing compared, 1.0 when the
+    readings share parts (none has a field) or both are empty, else 0.0 (parts
+    exist but none is shared: no field can agree)."""
+    if compared:
+        return agreeing / compared
+    shared = set(ra.comps) & set(rb.comps)
+    return 1.0 if shared or not (ra.comps or rb.comps) else 0.0
+
+
 def _labels(labels: Iterable[str]) -> tuple[str, str]:
     pair = tuple(str(x) for x in labels)
     if len(pair) != 2 or not all(pair) or pair[0] == pair[1]:
@@ -443,11 +484,11 @@ def crosscheck(a: Mapping[str, Any], b: Mapping[str, Any], *,
     found = (_duplicates(ra) + _duplicates(rb) + _only_in(ra, rb, COMPONENT_MISSING)
              + _only_in(rb, ra, COMPONENT_EXTRA) + field_out
              + _connectivity(eq, ra, rb, gone_a, gone_b)
-             + _no_connects(ra, rb, gone_b) + _no_connects(rb, ra, gone_a))
+             + _no_connects(ra, rb, gone_a) + _no_connects(rb, ra, gone_b))
     pins_ok, pins = _pin_agreement(ra, rb)
     union = set(ra.comps) | set(rb.comps)
     scores = {"components": len(set(ra.comps) & set(rb.comps)) / len(union) if union else 1.0,
-              "fields": agreeing / compared if compared else 1.0,
+              "fields": _fields_score(ra, rb, compared, agreeing),
               "connectivity": pins_ok / pins if pins else 1.0}
     score = round(sum(WEIGHTS[k] * v for k, v in scores.items()), 4)
     counts = {"components_a": len(ra.comps), "components_b": len(rb.comps),
@@ -465,7 +506,9 @@ def crosscheck(a: Mapping[str, Any], b: Mapping[str, Any], *,
 # ----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PinReport:
-    parts: tuple[dict[str, Any], ...]       # {ref, lib_id, unknown: [pad], unlisted: [pin]}
+    # parts: {ref, lib_id, unknown: [pad], unlisted: [pin], nc_pins: [pin]}; nc_pins (symbol
+    # pins of electrical type no_connect the reading leaves out) are informational
+    parts: tuple[dict[str, Any], ...]
     symbols: Mapping[str, list[dict[str, str]]]     # lib_id -> [{number, name, type}]
     unresolved: tuple[dict[str, str], ...]  # {ref, lib_id, reason}
 
@@ -483,10 +526,16 @@ class PinReport:
                 "unresolved": copy.deepcopy(list(self.unresolved)),
                 "symbols": copy.deepcopy(dict(self.symbols))}
 
+    def _nc_note(self) -> str:
+        count = sum(len(p.get("nc_pins", ())) for p in self.parts)
+        return (f"{count} NC-type pin(s) left unconnected by design (symbol pin type "
+                f"{NC_PIN_TYPE}; not an issue)") if count else ""
+
     def summary(self) -> str:
+        note = self._nc_note()
         if self.ok:
             return (f"pins ok: {len(self.parts)} part(s) checked against {len(self.symbols)} "
-                    "symbol(s)")
+                    f"symbol(s)" + (f"; {note}" if note else ""))
         lines = [f"pin check: {self.issues} issue(s)"]
         for p in self.parts:
             lines += [f"  {p['ref']}.{pad}: not a pin of {p['lib_id']}" for pad in p["unknown"]]
@@ -494,7 +543,7 @@ class PinReport:
                       "and not no_connect" for pin in p["unlisted"]]
         lines += [f"  {u['ref']}: {u['lib_id'] or '(no lib_id)'} does not resolve: {u['reason']}"
                   for u in self.unresolved]
-        return "\n".join(lines)
+        return "\n".join(lines + ([f"  ({note})"] if note else []))
 
 
 def _stock_symbols_dir() -> Path | None:
@@ -555,13 +604,27 @@ class _SymbolLibs:
         return _pin_table(symlib.flatten(self._cache, None, nick, name))
 
 
+def _part_row(ref: str, lib_id: str, table: list[dict[str, str]],
+              mine: set[str]) -> dict[str, Any]:
+    """One part's pin check: pads that are no pin of the symbol, symbol pins
+    the reading never mentions (an issue) and, apart, the unmentioned pins
+    of electrical type no_connect (unconnected by design, informational)."""
+    numbers = {p["number"] for p in table}
+    unread = [dict(p) for p in table if p["number"] not in mine]
+    return {"ref": ref, "lib_id": lib_id, "unknown": sorted(mine - numbers, key=_natural),
+            "unlisted": [p for p in unread if p["type"] != NC_PIN_TYPE],
+            "nc_pins": [p for p in unread if p["type"] == NC_PIN_TYPE]}
+
+
 def pin_check(design: Mapping[str, Any], *, netlist_dir: str | Path | None = None,
               symbols_dir: str | Path | None = None) -> PinReport:
     """Check every (ref, pad) of a reading against its symbol's pin numbers
-    and list the symbol pins it never mentions. ``netlist_dir`` (default: the
-    working directory) anchors the ``libraries`` block and project tables;
-    ``symbols_dir`` is the stock library (default: the newest KiCad's).
-    Board-only parts are skipped. ValueError on a malformed design or block."""
+    and list the symbol pins it never mentions (pins of electrical type
+    no_connect apart, as ``nc_pins``: not an issue). ``netlist_dir``
+    (default: the working directory) anchors the ``libraries`` block and
+    project tables; ``symbols_dir`` is the stock library (default: the newest
+    KiCad's). Board-only parts are skipped. ValueError on a malformed design
+    or block."""
     import symlib
     pads = ne.netlist_pad_nets(design)
     used: dict[str, set[str]] = {}
@@ -582,18 +645,16 @@ def pin_check(design: Mapping[str, Any], *, netlist_dir: str | Path | None = Non
             unresolved.append({"ref": ref, "lib_id": lib_id, "reason": str(e)})
             continue
         symbols[lib_id] = table
-        mine = used.get(ref, set())
-        numbers = {p["number"] for p in table}
-        parts.append({"ref": ref, "lib_id": lib_id,
-                      "unknown": sorted(mine - numbers, key=_natural),
-                      "unlisted": [dict(p) for p in table if p["number"] not in mine]})
+        parts.append(_part_row(ref, lib_id, table, used.get(ref, set())))
     return PinReport(tuple(parts), MappingProxyType(symbols), tuple(unresolved))
 
 
 # ----------------------------------------------------------------------------
-# Command line
+# File-level helpers (the CLI and the MCP layer)
 # ----------------------------------------------------------------------------
 def load_design(path: str | Path) -> dict[str, Any]:
+    """A netlist.json file as a dict; OSError when unreadable, ValueError when
+    it is not a JSON object."""
     p = Path(path)
     try:
         data = json.loads(p.read_text(encoding="utf-8-sig"))
@@ -604,16 +665,57 @@ def load_design(path: str | Path) -> dict[str, Any]:
     return data
 
 
-def _ref_map_arg(raw: str | None) -> dict[str, str] | None:
-    if not raw:
+def load_ref_map(raw: Mapping[str, str] | str | os.PathLike | None) -> Mapping[str, str] | None:
+    """A ref_map {ref in A: ref in B} given as a mapping, inline JSON text
+    (starting with '{' or '[') or the path of a JSON file; None or blank text
+    = no map. TypeError on another type, ValueError when it is not a JSON
+    object, OSError when the file cannot be read."""
+    if raw is None or isinstance(raw, Mapping):
+        return raw
+    if not isinstance(raw, (str, os.PathLike)):
+        raise TypeError(f"ref_map must be a mapping, JSON text or a JSON file path, "
+                        f"got {type(raw).__name__}")
+    text = raw.strip() if isinstance(raw, str) else os.fspath(raw)
+    if not text:
         return None
-    text = raw.strip()
-    data = json.loads(text if text.startswith("{") else Path(text).read_text(encoding="utf-8"))
+    if not isinstance(raw, str) or text[0] not in "{[":
+        text = Path(text).read_text(encoding="utf-8-sig")
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        raise ValueError(f"ref_map (--ref-map) {raw!s}: not valid JSON: {e}") from e
     if not isinstance(data, dict):
-        raise ValueError(f"--ref-map must be a JSON object {{ref_in_a: ref_in_b}}, got {raw!r}")
+        raise ValueError(f"ref_map (--ref-map) must be a JSON object {{ref_in_a: ref_in_b}}, "
+                         f"got {raw!s}")
     return data
 
 
+def crosscheck_files(a_path: str | Path, b_path: str | Path,
+                     ref_map: Mapping[str, str] | str | os.PathLike | None = None,
+                     labels: Iterable[str] = ("A", "B")) -> CrosscheckResult:
+    """crosscheck() of two netlist.json files; ``ref_map`` as load_ref_map
+    takes it. The result gives ``as_dict()``, ``markdown()`` and ``agree``.
+    Raises OSError (a file), ValueError (JSON, design, ref_map, labels) and
+    TypeError (ref_map type)."""
+    rename = load_ref_map(ref_map)
+    return crosscheck(load_design(a_path), load_design(b_path), ref_map=rename, labels=labels)
+
+
+def pin_check_file(netlist_path: str | Path, *,
+                   symbols_dir: str | Path | None = None) -> dict[str, Any]:
+    """pin_check() of a netlist.json file, its ``libraries`` block and
+    project tables anchored at the file's directory. Returns the JSON-ready
+    report (``ok`` = no pin issue, ``issues``, ``parts``, ``unresolved``,
+    ``symbols``) plus ``netlist`` (resolved path) and ``summary`` (text).
+    Raises OSError / ValueError like load_design."""
+    path = Path(netlist_path).resolve()
+    rep = pin_check(load_design(path), netlist_dir=path.parent, symbols_dir=symbols_dir)
+    return {"netlist": str(path), **rep.as_dict(), "summary": rep.summary()}
+
+
+# ----------------------------------------------------------------------------
+# Command line
+# ----------------------------------------------------------------------------
 def _write(path: str | None, text: str) -> None:
     if path:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -621,8 +723,7 @@ def _write(path: str | None, text: str) -> None:
 
 
 def _cli_compare(args: argparse.Namespace) -> int:
-    res = crosscheck(load_design(args.a), load_design(args.b), ref_map=_ref_map_arg(args.ref_map),
-                     labels=(args.label_a, args.label_b))
+    res = crosscheck_files(args.a, args.b, args.ref_map, (args.label_a, args.label_b))
     report = json.dumps(res.as_dict(), indent=1)
     _write(args.out, report)
     _write(args.md, res.markdown())
@@ -631,10 +732,9 @@ def _cli_compare(args: argparse.Namespace) -> int:
 
 
 def _cli_pins(args: argparse.Namespace) -> int:
-    rep = pin_check(load_design(args.netlist), netlist_dir=Path(args.netlist).resolve().parent,
-                    symbols_dir=args.symbols_dir)
-    print(json.dumps(rep.as_dict(), indent=1) if args.json else rep.summary())
-    return 0 if rep.ok else 1
+    out = pin_check_file(args.netlist, symbols_dir=args.symbols_dir)
+    print(json.dumps(out, indent=1) if args.json else out["summary"])
+    return 0 if out["ok"] else 1
 
 
 def main(argv: list[str] | None = None) -> int:

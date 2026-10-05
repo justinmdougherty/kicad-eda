@@ -35,6 +35,7 @@ for _p in (str(_HERE), str(_HERE.parent)):
 import kicad_import_fplib as kfp  # noqa: E402
 import kicad_import_pcb as kpcb  # noqa: E402
 import net_equivalence as ne  # noqa: E402
+import sexpr_read as sr  # noqa: E402
 from kicad_import_sch import child_spans  # noqa: E402
 
 _ATOM = r'("(?:[^"\\]|\\.)*"|[^\s()"]+)'
@@ -60,7 +61,7 @@ def _quote(value: str) -> str:
 def _footprint_spans(text: str) -> list[tuple[int, int]]:
     """(start, end) of every top-level footprint, in file order: the order
     of kicad_import_pcb's BoardFootprint.index."""
-    root = len(text) - len(text.lstrip(ne._LEADING))
+    root = len(text) - len(text.lstrip(sr.LEADING))
     return [(a, b) for head, a, b in child_spans(text, root, len(text))
             if head in kpcb.FOOTPRINT_HEADS]
 
@@ -98,7 +99,7 @@ def board_as_imported(board_text: str, renamed_refs: Iterable[Mapping[str, Any]]
     rows = sorted(renamed_refs, key=lambda r: r["index"], reverse=True)
     if not rows:
         return board_text
-    text = ne._restore_teardrop_parens(board_text)       # as kicad_import_pcb scans it
+    text = sr.restore_teardrop_parens(board_text)        # as kicad_import_pcb scans it
     spans = _footprint_spans(text)
     for row in rows:                                     # from the end: offsets stay valid
         index = row["index"]

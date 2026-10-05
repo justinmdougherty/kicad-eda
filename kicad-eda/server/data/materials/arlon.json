@@ -1,0 +1,38 @@
+{
+  "schema": "kicad-eda/materials@1",
+  "retrieved": "2026-10-04",
+  "note": "Arlon 25N / 25FR (ceramic-filled thermoset on woven glass; Arlon is part of Rogers since the January 2015 acquisition, Rogers 10-K 2015).",
+  "materials": {
+    "arlon.25n": {
+      "vendor": "Arlon (Rogers)", "product": "25N", "family": "ceramic-thermoset", "category": "rf-laminate",
+      "forms": ["core", "prepreg"], "ptfe": false, "process": "fr4-compatible",
+      "dk": [
+        {"value": 3.38, "freq_hz": 1e10, "basis": "process", "method": "IPC TM-650 2.5.5.5", "source": "https://www.epectec.com/downloads/ARLON-25N-25FR-Data-Sheet.pdf"}
+      ],
+      "df": [
+        {"value": 0.0025, "freq_hz": 1e10, "basis": "process", "method": "IPC TM-650 2.5.5.5", "source": "https://www.epectec.com/downloads/ARLON-25N-25FR-Data-Sheet.pdf"}
+      ],
+      "constructions": {"1080": {"thickness_mm": 0.099}, "2112": {"thickness_mm": 0.147}, "2313": {"thickness_mm": 0.17}},
+      "standard_thicknesses_mm": [0.152, 0.203, 0.254, 0.305, 0.457, 0.508, 0.61, 0.762, 1.524],
+      "sources": [
+        {"title": "Arlon 25N/25FR data sheet", "url": "https://www.epectec.com/downloads/ARLON-25N-25FR-Data-Sheet.pdf"},
+        {"title": "Rogers Corporation 10-K 2015 (Arlon acquisition)", "url": "https://www.sec.gov/Archives/edgar/data/0000084748/000008474816000013/rog-20151231x10k.htm"}
+      ]
+    },
+    "arlon.25fr": {
+      "vendor": "Arlon (Rogers)", "product": "25FR", "family": "ceramic-thermoset", "category": "rf-laminate",
+      "forms": ["core", "prepreg"], "ptfe": false, "process": "fr4-compatible",
+      "dk": [
+        {"value": 3.58, "freq_hz": 1e10, "basis": "process", "method": "IPC TM-650 2.5.5.5", "source": "https://www.epectec.com/downloads/ARLON-25N-25FR-Data-Sheet.pdf"}
+      ],
+      "df": [
+        {"value": 0.0035, "freq_hz": 1e10, "basis": "process", "method": "IPC TM-650 2.5.5.5", "source": "https://www.epectec.com/downloads/ARLON-25N-25FR-Data-Sheet.pdf"}
+      ],
+      "constructions": {"1080": {"thickness_mm": 0.099}, "2112": {"thickness_mm": 0.147}, "2313": {"thickness_mm": 0.17}},
+      "standard_thicknesses_mm": [0.152, 0.203, 0.254, 0.305, 0.457, 0.508, 0.61, 0.762, 1.524],
+      "sources": [
+        {"title": "Arlon 25N/25FR data sheet", "url": "https://www.epectec.com/downloads/ARLON-25N-25FR-Data-Sheet.pdf"}
+      ]
+    }
+  }
+}

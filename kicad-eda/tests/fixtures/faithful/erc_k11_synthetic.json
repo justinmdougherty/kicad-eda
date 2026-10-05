@@ -1,0 +1,93 @@
+{
+    "$schema": "https://schemas.kicad.org/erc.v1.json",
+    "coordinate_units": "mm",
+    "kicad_version": "synthetic: item descriptions in the KiCad 10.99 formats",
+    "source": "synthetic.kicad_sch",
+    "sheets": [
+        {
+            "path": "/",
+            "uuid_path": "/00000000-0000-0000-0000-000000000001",
+            "violations": [
+                {
+                    "description": "Input Power pin not driven by any Output Power pins",
+                    "items": [
+                        {"description": "Symbol #PWR? Hidden pin  [P3.3V, Power input, Line]", "pos": {"x": 1.0, "y": 1.0}, "uuid": "e-01"}
+                    ],
+                    "severity": "error",
+                    "type": "power_pin_not_driven"
+                },
+                {
+                    "description": "Pin not connected",
+                    "items": [
+                        {"description": "Symbol U11P Pin 5 [NC/ADJ, Passive, Line]", "pos": {"x": 2.0, "y": 1.0}, "uuid": "e-02"}
+                    ],
+                    "severity": "error",
+                    "type": "pin_not_connected"
+                },
+                {
+                    "description": "Pin not connected",
+                    "items": [
+                        {"description": "Symbol R1 Pin 1 [Passive, Line]", "pos": {"x": 3.0, "y": 1.0}, "uuid": "e-03"}
+                    ],
+                    "severity": "error",
+                    "type": "pin_not_connected"
+                },
+                {
+                    "description": "Pins of type Unspecified and Unspecified are connected",
+                    "items": [
+                        {"description": "Symbol C7 Pin 1 [1, Unspecified, Line]", "pos": {"x": 4.0, "y": 1.0}, "uuid": "e-04"},
+                        {"description": "Symbol C6 Pin 2 [2, Unspecified, Line]", "pos": {"x": 4.0, "y": 2.0}, "uuid": "e-05"}
+                    ],
+                    "severity": "error",
+                    "type": "pin_to_pin"
+                },
+                {
+                    "description": "Wire not connected at one end",
+                    "items": [
+                        {"description": "Vertical Wire, length 0.0127 mm", "pos": {"x": 5.0, "y": 1.0}, "uuid": "e-06"}
+                    ],
+                    "severity": "error",
+                    "type": "wire_dangling"
+                },
+                {
+                    "description": "Symbol 'P3.3V_BAR' doesn't match copy in library",
+                    "items": [
+                        {"description": "Symbol #PWR? [P3.3V_BAR]", "pos": {"x": 6.0, "y": 1.0}, "uuid": "e-07"}
+                    ],
+                    "severity": "warning",
+                    "type": "lib_symbol_issues"
+                }
+            ]
+        },
+        {
+            "path": "/sub/",
+            "uuid_path": "/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002",
+            "violations": [
+                {
+                    "description": "Pin not connected",
+                    "items": [
+                        {"description": "Symbol R1 Pin 1 [Passive, Line]", "pos": {"x": 3.0, "y": 1.0}, "uuid": "e-08"}
+                    ],
+                    "severity": "error",
+                    "type": "pin_not_connected"
+                },
+                {
+                    "description": "Footprint link issue",
+                    "items": [
+                        {"description": "Symbol C13P [Cap Semi]", "pos": {"x": 7.0, "y": 1.0}, "uuid": "e-09"}
+                    ],
+                    "severity": "warning",
+                    "type": "footprint_link_issues"
+                },
+                {
+                    "description": "Label not connected",
+                    "items": [
+                        {"description": "Global Label 'SDA'", "pos": {"x": 8.0, "y": 1.0}, "uuid": "e-10"}
+                    ],
+                    "severity": "error",
+                    "type": "label_dangling"
+                }
+            ]
+        }
+    ]
+}

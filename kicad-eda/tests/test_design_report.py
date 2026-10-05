@@ -108,7 +108,8 @@ def test_floating_pin_flagged_unless_declared_no_connect(buck_design: dict):
 def test_power_tree_drivers_loads_and_specs(buck_design: dict):
     tree = design_report.analyze(buck_design, str(KICAD.symbols))["power_tree"]
     assert list(tree) == ["VIN_RAW", "VIN", "SW", "V5", "GND"]
-    assert tree["SW"] == {"drivers": ["U1.2"], "loads": 2, "spec": {"voltage": 12.0, "current": 3.0}}
+    assert tree["SW"] == {"drivers": ["U1.2"], "loads": 2,
+                          "spec": {"voltage": 12.0, "current": 3.0}}
     assert tree["VIN"] == {"drivers": ["(passive/flagged source)"], "loads": 4,
                            "spec": {"voltage": 12.0, "current": 1.5}}
 
@@ -119,7 +120,8 @@ def test_rails_missing_testpoint(buck_design: dict):
     assert rep["flags"]["rails_missing_testpoint"] == ["SW", "V5", "VIN", "VIN_RAW"]   # GND is 0 V
     with_tp = {**buck_design,
                "components": buck_design["components"] + [
-                   {"ref": "TP1", "lib_id": "Connector:TestPoint", "value": "TP", "footprint": "F"}],
+                   {"ref": "TP1", "lib_id": "Connector:TestPoint", "value": "TP",
+                    "footprint": "F"}],
                "nets": {**buck_design["nets"], "V5": buck_design["nets"]["V5"] + [["TP1", "1"]]}}
     rep = design_report.analyze(with_tp, str(KICAD.symbols))
     assert rep["errors"] == []
@@ -135,7 +137,8 @@ def test_dfa_counts_need_no_symbols(buck_design: dict):
                           "by_prefix": {"C": 4, "D": 1, "F": 1, "J": 2, "L": 1, "U": 1},
                           "array_candidates": []}
     four_r = {**buck_design, "components": buck_design["components"] + [
-        {"ref": f"R{i}", "lib_id": "Device:R", "value": "10k", "footprint": "R_0603"} for i in range(1, 5)]}
+        {"ref": f"R{i}", "lib_id": "Device:R", "value": "10k", "footprint": "R_0603"}
+        for i in range(1, 5)]}
     assert design_report.analyze(four_r, "")["dfa"]["array_candidates"] == [
         {"value": "10k", "footprint": "R_0603", "count": 4, "refs": ["R1", "R2", "R3", "R4"]}]
 
@@ -172,7 +175,8 @@ def test_to_markdown_puts_errors_heading_first(buck_design: dict, tmp_path: Path
     assert lines[0] == "# Design Report — LM2596 12V->5V 3A Buck Regulator"
     assert lines[2] == "## Errors"
     assert lines[3].startswith("The following symbols could not be read;")
-    assert sum(1 for line in lines if line.startswith("- pin types unavailable for ")) == BUCK_LIB_IDS
+    assert sum(1 for line in lines
+               if line.startswith("- pin types unavailable for ")) == BUCK_LIB_IDS
     assert lines.index("## Errors") < lines.index("## DFA / BOM")
 
 
@@ -210,14 +214,111 @@ def test_components_not_a_list_of_objects_raises():
 
 
 def test_main_exit_code_follows_errors(buck_design: dict, tmp_path: Path,
-                                       monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+                                       monkeypatch: pytest.MonkeyPatch,
+                                       capsys: pytest.CaptureFixture):
     netlist = tmp_path / "netlist.json"
     netlist.write_text(json.dumps(buck_design), encoding="utf-8")
     monkeypatch.setattr("sys.argv", ["design_report.py", str(netlist), "--json"])
     assert design_report.main() == 0
     assert json.loads(capsys.readouterr().out)["errors"] == []
-    monkeypatch.setattr("sys.argv", ["design_report.py", str(netlist), str(tmp_path / "nope"), "--json"])
+    monkeypatch.setattr("sys.argv",
+                        ["design_report.py", str(netlist), str(tmp_path / "nope"), "--json"])
     assert design_report.main() == 1
     assert len(json.loads(capsys.readouterr().out)["errors"]) == BUCK_LIB_IDS
     monkeypatch.setattr("sys.argv", ["design_report.py"])
     assert design_report.main() == 2
+
+
+# --- flags.floating_detail (napkin floating-pin policy input, D5) -------------------
+
+MCU_SPEC = {"name": "NapkinMCU", "reference": "U", "pins": [
+    {"number": "1", "name": "VDD", "type": "power_in"},
+    {"number": "2", "name": "GND", "type": "power_in"},
+    {"number": "3", "name": "PA0", "type": "output"},
+    {"number": "4", "name": "PA1", "type": "input"},
+    {"number": "5", "name": "NC", "type": "passive"},
+    {"number": "6", "name": "GND", "type": "power_in"},     # stacked on pin 2: passive
+    {"number": "7", "name": "GND", "type": "power_in"},
+    {"number": "8", "name": "VDD", "type": "power_in"}]}    # stacked on pin 1
+CAP_SPEC = {"name": "Cap", "reference": "C", "pins": [
+    {"number": "1", "name": "~", "type": "passive"},
+    {"number": "2", "name": "~", "type": "passive"}]}
+MCU_FP = "Package_QFP:LQFP-8"
+
+
+@pytest.fixture
+def napkin_lib(tmp_path: Path) -> Path:
+    """A symbol directory holding NapkinLib (an MCU with D1 stacked supply
+    pins, a capacitor) and LG290P, authored with sym_author."""
+    import sym_author
+    lib = tmp_path / "NapkinLib.kicad_sym"
+    sym_author.author_symbol(MCU_SPEC, lib)
+    sym_author.author_symbol(CAP_SPEC, lib)
+    sym_author.author_symbol(sym_author.lg290p_spec(), lib)
+    return tmp_path
+
+
+def _mcu_design(**nets: list) -> dict:
+    base = {"3V3": [["U1", "1"], ["C1", "1"]], "GND": [["U1", "2"], ["C1", "2"]]}
+    return {"name": "mcu", "components": [
+                {"ref": "U1", "lib_id": "NapkinLib:NapkinMCU", "value": "MCU",
+                 "footprint": MCU_FP},
+                {"ref": "C1", "lib_id": "NapkinLib:Cap", "value": "100n", "footprint": "C"}],
+            "nets": {**base, **nets}}
+
+
+def _detail(rep: dict) -> dict:
+    return {d["pin"]: d for d in rep["flags"]["floating_detail"]}
+
+
+def test_floating_detail_names_types_and_same_name_nets(napkin_lib: Path):
+    rep = design_report.analyze(_mcu_design(), str(napkin_lib))
+    assert rep["errors"] == []
+    pins = ["U1.3", "U1.4", "U1.5", "U1.6", "U1.7", "U1.8"]
+    assert rep["flags"]["floating_pins"] == pins
+    assert [d["pin"] for d in rep["flags"]["floating_detail"]] == pins
+    detail = _detail(rep)
+    assert detail["U1.3"] == {"pin": "U1.3", "ref": "U1", "pad": "3", "type": "output",
+                              "name": "PA0", "same_name_net": None,
+                              "lib_id": "NapkinLib:NapkinMCU", "footprint": MCU_FP}
+    assert (detail["U1.4"]["type"], detail["U1.4"]["name"]) == ("input", "PA1")
+    assert (detail["U1.5"]["name"], detail["U1.5"]["same_name_net"]) == ("NC", None)
+    # D1 stacked pins: hidden, typed passive, named like the visible pin
+    for pin, name, net in (("U1.6", "GND", "GND"), ("U1.7", "GND", "GND"),
+                           ("U1.8", "VDD", "3V3")):
+        assert detail[pin]["type"] == "passive"
+        assert (detail[pin]["name"], detail[pin]["same_name_net"]) == (name, net)
+
+
+def test_floating_detail_follows_pin_name_keyed_nets(napkin_lib: Path):
+    design = _mcu_design(GND=[["U1", "GND"], ["C1", "2"]], SIG=[["U1", "PA0"], ["U1", "PA1"]])
+    rep = design_report.analyze(design, str(napkin_lib))
+    assert "U1.3" not in rep["flags"]["floating_pins"]           # PA0 netted by name
+    assert _detail(rep)["U1.6"]["same_name_net"] == "GND"
+
+
+def test_same_name_net_is_none_when_same_name_pins_disagree(napkin_lib: Path):
+    rep = design_report.analyze(_mcu_design(AGND=[["U1", "6"]]), str(napkin_lib))
+    assert _detail(rep)["U1.7"]["same_name_net"] is None
+    assert "U1.6" not in _detail(rep)
+
+
+def test_floating_detail_is_empty_without_symbols(buck_design: dict):
+    rep = design_report.analyze(buck_design, "")
+    assert rep["flags"]["floating_detail"] == []
+
+
+def test_lg290p_stacked_gnd_pads_all_join_gnd_under_the_napkin_policy(napkin_lib: Path):
+    import napkin_policy
+    design = {"name": "gnss", "components": [
+        {"ref": "U1", "lib_id": "NapkinLib:LG290P", "value": "LG290P", "footprint": "SPS:LG290P"}],
+        "nets": {"GND": [["U1", "10"]], "VCC": [["U1", "23"]]}}
+    rep = design_report.analyze(design, str(napkin_lib))
+    gnd = [d for d in rep["flags"]["floating_detail"] if d["name"] == "GND"]
+    assert len(gnd) == 58                          # 59 GND pads, pad 10 netted
+    assert all(d["same_name_net"] == "GND" for d in gnd)
+    comp = design["components"][0]
+    assert {napkin_policy.floating_pin_action(d, comp) for d in gnd} == {
+        ("net_same_name_pin", "GND")}
+    # RESERVED pins are typed no_connect in the symbol: never floating
+    assert not any(d["name"] == "RESERVED" for d in rep["flags"]["floating_detail"])
