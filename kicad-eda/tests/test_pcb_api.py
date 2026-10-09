@@ -13,13 +13,9 @@ Two tiers in one module:
 """
 from __future__ import annotations
 
-import csv
-import io
 import json
 import math
 import re
-import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +29,7 @@ from backends import pcb_items as items
 from backends import pcb_session as sess
 from backends.errors import BoardApiError
 from backends.pcb_api import BoardApi
+from fixtures.kicad_procs import owned_pids
 
 requires_api = pytest.mark.skipif(not BoardApi.available(),
                                   reason=BoardApi.unavailable_reason() or "")
@@ -809,13 +806,9 @@ def test_open_refuses_missing_file_and_bad_suffix(tmp_path):
 # live tier — headless KiCad 11 on a board built by KiCad 9's pcbnew
 # ============================================================================
 def _kicad_cli_pids() -> set[int] | None:
-    """PIDs of every kicad-cli.exe (Windows); None where tasklist is absent."""
-    if sys.platform != "win32":
-        return None
-    proc = subprocess.run(["tasklist", "/FI", "IMAGENAME eq kicad-cli.exe", "/FO", "CSV", "/NH"],
-                          capture_output=True, text=True, timeout=30)
-    return {int(row[1]) for row in csv.reader(io.StringIO(proc.stdout))
-            if len(row) > 1 and row[1].isdigit()}
+    """kicad-cli.exe PIDs this test run owns (Windows; other agents' servers on
+    the same machine are not ours); None off Windows."""
+    return owned_pids("kicad-cli.exe")
 
 
 def _assert_no_server_left(before: set[int] | None) -> None:

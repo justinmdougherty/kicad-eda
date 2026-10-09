@@ -21,7 +21,9 @@ RULES.md "K10"; skipped without a KiCad Python that imports pcbnew):
  3. outline.dxf without a sidecar -> ok false; with outline_resolve's
     sidecar -> builds;
  4. rpi5_battery_hat + corner_radius 3 -> 4 Edge.Cuts arcs;
- 5. a 300 x 200 loop board -> (paper "A3"), centred on the sheet;
+ 5. a 300 x 200 loop board -> (paper "A3"), centred on the sheet; a board
+    too big for A0 -> (paper "User" W H), capped at pcbnew's 1219.2 mm, which
+    pcbnew loads and keeps through the fill's re-save;
  6. three T10 builds -> the same footprint order (and byte-identical files);
  7. default corner mounting holes on an L-shape -> ok false.
 """
@@ -63,11 +65,11 @@ L_SHAPE = [[0, 0], [32, 0], [32, 20], [60, 20], [60, 45], [0, 45]]
     ({"w": 50, "h": 30, "datum": [0, 30]}, False),
     ({"w": 50, "h": 30, "cutouts": [{"circle": [10, 10, 2]}]}, False),
     ({"outline": {"loop": L_SHAPE}}, False)])
-def test_is_legacy_block(board, legacy):
+def test_is_legacy_block(board, legacy) -> None:
     assert bf.is_legacy_block(board) is legacy
 
 
-def test_legacy_source_keeps_the_design_and_needs_no_resolver():
+def test_legacy_source_keeps_the_design_and_needs_no_resolver() -> None:
     design = {"components": [], "board": {"auto_y": 3.0}}       # resolve_board would refuse
     src = bf.resolve_outline_source(design, {})
     assert (src.legacy, src.source, src.outline, src.sidecar) == (True, "rect", None, None)
@@ -75,7 +77,7 @@ def test_legacy_source_keeps_the_design_and_needs_no_resolver():
     assert bf.resolve_outline_source({"components": []}, {}).source == "none"
 
 
-def test_board_block_outline_is_resolved_and_validated():
+def test_board_block_outline_is_resolved_and_validated() -> None:
     design = {"components": [], "board": {"w": 60, "h": 40, "corner_radius": 3}}
     src = bf.resolve_outline_source(design, {})
     assert (src.legacy, src.source) == (False, "rounded_rect")
@@ -84,7 +86,7 @@ def test_board_block_outline_is_resolved_and_validated():
         bf.resolve_outline_source({"board": {"outline": {"loop": [[5, 5], [9, 5], [9, 9]]}}}, {})
 
 
-def test_dxf_without_sidecar_is_refused():
+def test_dxf_without_sidecar_is_refused() -> None:
     design = {"board": {"outline": {"dxf": "mech/outline.dxf"}}}
     with pytest.raises(bf.BuildError) as exc:
         bf.resolve_outline_source(design, {})
@@ -93,7 +95,7 @@ def test_dxf_without_sidecar_is_refused():
                                  "(build_board_from_netlist / outline_resolve.py does this)")
 
 
-def test_sidecar_replaces_the_board_without_mutating_the_design(tmp_path):
+def test_sidecar_replaces_the_board_without_mutating_the_design(tmp_path) -> None:
     design = {"components": [{"ref": "R1"}], "board": {"outline": {"dxf": "x.dxf"}}}
     before = json.dumps(design, sort_keys=True)
     resolved = orz.resolve_board({"board": {"outline": {"loop": L_SHAPE}}}, None)
@@ -110,7 +112,7 @@ def test_sidecar_replaces_the_board_without_mutating_the_design(tmp_path):
         bf.resolve_outline_source(design, {orz.ENV_VAR: str(bad)})
 
 
-def test_kiid_seed_is_32_bit_and_depends_on_both_inputs():
+def test_kiid_seed_is_32_bit_and_depends_on_both_inputs() -> None:
     a = bf.kiid_seed(b"netlist")
     assert a == int.from_bytes(hashlib.sha256(b"netlist").digest()[:4], "big")
     assert 0 <= a < 2 ** 32 and a == bf.kiid_seed(b"netlist", b"")
@@ -121,12 +123,18 @@ def test_kiid_seed_is_32_bit_and_depends_on_both_inputs():
     (60, 40, ("A4", 297.0, 210.0)), (257, 170, ("A4", 297.0, 210.0)),
     (258, 170, ("A3", 420.0, 297.0)), (300, 200, ("A3", 420.0, 297.0)),
     (500, 300, ("A2", 594.0, 420.0)), (1149, 801, ("A0", 1189.0, 841.0)),
-    (1300, 300, ("User", 1340.0, 340.0)), (100.2, 900, ("User", 141.0, 940.0))])
-def test_choose_sheet(w, h, sheet):
+    (1150, 300, ("User", 1190.0, 340.0)), (100.2, 900, ("User", 141.0, 940.0)),
+    # pcbnew clamps a User sheet to 48000 mils (1219.2 mm) when it loads the file
+    (1300, 300, ("User", 1219.2, 340.0)), (100.2, 1200, ("User", 141.0, 1219.2))])
+def test_choose_sheet(w, h, sheet) -> None:
     assert bf.choose_sheet(w, h) == sheet
+    overflow = bf.sheet_warnings(w, h, sheet)
+    assert bool(overflow) == (max(w, h) + 2 * bf.SHEET_MARGIN_MM > bf.MAX_USER_SHEET_MM)
+    if overflow:
+        assert "1219.2" in overflow[0] and f"{w:g} x {h:g}" in overflow[0], overflow
 
 
-def test_paper_splice():
+def test_paper_splice() -> None:
     text = b'(kicad_pcb\n\t(version 20241229)\n\t(paper "A4")\n\t(layers)\n)\n'
     assert bf.splice_paper_bytes(text, ("A3", 420.0, 297.0)) == text.replace(
         b'"A4"', b'"A3"')
@@ -137,7 +145,7 @@ def test_paper_splice():
             bf.splice_paper_bytes(bad, ("A3", 420.0, 297.0))
 
 
-def test_paper_splice_file_keeps_line_endings(tmp_path):
+def test_paper_splice_file_keeps_line_endings(tmp_path) -> None:
     pcb = tmp_path / "b.kicad_pcb"
     pcb.write_bytes(b'(kicad_pcb\r\n\t(paper "A4")\r\n)\r\n')
     bf.splice_paper(str(pcb), ("A2", 594.0, 420.0))
@@ -145,7 +153,7 @@ def test_paper_splice_file_keeps_line_endings(tmp_path):
     assert list(tmp_path.iterdir()) == [pcb]
 
 
-def test_keepout_rect_is_the_legacy_arithmetic():
+def test_keepout_rect_is_the_legacy_arithmetic() -> None:
     ox, oy, w, h = 118.5, 85.0, 60.0, 40.0
     assert bf.keepout_rect({"edge": "bottom", "depth": 6}, w, h, ox, oy) == (
         ox, oy + h - 6.0, w, 6.0)
@@ -156,14 +164,14 @@ def test_keepout_rect_is_the_legacy_arithmetic():
     assert bf.leaves_bbox((55, 0, 10, 5), w, h) and bf.leaves_bbox((-1, 0, 5, 5), w, h)
 
 
-def test_corner_positions_and_datum_default():
+def test_corner_positions_and_datum_default() -> None:
     assert bf.corner_positions(60, 40, 4) == [(4, 4), (56, 4), (56, 36), (4, 36)]
     o = ol.from_board_block({"w": 60, "h": 40})
     assert bf.datum_board(o) == (0.0, 40.0)
     assert bf.datum_board(ol.from_board_block({"w": 60, "h": 40, "datum": [10, 30]})) == (10, 30)
 
 
-def test_default_planes_heuristic():
+def test_default_planes_heuristic() -> None:
     nets = {"GND": [], "VIN": [], "+3V3": [], "SIG": []}
     assert bf.default_planes({"nets": nets}) == {"In1.Cu": "GND", "In2.Cu": "+3V3"}
     assert bf.default_planes({"nets": {"GND": [], "VBUS": []}}) == {"In1.Cu": "GND",
@@ -172,7 +180,7 @@ def test_default_planes_heuristic():
     assert bf.default_planes({"planes": {"B.Cu": "GND"}}) == {"B.Cu": "GND"}
 
 
-def test_builder_keeps_the_mounting_hole_default_and_its_size():
+def test_builder_keeps_the_mounting_hole_default_and_its_size() -> None:
     src = BUILDER.read_text(encoding="utf-8")
     assert "DEFAULT_MOUNTING_HOLE_FOOTPRINT" in src                 # test_libtable drift
     assert len(src.splitlines()) < 650
@@ -237,7 +245,7 @@ def inspect(pcb: Path, tmp_path: Path) -> dict:
     return sp.run_child(INSPECT, [pcb], tmp_path)
 
 
-def test_live_1_legacy_lm358_geometry_matches_the_pre_f3_11_golden(kicad, tmp_path):
+def test_live_1_legacy_lm358_geometry_matches_the_pre_f3_11_golden(kicad, tmp_path) -> None:
     kpy, footprints = kicad
     out = tmp_path / "lm358_geometry.json"
     proc = subprocess.run([kpy, str(CAPTURE), str(out), "--footprints", str(footprints),
@@ -264,7 +272,7 @@ def t10_build(kicad, tmp_path_factory) -> tuple[Path, dict]:
     return out, res
 
 
-def test_live_2_t10_board(t10_build, tmp_path):
+def test_live_2_t10_board(t10_build, tmp_path) -> None:
     pcb, res = t10_build
     info = res["outline"]
     assert (info["source"], info["legacy"], info["cutouts"]) == ("loop", False, 2)
@@ -293,7 +301,7 @@ def _dxf_design() -> dict:
             "nets": {"GND": [["R1", "2"], ["C1", "2"]], "+3V3": [["R1", "1"], ["C1", "1"]]}}
 
 
-def test_live_3_dxf_outline_needs_the_sidecar(kicad, tmp_path):
+def test_live_3_dxf_outline_needs_the_sidecar(kicad, tmp_path) -> None:
     from fixtures.dxf_builders import Sketch, fusion_board, fusion_doc, save
     doc, msp = fusion_doc()
     fusion_board(Sketch(msp, k=10.0))                  # 60 x 40, r 3, hole, slot; origin (10, 10)
@@ -317,7 +325,7 @@ def test_live_3_dxf_outline_needs_the_sidecar(kicad, tmp_path):
     assert got["aux"] == pytest.approx([10 + got["origin"][0], 10 + got["origin"][1]], abs=1e-6)
 
 
-def test_live_4_rpi5_hat_with_corner_radius_has_four_arcs(kicad, tmp_path):
+def test_live_4_rpi5_hat_with_corner_radius_has_four_arcs(kicad, tmp_path) -> None:
     design = load_example("rpi5_battery_hat")
     design["board"] = {**design["board"], "corner_radius": 3}
     # the stock USB-C footprints name the shield pad differently per release;
@@ -336,7 +344,7 @@ def test_live_4_rpi5_hat_with_corner_radius_has_four_arcs(kicad, tmp_path):
                                         abs=0.05)
 
 
-def test_live_5_large_loop_board_gets_a3_and_is_centred(kicad, tmp_path):
+def test_live_5_large_loop_board_gets_a3_and_is_centred(kicad, tmp_path) -> None:
     design = {"name": "big", "board": {"outline": {"loop": [[0, 0], [300, 0], [300, 200],
                                                             [0, 200]]}},
               "components": [
@@ -357,7 +365,28 @@ def test_live_5_large_loop_board_gets_a3_and_is_centred(kicad, tmp_path):
     assert got["aux"] == pytest.approx([ox, oy + 200], abs=1e-6)       # default datum
 
 
-def test_live_6_t10_rebuilds_are_deterministic(kicad, t10_build, tmp_path, record_property):
+def test_live_5b_oversized_board_gets_a_user_sheet_pcbnew_loads(kicad, tmp_path) -> None:
+    design = {"name": "huge", "board": {"outline": {"loop": [[0, 0], [1300, 0], [1300, 300],
+                                                             [0, 300]]}},
+              "components": [
+                  {"ref": "R1", "value": "1k", "footprint": "Resistor_SMD:R_0603_1608Metric",
+                   "x": 20, "y": 20, "rot": 0},
+                  {"ref": "R2", "value": "1k", "footprint": "Resistor_SMD:R_0603_1608Metric",
+                   "x": 1280, "y": 280, "rot": 0}],
+              "nets": {"N1": [["R1", "1"], ["R2", "1"]], "GND": [["R1", "2"], ["R2", "2"]]}}
+    out = tmp_path / "huge.kicad_pcb"
+    rc, res = build(kicad, write_netlist(tmp_path, design), out)
+    assert rc == 0 and res["ok"], res
+    text = out.read_text(encoding="utf-8")             # after the fill's load + re-save
+    assert '(paper "User" 1219.2 340)' in text and '(paper "A4")' not in text
+    assert res["outline"]["paper"] == "User" and res["outline"]["sheet_mm"] == [1219.2, 340.0]
+    assert [w for w in res["warnings"] if "1219.2" in w], res["warnings"]
+    got = inspect(out, tmp_path)                       # pcbnew parsed the User sheet
+    ox, oy = got["origin"]
+    assert (ox + 650, oy + 150) == pytest.approx((609.6, 170.0), abs=1e-6)
+
+
+def test_live_6_t10_rebuilds_are_deterministic(kicad, t10_build, tmp_path, record_property) -> None:
     first, _ = t10_build
     files = [first]
     for i in range(2):
@@ -373,7 +402,7 @@ def test_live_6_t10_rebuilds_are_deterministic(kicad, t10_build, tmp_path, recor
     assert identical
 
 
-def test_live_7_default_corner_holes_on_an_l_shape_are_refused(kicad, tmp_path):
+def test_live_7_default_corner_holes_on_an_l_shape_are_refused(kicad, tmp_path) -> None:
     design = {"name": "lshape", "board": {"outline": {"loop": L_SHAPE}},
               "mounting_holes": True,
               "components": [{"ref": "R1", "value": "1k",

@@ -322,3 +322,323 @@ def test_lg290p_stacked_gnd_pads_all_join_gnd_under_the_napkin_policy(napkin_lib
         ("net_same_name_pin", "GND")}
     # RESERVED pins are typed no_connect in the symbol: never floating
     assert not any(d["name"] == "RESERVED" for d in rep["flags"]["floating_detail"])
+
+
+# --- symbol sources: a directory, a LibraryResolver or a library map (F2-10, D1) ------
+
+PROJECT_NICK = "SPS_parts"
+PROJECT_LIB = f"libs/{PROJECT_NICK}.kicad_sym"
+
+
+@pytest.fixture
+def project(tmp_path: Path) -> Path:
+    """A project directory whose libs/SPS_parts.kicad_sym holds NapkinMCU, Cap
+    and LG290P (sym_author); TestLib is a stock library (FIXTURE_SYMBOLS)."""
+    import sym_author
+    lib = tmp_path / PROJECT_LIB
+    lib.parent.mkdir()
+    for spec in (MCU_SPEC, CAP_SPEC, sym_author.lg290p_spec()):
+        sym_author.author_symbol(spec, lib)
+    return tmp_path
+
+
+def _project_design(nick: str = PROJECT_NICK, block: bool = True) -> dict:
+    """U1/C1 from the project library, R1 from the stock TestLib."""
+    design = {"name": "proj", "components": [
+        {"ref": "U1", "lib_id": f"{nick}:NapkinMCU", "value": "MCU", "footprint": MCU_FP},
+        {"ref": "C1", "lib_id": f"{nick}:Cap", "value": "100n", "footprint": "C"},
+        {"ref": "R1", "lib_id": "TestLib:PosFileR", "value": "10k", "footprint": "R"}],
+        "nets": {"3V3": [["U1", "1"], ["C1", "1"], ["R1", "1"]],
+                 "GND": [["U1", "2"], ["C1", "2"], ["R1", "2"]]}}
+    if block:
+        design["libraries"] = {"symbols": {nick: PROJECT_LIB}}
+    return design
+
+
+def _resolver(project: Path, design: dict, stock: Path | None = FIXTURE_SYMBOLS):
+    import libtable
+    return libtable.LibraryResolver.for_design(project, design, stock, None)
+
+
+def _write_netlist(project: Path, design: dict) -> Path:
+    path = project / "netlist.json"
+    path.write_text(json.dumps(design), encoding="utf-8")
+    return path
+
+
+PROJECT_FLOATING = ["U1.3", "U1.4", "U1.5", "U1.6", "U1.7", "U1.8"]
+
+
+def test_resolver_reads_project_parts_and_stock_parts(project: Path):
+    design = _project_design()
+    rep = design_report.analyze(design, _resolver(project, design))
+    assert rep["errors"] == [] and rep["symbols_available"] is True
+    assert rep["decoupling"]["checked"] == [
+        {"ref": "U1", "rails": ["3V3", "GND"], "decoupled": ["3V3", "GND"]}]
+    assert rep["flags"]["floating_pins"] == PROJECT_FLOATING
+    # F5-08's floating_detail keeps working for project-local parts
+    detail = _detail(rep)
+    assert detail["U1.3"] == {"pin": "U1.3", "ref": "U1", "pad": "3", "type": "output",
+                              "name": "PA0", "same_name_net": None,
+                              "lib_id": f"{PROJECT_NICK}:NapkinMCU", "footprint": MCU_FP}
+    assert (detail["U1.8"]["name"], detail["U1.8"]["same_name_net"]) == ("VDD", "3V3")
+
+
+def test_library_map_and_its_json_round_trip_match_the_resolver(project: Path):
+    design = _project_design()
+    resolver = _resolver(project, design)
+    expected = design_report.analyze(design, resolver)
+    lib_map = resolver.library_map()
+    assert design_report.analyze(design, lib_map) == expected
+    assert design_report.analyze(design, json.loads(json.dumps(lib_map))) == expected
+
+
+def test_a_nickname_other_than_the_file_stem_needs_the_resolver(project: Path):
+    design = _project_design(nick="GNSS")              # libs/SPS_parts.kicad_sym as GNSS
+    rep = design_report.analyze(design, _resolver(project, design))
+    assert rep["errors"] == [] and rep["flags"]["floating_pins"] == PROJECT_FLOATING
+    # dir mode keeps the stock naming convention: <dir>/GNSS.kicad_sym does not exist
+    rep = design_report.analyze(design, str(project / "libs"))
+    assert [e.split(": ", 1)[0] for e in rep["errors"]] == [
+        "pin types unavailable for GNSS:NapkinMCU (U1)", "pin types unavailable for GNSS:Cap (C1)",
+        "pin types unavailable for TestLib:PosFileR (R1)"]
+
+
+def test_project_sym_lib_table_resolves_without_a_libraries_block(project: Path):
+    (project / "sym-lib-table").write_text(
+        '(sym_lib_table\n  (version 7)\n  (lib (name "SPS_parts")(type "KiCad")'
+        '(uri "${KIPRJMOD}/libs/SPS_parts.kicad_sym")(options "")(descr ""))\n)\n',
+        encoding="utf-8")
+    design = _project_design(block=False)
+    rep = design_report.analyze(design, _resolver(project, design))
+    assert rep["errors"] == [] and rep["flags"]["floating_pins"] == PROJECT_FLOATING
+
+
+def test_unresolvable_nickname_is_reported_with_its_refs_and_others_stay_covered(
+        project: Path):
+    design = {**_project_design(), "components": _project_design()["components"] + [
+        {"ref": "U2", "lib_id": "Missing:Chip", "value": "?", "footprint": "F"},
+        {"ref": "U3", "lib_id": "Missing:Chip", "value": "?", "footprint": "F"}]}
+    rep = design_report.analyze(design, _resolver(project, design))
+    assert len(rep["errors"]) == 1
+    assert rep["errors"][0].startswith(
+        "pin types unavailable for Missing:Chip (U2, U3): SymbolLibError: "
+        "symbol library not found: 'Missing': ")
+    assert rep["decoupling"]["checked"][0]["ref"] == "U1"
+
+
+def test_a_library_of_another_type_is_an_error_naming_it(project: Path):
+    (project / "sym-lib-table").write_text(
+        '(sym_lib_table\n  (version 7)\n  (lib (name "SPS_parts")(type "Legacy")'
+        '(uri "${KIPRJMOD}/libs/SPS_parts.lib")(options "")(descr ""))\n)\n',
+        encoding="utf-8")
+    design = _project_design(block=False)
+    rep = design_report.analyze(design, _resolver(project, design))
+    assert [e.split(": ", 1)[0] for e in rep["errors"]] == [   # one per lib_id; R1 is stock
+        f"pin types unavailable for {PROJECT_NICK}:NapkinMCU (U1)",
+        f"pin types unavailable for {PROJECT_NICK}:Cap (C1)"]
+    assert all("'SPS_parts'" in e and "has type 'Legacy'" in e for e in rep["errors"])
+
+
+def test_symbols_keyword_overrides_the_positional_directory(project: Path):
+    """The harness passes ctx.syms positionally and a feature's resolver as
+    ``symbols=`` (rp_hooks analysis_kwargs)."""
+    design = _project_design()
+    resolver = _resolver(project, design)
+    assert design_report.analyze(design, str(FIXTURE_SYMBOLS), symbols=resolver) == \
+        design_report.analyze(design, resolver)
+    off = design_report.analyze(design, str(FIXTURE_SYMBOLS), symbols="")
+    assert off["symbols_available"] is False and off["errors"] == []
+
+
+@pytest.mark.parametrize("empty", ["", None, {}])
+def test_no_source_is_a_config_choice(buck_design: dict, empty):
+    rep = design_report.analyze(buck_design, empty)
+    assert rep["errors"] == [] and rep["symbols_available"] is False
+
+
+@pytest.mark.parametrize("bad", [42, ["dir"], object()])
+def test_a_source_of_another_kind_is_a_type_error(bad):
+    with pytest.raises(TypeError, match="symbol source"):
+        design_report.analyze(_synthetic_design(), bad)
+
+
+def test_a_path_object_is_a_directory(buck_design: dict, tmp_path: Path):
+    assert design_report.analyze(buck_design, tmp_path / "nope") == \
+        design_report.analyze(buck_design, str(tmp_path / "nope"))
+
+
+# --- stacked pins: a floating hidden passive pin suggests pin_groups (F2-10, D1) ----
+
+def test_floating_stacked_pins_carry_a_pin_groups_hint(napkin_lib: Path):
+    rep = design_report.analyze(_mcu_design(), str(napkin_lib))
+    detail = _detail(rep)
+    for pin in ("U1.3", "U1.4", "U1.5"):                  # not stacked: no new keys
+        assert "stacked_on" not in detail[pin] and "hint" not in detail[pin]
+    assert (detail["U1.6"]["stacked_on"], detail["U1.7"]["stacked_on"],
+            detail["U1.8"]["stacked_on"]) == ("2", "2", "1")
+    assert detail["U1.6"]["hint"] == (
+        "hidden pin stacked on U1.2 ('GND'): put every pad of pin_groups['GND'] (2, 6, 7) "
+        "on net GND; KiCad joins stacked pins in the schematic, but the board takes "
+        "pad nets from the netlist")
+    assert detail["U1.7"]["hint"] == detail["U1.6"]["hint"]
+    assert "pin_groups['VDD'] (1, 8) on net 3V3" in detail["U1.8"]["hint"]
+
+
+def test_stacked_hint_without_a_netted_group_names_no_net(napkin_lib: Path):
+    design = _mcu_design()
+    design["nets"] = {"3V3": [["C1", "1"]], "GND": [["C1", "2"]]}
+    hint = _detail(design_report.analyze(design, str(napkin_lib)))["U1.6"]["hint"]
+    assert "pin_groups['GND'] (2, 6, 7) on one net;" in hint
+
+
+def test_markdown_lists_each_stack_once(napkin_lib: Path):
+    md = design_report.to_markdown(design_report.analyze(_mcu_design(), str(napkin_lib)))
+    stack_lines = [line for line in md.splitlines() if line.startswith("- Stacked pins")]
+    assert stack_lines == [
+        "- Stacked pins floating on U1: pad(s) 6, 7 — hidden pin stacked on U1.2 ('GND'): put "
+        "every pad of pin_groups['GND'] (2, 6, 7) on net GND; KiCad joins stacked pins in "
+        "the schematic, but the board takes pad nets from the netlist",
+        "- Stacked pins floating on U1: pad(s) 8 — hidden pin stacked on U1.1 ('VDD'): put "
+        "every pad of pin_groups['VDD'] (1, 8) on net 3V3; KiCad joins stacked pins in the "
+        "schematic, but the board takes pad nets from the netlist"]
+    assert md.index("- Floating pins:") < md.index("- Stacked pins")
+
+
+def test_lg290p_hint_compacts_the_gnd_pad_list(project: Path):
+    design = {"name": "gnss", "libraries": {"symbols": {PROJECT_NICK: PROJECT_LIB}},
+              "components": [{"ref": "U1", "lib_id": f"{PROJECT_NICK}:LG290P",
+                              "value": "LG290P", "footprint": "SPS:LG290P"}],
+              "nets": {"GND": [["U1", "10"]], "VCC": [["U1", "23"]]}}
+    rep = design_report.analyze(design, _resolver(project, design))
+    gnd = [d for d in rep["flags"]["floating_detail"] if d["name"] == "GND"]
+    assert len(gnd) == 58 and {d["stacked_on"] for d in gnd} == {"10"}
+    assert "pin_groups['GND'] (10, 12, 13, 24-79) on net GND" in gnd[0]["hint"]
+    md = design_report.to_markdown(rep)
+    assert [line.split(" — ")[0] for line in md.splitlines()
+            if line.startswith("- Stacked pins")] == [
+        "- Stacked pins floating on U1: pad(s) 12, 13, 24-79"]
+    # non-stacked floating signal pins carry no hint
+    assert all("hint" not in d for d in rep["flags"]["floating_detail"] if d["name"] != "GND")
+
+
+OLD_FORMAT_LIB = """(kicad_symbol_lib (version 20211014) (generator kicad_symbol_editor)
+  (symbol "Old" (in_bom yes) (on_board yes)
+    (property "Reference" "U" (id 0) (at 0 0 0))
+    (symbol "Old_1_1"
+      (pin power_in line (at 0 -5.08 90) (length 2.54)
+        (name "GND") (number "1"))
+      (pin passive line (at 0 -5.08 90) (length 2.54) hide
+        (name "GND") (number "2"))
+      (pin passive line (at 2.54 -5.08 90) (length 2.54) hide
+        (name "SHIELD") (number "3"))
+      (pin passive line (at 0 -5.08 90) (length 2.54)
+        (name "GND") (number "4"))
+      (pin input line (at 0 -5.08 90) (length 2.54) (hide yes)
+        (name "GND") (number "5"))
+    )
+  )
+)
+"""
+
+
+def test_stacked_means_hidden_passive_on_an_earlier_pins_point(tmp_path: Path):
+    """KiCad 6-8 write a bare ``hide`` token: pin 2 is stacked on pin 1; pin 3
+    is hidden but alone, pin 4 shares the point but is visible, pin 5 is
+    hidden on the point but typed input: none of those is a stacked pin."""
+    (tmp_path / "OldLib.kicad_sym").write_text(OLD_FORMAT_LIB, encoding="utf-8")
+    design = {"name": "old", "components": [
+        {"ref": "U1", "lib_id": "OldLib:Old", "value": "Old", "footprint": "F"}],
+        "nets": {"GND": [["U1", "1"]]}}
+    detail = _detail(design_report.analyze(design, str(tmp_path)))
+    assert sorted(detail) == ["U1.2", "U1.3", "U1.4", "U1.5"]
+    assert {pin: d.get("stacked_on") for pin, d in detail.items()} == {
+        "U1.2": "1", "U1.3": None, "U1.4": None, "U1.5": None}
+
+
+UNNAMED_STACK_LIB = """(kicad_symbol_lib (version 20241209) (generator "kicad-eda-tests")
+  (symbol "Tab" (in_bom yes) (on_board yes)
+    (property "Reference" "J" (at 0 0 0))
+    (symbol "Tab_1_1"
+      (pin passive line (at 0 0 0) (length 2.54) (name "~") (number "1"))
+      (pin passive line (at 0 0 0) (length 2.54) (hide yes) (name "~") (number "2"))
+      (pin passive line (at 0 0 0) (length 2.54) (hide yes) (name "~") (number "3"))
+      (pin passive line (at 2.54 0 0) (length 2.54) (name "~") (number "4"))
+      (pin passive line (at 5.08 0 0) (length 2.54))
+    )
+  )
+)
+"""
+
+
+def test_an_unnamed_stack_suggests_netting_its_own_pads(tmp_path: Path):
+    """No pin name, so no pin_groups entry: the hint names the stack's pads
+    (a pin without a number is ignored, as everywhere else)."""
+    (tmp_path / "TabLib.kicad_sym").write_text(UNNAMED_STACK_LIB, encoding="utf-8")
+    design = {"name": "tab", "components": [
+        {"ref": "J1", "lib_id": "TabLib:Tab", "value": "Tab", "footprint": "F"}],
+        "nets": {"SIG": [["J1", "1"]]}}
+    rep = design_report.analyze(design, str(tmp_path))
+    detail = _detail(rep)
+    assert sorted(detail) == ["J1.2", "J1.3", "J1.4"]
+    assert detail["J1.2"]["hint"] == detail["J1.3"]["hint"] == (
+        "hidden pin stacked on J1.1: put every pad of the stack at J1.1 (1-3) on net SIG; "
+        "KiCad joins stacked pins in the schematic, but the board takes pad nets from the "
+        "netlist")
+    assert "stacked_on" not in detail["J1.4"]
+
+
+def test_markdown_lists_consolidation_opportunities(buck_design: dict):
+    four_r = {**buck_design, "components": buck_design["components"] + [
+        {"ref": f"R{i}", "lib_id": "Device:R", "value": "10k", "footprint": "R:R_0603"}
+        for i in range(1, 5)]}
+    md = design_report.to_markdown(design_report.analyze(four_r, ""))
+    assert "  - 4× `10k` R_0603 (R1, R2, R3, R4)" in md.splitlines()
+
+
+@requires_symbols
+def test_stock_stacked_gnd_pins_get_the_hint():
+    """KiCad's RF_GPS:L70-R stacks hidden passive GND pins 10 and 12 on pin 1."""
+    design = {"name": "gps", "components": [
+        {"ref": "U1", "lib_id": "RF_GPS:L70-R", "value": "L70-R", "footprint": "F"}],
+        "nets": {"GND": [["U1", "1"]]}}
+    detail = _detail(design_report.analyze(design, str(KICAD.symbols)))
+    assert (detail["U1.10"]["stacked_on"], detail["U1.12"]["stacked_on"]) == ("1", "1")
+    assert "pin_groups['GND'] (1, 10, 12) on net GND" in detail["U1.10"]["hint"]
+
+
+# --- CLI: <symbols> goes through the netlist's resolver, as sch_build's does ----------
+
+def test_cli_resolves_the_netlist_libraries_block(project: Path, capsys: pytest.CaptureFixture):
+    netlist = _write_netlist(project, _project_design())
+    assert design_report.main([str(netlist), str(FIXTURE_SYMBOLS), "--json"]) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["errors"] == [] and rep["flags"]["floating_pins"] == PROJECT_FLOATING
+
+
+def test_cli_takes_a_library_map_file(project: Path, capsys: pytest.CaptureFixture):
+    design = _project_design(nick="GNSS")
+    netlist = _write_netlist(project, design)
+    lib_map = project / "libmap.json"
+    lib_map.write_text(json.dumps(_resolver(project, design).library_map()), encoding="utf-8")
+    assert design_report.main([str(netlist), str(lib_map), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["flags"]["floating_pins"] == PROJECT_FLOATING
+
+
+def test_cli_markdown_mode_and_a_bad_libraries_block(project: Path,
+                                                     capsys: pytest.CaptureFixture):
+    netlist = _write_netlist(project, _project_design())
+    assert design_report.main([str(netlist), str(FIXTURE_SYMBOLS)]) == 0
+    assert capsys.readouterr().out.startswith("# Design Report — proj")
+    netlist = _write_netlist(project, {**_project_design(), "libraries": {"symbols": []}})
+    assert design_report.main([str(netlist), str(FIXTURE_SYMBOLS), "--json"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False and "libraries.symbols must be an object" in out["error"]
+    assert design_report.main([str(netlist), str(FIXTURE_SYMBOLS)]) == 1
+    assert capsys.readouterr().out.startswith("error: ")
+
+
+@pytest.mark.parametrize("argv", [[], ["a.json", "syms", "extra"], ["--json"]])
+def test_cli_usage_errors_exit_2(argv: list[str], capsys: pytest.CaptureFixture):
+    assert design_report.main(argv) == 2
+    assert "usage: design_report.py" in capsys.readouterr().out

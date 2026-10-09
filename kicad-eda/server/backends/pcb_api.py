@@ -607,9 +607,10 @@ class BoardApi:
         degrees, on side 'F' or 'B' (KiCad flips it), as ``ref`` with
         ``value`` ('' keeps the library's, the footprint name). The footprint
         libraries load first (headless: once per session). Returns {id, ref,
-        value, x, y, rot, side, bbox, pads (count), lib_id (KiCad's FPID)};
-        the pads have no nets yet. Every library error names the lib_id and
-        the project fp-lib-table."""
+        value, x, y, rot, side, bbox, pads (count), lib_id} with lib_id the
+        FPID KiCad stamped ('' for none), plus ``notes`` when that differs
+        from the request; the pads have no nets yet. Every library error
+        names the lib_id and the project fp-lib-table."""
         self._require_open()
         _check_lib_id(lib_id, Path(self._path).parent / sess.FP_TABLE)
         _check_ref(ref)
@@ -618,7 +619,7 @@ class BoardApi:
         position = kb.vec(_coord(x_mm, "x"), _coord(y_mm, "y"))
         angle, layer = _angle(_degrees(rot)), _side_layer(side)
         self._refuse_duplicate(ref)
-        self._session.load_libraries((kb.LT_FOOTPRINT,))
+        self._load_footprint_libraries(lib_id, ref)
         placed = self._place(lib_id, ref, position, angle, layer)
         self._dirty = True                       # KiCad holds the footprint from here on
         placed.reference_field.text.value = ref
@@ -629,9 +630,29 @@ class BoardApi:
                              self._board.update_items, [placed])
         footprint = updated[0] if updated else placed
         bbox = self._call(f"bounding box of {ref}", self._board.get_item_bounding_box, footprint)
-        fpid = str(footprint.definition.id)
-        return {**items.footprint_dict(footprint, bbox, len(_definition_pads(footprint))),
-                "lib_id": fpid if fpid.strip(":") else lib_id}
+        found = items.footprint_dict(footprint, bbox, len(_definition_pads(footprint)))
+        return self._with_fpid(found, str(footprint.definition.id), lib_id, ref)
+
+    def _with_fpid(self, placed: dict, fpid: str, lib_id: str, ref: str) -> dict:
+        """``placed`` with the FPID KiCad stamped as lib_id ('' when it
+        stamped none, which str(LibraryIdentifier) renders as ':'); a
+        mismatch with the requested lib_id is reported, never papered over."""
+        stamped = fpid if fpid.strip(":") else ""
+        if stamped == lib_id:
+            return {**placed, "lib_id": stamped}
+        note = (f"KiCad stamped {repr(stamped) if stamped else 'no FPID'} on {ref}, not the "
+                f"requested {lib_id!r}")
+        self._note(note)
+        return {**placed, "lib_id": stamped, "notes": [note]}
+
+    def _load_footprint_libraries(self, lib_id: str, ref: str) -> None:
+        """The session's footprint-library load; its failure names the lib_id
+        being placed as well as the project fp-lib-table."""
+        try:
+            self._session.load_libraries((kb.LT_FOOTPRINT,))
+        except BoardApiError as exc:
+            raise BoardApiError(f"placing {lib_id} as {ref} on {self._path} failed: "
+                                f"{exc}") from exc
 
     def _refuse_duplicate(self, ref: str) -> None:
         taken = {str(fp.reference_field.text.value)

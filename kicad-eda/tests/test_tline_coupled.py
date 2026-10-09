@@ -6,9 +6,9 @@ EMPIRICAL Wheeler-dW mapping (w + dW, s - dW, b - t), offset lines by the per-mo
 Kirschning-Jansen 1984 at t = 0 on the EMPIRICAL mapping w + d, s - d,
 d = du_r + 0.2 (du1 - du_r) [R-imp].
 
-Pair results (the FD tier's FdResult convention): z0 = sqrt(z_even z_odd) (the coupler Z0 of
-Rogers note 3.2.1), z_diff = 2 z_odd, z_comm = z_even / 2, eeff / eeff_f / delay of the odd
-mode. est_error_pct refers to z_diff.
+Pair results (stripline.pair_line_result; fieldsolve2d.FdResult uses the same, D7-06):
+z0 = sqrt(z_even z_odd) (the coupler Z0 of Rogers note 3.2.1), z_diff = 2 z_odd,
+z_comm = z_even / 2, eeff / eeff_f / delay of the odd mode. est_error_pct refers to z_diff.
 
 Broadside validity envelope (D7-05 rework): Cohn 1960 holds for close coupling only; an FD
 sweep over w/h_out, g/h_out and t/h_out (BSL_SWEEP) pins where class A / B hold and that every
@@ -217,6 +217,7 @@ def test_dual_stripline_edge_pair_is_class_c_and_names_the_layer() -> None:
     assert out.accuracy_class == "C" and "dual" in out.model
     assert any("In3.Cu" in m for m in out.warnings)
     assert out.z_diff == pytest.approx(2 * out.z_odd)
+    assert out.z0 == pytest.approx(math.sqrt(out.z_even * out.z_odd))
 
 
 # ---------------------------------------------------------------- broadside
@@ -717,6 +718,40 @@ def test_coupled_microstrip_geometry_errors_are_loud() -> None:
         tline.evaluate(cms(0.2, None, 0.2104, 4.4))
     with pytest.raises(ValueError, match="gap"):
         tline.evaluate(cms(0.3, 0.005, 0.2104, 4.4))
+
+
+@pytest.mark.parametrize("w, h, er, t", [(0.1, 0.2104, 4.4, T_1OZ), (0.3, 1.51, 4.5, T_1OZ),
+                                         (0.5, 1.51, 4.5, 0.07), (0.03, 1.51, 4.5, 0.0)])
+def test_coupled_microstrip_at_the_mapping_edge_never_overflows(w: float, h: float, er: float,
+                                                                t: float) -> None:
+    """D7-05 review 2: micron gaps at the edge of the d / du1 mappings drove KJ84's odd-mode
+    term exp(Q6 ln u u^-Q9) out of the float range (OverflowError; Q6 < 0 below g 0.0015).
+    A mapped gap under KJ84_MIN_G h is a loud ValueError; an air-mapped one takes the
+    closed-gap eeff fallback."""
+    d, d1 = cm.mapped_increments(w, h, t, er)
+    outcomes = Counter()
+    for i in range(500):
+        s = d + h * 10 ** (-7 + 6.5 * i / 500)               # (s - d)/h from 1e-7 to 0.3
+        if (s - d) / h < cm.KJ84_MIN_G:
+            with pytest.raises(ValueError, match="gap .* too small"):
+                tline.evaluate(cms(w, s, h, er, t=t))
+            outcomes["error"] += 1
+            continue
+        out = tline.evaluate(cms(w, s, h, er, t=t))
+        assert min(out.z_odd, out.z_even) > 0 and 1.0 <= out.eeff <= er, s
+        assert out.accuracy_class == "C" or out.z_odd < out.z_even, s   # g < 0.1: class C
+        closed = (s - d1) / h < cm.KJ84_MIN_G
+        assert closed == any("air mapping" in m for m in out.warnings), s
+        outcomes["fallback" if closed else "ok"] += 1
+    assert outcomes["error"] and outcomes["ok"] and (outcomes["fallback"] or t == 0.0)
+
+
+def test_kj84_static_outside_its_numeric_domain_is_a_value_error() -> None:
+    for u, g in [(0.02, 1e-3), (0.5, 0.0), (2000.0, 9000.0)]:   # tiny gap; huge u and g
+        with pytest.raises(ValueError, match="kj84"):
+            cm.kj84_static(u, g, 4.4)
+    edge = cm.kj84_static(0.02, cm.KJ84_MIN_G, 4.4)          # just inside: finite, positive
+    assert all(math.isfinite(v) and v > 0 for v in edge)
 
 
 # ---------------------------------------------------------------- monotonicity

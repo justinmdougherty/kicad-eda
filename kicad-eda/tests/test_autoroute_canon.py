@@ -29,6 +29,10 @@ import kicad_env as env
 import kicad_ipc as ipc
 import toolchain as tc
 
+Install = env.KiCadInstall
+MonkeyPatch = pytest.MonkeyPatch
+Hold = Callable[..., object]            # the registry fixture: hold(pcb, modified=False)
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "dsn"
 K9_BOARD = ('(kicad_pcb\n\t(version 20241229)\n\t(generator "pcbnew")\n'
             '\t(generator_version "9.0")\n\t(general\n\t\t(thickness 1.6)\n\t)\n)\n')
@@ -52,7 +56,7 @@ def _install(base: Path, version: str, vt: tuple[int, int, int], *,
 
 
 @pytest.fixture
-def machine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> env.KiCadInstall:
+def machine(monkeypatch: MonkeyPatch, tmp_path: Path) -> env.KiCadInstall:
     """KiCad 9.0.4 with its pcbnew Python, Java and a jar; no GUI."""
     stable = _install(tmp_path / "kicad", "9.0", (9, 0, 4), python=True)
     monkeypatch.setattr(env, "discover", lambda refresh=False: [stable])
@@ -64,7 +68,7 @@ def machine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> env.KiCadInstall
 
 
 @pytest.fixture
-def registry(monkeypatch: pytest.MonkeyPatch) -> Callable[..., object]:
+def registry(monkeypatch: MonkeyPatch) -> Callable[..., object]:
     """An isolated board registry; hold(pcb, modified=...) puts a stub session on it."""
     monkeypatch.setattr(brt, "_BOARDS", {})
     monkeypatch.setattr(brt, "_PROGRESS", {})
@@ -134,20 +138,21 @@ class Chain:
                 for a in self.calls]
 
 
-def _chain(monkeypatch: pytest.MonkeyPatch, export: str | None, **kw: bool) -> Chain:
+def _chain(monkeypatch: MonkeyPatch, export: str | None, **kw: bool) -> Chain:
     chain = Chain(export, **kw)
     monkeypatch.setattr(tc, "run", chain)
     return chain
 
 
-def _no_run(monkeypatch: pytest.MonkeyPatch) -> None:
+def _no_run(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(tc, "run", lambda args, **kw: pytest.fail(f"ran {list(args)[:2]}"))
 
 
 # ----------------------------------------------------------------------------
 # autoroute_board: the canonical DSN
 # ----------------------------------------------------------------------------
-def test_freerouting_reads_the_canonical_dsn(machine, pcb, monkeypatch) -> None:
+def test_freerouting_reads_the_canonical_dsn(
+        machine: Install, pcb: str, monkeypatch: MonkeyPatch) -> None:
     raw = _raw("buck_r01")
     chain = _chain(monkeypatch, raw)
     res = bpt.autoroute_board(pcb)
@@ -159,7 +164,8 @@ def test_freerouting_reads_the_canonical_dsn(machine, pcb, monkeypatch) -> None:
     assert chain.steps() == ["swig_export_dsn.py", "-jar", "swig_import_ses.py", "drc"]
 
 
-def test_two_uuid_orders_route_identical_bytes(machine, pcb, monkeypatch) -> None:
+def test_two_uuid_orders_route_identical_bytes(
+        machine: Install, pcb: str, monkeypatch: MonkeyPatch) -> None:
     hashes, routed = [], []
     for name in ("buck_r01", "buck_r05", "buck_r02"):
         chain = _chain(monkeypatch, _raw(name))
@@ -170,7 +176,8 @@ def test_two_uuid_orders_route_identical_bytes(machine, pcb, monkeypatch) -> Non
     assert len(set(hashes)) == 1 and len(set(routed)) == 1 and len(routed) == 3
 
 
-def test_dsn_seed_reaches_canonicalize(machine, pcb, monkeypatch) -> None:
+def test_dsn_seed_reaches_canonicalize(
+        machine: Install, pcb: str, monkeypatch: MonkeyPatch) -> None:
     raw = _raw("buck_r02")
     seen: list[tuple[str, int]] = []
     real = dc.canonicalize_file
@@ -190,7 +197,8 @@ def test_dsn_seed_reaches_canonicalize(machine, pcb, monkeypatch) -> None:
     assert alt["dsn_sha256"] == _sha(chain.routed[1]) != base["dsn_sha256"]
 
 
-def test_a_garbage_dsn_stops_at_dsn_canon(machine, pcb, monkeypatch, tmp_path) -> None:
+def test_a_garbage_dsn_stops_at_dsn_canon(
+        machine: Install, pcb: str, monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     stale_ses = tmp_path / "netlist.ses"
     stale_ses.write_text("(session old)", encoding="utf-8")
     chain = _chain(monkeypatch, 'not a DSN "at all')
@@ -201,7 +209,8 @@ def test_a_garbage_dsn_stops_at_dsn_canon(machine, pcb, monkeypatch, tmp_path) -
     assert Path(res["dsn"]).read_text(encoding="utf-8") == 'not a DSN "at all'   # kept as is
 
 
-def test_a_failed_export_never_routes_a_stale_dsn(machine, pcb, monkeypatch, tmp_path) -> None:
+def test_a_failed_export_never_routes_a_stale_dsn(
+        machine: Install, pcb: str, monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / "netlist.dsn").write_text(dc.canonicalize(_raw("buck_r01")), encoding="utf-8")
     chain = _chain(monkeypatch, None)
     res = bpt.autoroute_board(pcb)
@@ -210,14 +219,15 @@ def test_a_failed_export_never_routes_a_stale_dsn(machine, pcb, monkeypatch, tmp
 
 
 @pytest.mark.parametrize("seed", [-1, True, "2", 1.5, None])
-def test_a_bad_dsn_seed_is_refused_before_anything_runs(machine, pcb, monkeypatch,
-                                                        seed: object) -> None:
+def test_a_bad_dsn_seed_is_refused_before_anything_runs(
+        machine: Install, pcb: str, monkeypatch: MonkeyPatch, seed: object) -> None:
     _no_run(monkeypatch)
     res = bpt.autoroute_board(pcb, dsn_seed=seed)  # type: ignore[arg-type]
     assert res["ok"] is False and "dsn_seed" in res["reason"], res
 
 
-def test_route_and_import_failures_carry_the_dsn_hash(machine, pcb, monkeypatch) -> None:
+def test_route_and_import_failures_carry_the_dsn_hash(
+        machine: Install, pcb: str, monkeypatch: MonkeyPatch) -> None:
     raw = _raw("buck_r05")
     _chain(monkeypatch, raw, ses=False)
     res = bpt.autoroute_board(pcb, dsn_seed=1)
@@ -226,7 +236,8 @@ def test_route_and_import_failures_carry_the_dsn_hash(machine, pcb, monkeypatch)
     assert res["dsn_seed"] == 1
 
 
-def test_unrouted_result_keeps_the_dsn_fields(machine, pcb, monkeypatch) -> None:
+def test_unrouted_result_keeps_the_dsn_fields(
+        machine: Install, pcb: str, monkeypatch: MonkeyPatch) -> None:
     _chain(monkeypatch, _raw("buck_r01"), drc_clean=False)
     res = bpt.autoroute_board(pcb)
     assert res["ok"] is False and res["unconnected"] == 1 and res["dsn_seed"] == 0
@@ -241,7 +252,8 @@ def test_the_tool_docstring_names_dsn_seed() -> None:
 # ----------------------------------------------------------------------------
 # add_ground_stitching: board-API session release
 # ----------------------------------------------------------------------------
-def test_stitching_releases_an_idle_session(machine, pcb, registry, monkeypatch) -> None:
+def test_stitching_releases_an_idle_session(
+        machine: Install, pcb: str, registry: Hold, monkeypatch: MonkeyPatch) -> None:
     idle = registry(pcb)
     brt._PROGRESS[brt._key(pcb)] = (3, 3)
     chain = _chain(monkeypatch, None)
@@ -253,7 +265,8 @@ def test_stitching_releases_an_idle_session(machine, pcb, registry, monkeypatch)
 
 
 def test_stitching_refuses_a_dirty_session_before_touching_any_file(
-        machine, pcb, registry, monkeypatch, tmp_path) -> None:
+        machine: Install, pcb: str, registry: Hold, monkeypatch: MonkeyPatch,
+        tmp_path: Path) -> None:
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
     dirty = registry(pcb, modified=True)
     _no_run(monkeypatch)
@@ -263,15 +276,15 @@ def test_stitching_refuses_a_dirty_session_before_touching_any_file(
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == before
 
 
-def test_stitching_without_a_session_reports_no_release(machine, pcb, registry,
-                                                        monkeypatch) -> None:
+def test_stitching_without_a_session_reports_no_release(
+        machine: Install, pcb: str, registry: Hold, monkeypatch: MonkeyPatch) -> None:
     _chain(monkeypatch, None)
     res = bpt.add_ground_stitching(pcb, interior=False)
     assert res["ok"] is True and res["mode"] == "fence" and "released_boards" not in res
 
 
-def test_a_refused_baseline_still_reports_the_release(machine, pcb, registry,
-                                                      monkeypatch) -> None:
+def test_a_refused_baseline_still_reports_the_release(
+        machine: Install, pcb: str, registry: Hold, monkeypatch: MonkeyPatch) -> None:
     idle = registry(pcb)
     _chain(monkeypatch, None, drc_clean=False)
     res = bpt.add_ground_stitching(pcb)

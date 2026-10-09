@@ -233,6 +233,39 @@ def test_e3_board_only_parts_need_no_symbol(world):
     assert _run(world, design) == ([], [])
 
 
+def test_e3_a_declared_library_that_is_not_a_file_is_e2_alone(world):
+    design = _design()
+    design["libraries"]["symbols"]["Proj_parts"] = "libs/Proj_parts.pretty"   # a directory
+    errors, _ = _run(world, design)
+    assert _codes(errors) == ["LIB-E2"] and "is not a .kicad_sym" in errors[0]
+
+
+def test_e3_the_power_flag_the_schematic_build_always_embeds(world):
+    _sym_lib(world["syms"] / "power.kicad_sym", RES)        # power without PWR_FLAG
+    expected = ["LIB-E3 symbol power:PWR_FLAG (power flags): symbol power:PWR_FLAG not found "
+                "in power.kicad_sym"]
+    assert _run(world, _design())[0] == expected
+    dir_design = _design()
+    del dir_design["libraries"], dir_design["components"][2]
+    assert libs.check(dir_design, LintContext(symbols=str(world["syms"])))[0] == expected
+
+
+def test_e3_the_mounting_hole_footprint_the_board_build_loads(world):
+    design = {**_design(), "mounting_holes": {"footprint": "Dev:NoHole", "inset": 3}}
+    hole_error = (f"LIB-E3 footprint Dev:NoHole (mounting_holes): NoHole.kicad_mod not found "
+                  f"in {world['fps'] / 'Dev.pretty'}")
+    assert _run(world, design)[0] == [hole_error]
+    design["components"].append({"ref": "H9", "footprint": "Dev:NoHole", "board_only": True})
+    assert _run(world, design)[0] == [hole_error.replace("(mounting_holes)",
+                                                         "(H9, mounting_holes)")]
+    for holes in ({"footprint": "Dev:R_0603"}, False, {}):  # found, or no holes at all
+        assert _run(world, {**_design(), "mounting_holes": holes}) == ([], [])
+    errors, _ = _run(world, {**_design(), "mounting_holes": True})   # default footprint
+    assert _codes(errors) == ["LIB-E2"] and "'MountingHole'" in errors[0]
+    _footprint(world["fps"] / "MountingHole.pretty", "MountingHole_3.2mm_M3", ["1"])
+    assert _run(world, {**_design(), "mounting_holes": True}) == ([], [])
+
+
 # --- LIB-E4 ---------------------------------------------------------------------------------
 def test_e4_netted_keys_must_be_footprint_pads(world):
     design = _design()
@@ -395,6 +428,7 @@ def test_dir_mode_footprints_dir_option_and_a_missing_one(world, tmp_path):
         ["LIB-E3 symbol Dev", "Nope (X1)"]]
     syms_only = tmp_path / "lonely" / "symbols"             # no sibling footprints/
     _sym_lib(syms_only / "Dev.kicad_sym", STACK, RES)
+    _sym_lib(syms_only / "power.kicad_sym", PWR)
     errors, _ = libs.check(_dir_design(), LintContext(symbols=str(syms_only)))
     assert errors == ["LIB-E3 symbol Dev:Nope (X1): symbol Dev:Nope not found in Dev.kicad_sym"]
 
@@ -465,7 +499,7 @@ def test_each_library_file_is_read_once_per_call(world, monkeypatch):
                              for i in range(2, 30)]
     design["nets"]["VCC"] += [[f"R{i}", "1"] for i in range(2, 30)]
     assert _run(world, design) == ([], [])
-    assert len(reads) == 3 and sorted(flats) == ["Mod", "R", "Stack"]
+    assert len(reads) == 3 and sorted(flats) == ["Mod", "PWR_FLAG", "R", "Stack"]
     _run(world, design)
     assert len(reads) == 6                                   # a new call reads afresh
 

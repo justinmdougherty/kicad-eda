@@ -9,10 +9,19 @@ dispatches to either backend without caring which one it holds.
 The model is a plain dict written through the SAME emitter format as the
 headless pipeline (server/tools/sch_build.py): file version 20250114, every
 used library symbol flattened and embedded in lib_symbols, per-instance pin
-lists, instances / sheet_instances / embedded_fonts. Pin coordinates for the
-*_pin methods come from a pins/ sidecar when one exists, otherwise they are
-derived from the library symbol itself. power_pin places a global label (the
-file model does not instantiate power symbols).
+lists, instances / sheet_instances / embedded_fonts, every string quoted by
+sch_build.q. Pin coordinates for the *_pin methods come from a pins/ sidecar
+when one exists, otherwise they are derived from the library symbol itself.
+power_pin places a global label (the file model does not instantiate power
+symbols).
+
+Library symbols resolve the way KiCad resolves them for the schematic's
+directory (ROADMAP_DECISIONS D1, symbol_source): the project sym-lib-table
+beside the .kicad_sch (``${KIPRJMOD}`` = that directory), then the stock
+library of the newest install (or save's `symbols_dir`). Libraries are parsed
+through symlib's cache, keyed by file version, so a regenerated library is
+read again. save also writes a minimal ``<stem>.kicad_pro`` when none exists:
+kicad-cli ERC reads the project tables only beside one (D0).
 
 netlist() is read off the model's own geometry (union-find over wire
 endpoints, label anchors, junctions and pin coordinates). KiCad's ERC is the
@@ -25,6 +34,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable
 
 import toolchain as tc
@@ -35,8 +45,11 @@ SCH_GENERATOR = "kicad-eda"
 SCH_GENERATOR_VERSION = "10.0"
 ROTATIONS = (0, 90, 180, 270)
 COORD_TOL = 1e-3
+PROJECT_SUFFIX = ".kicad_pro"
 _FONT = "(effects (font (size 1.27 1.27)))"
-_SYM_CACHE: dict[str, dict] = {}            # symbols_dir -> sch_build lib cache
+# A symbol source as symlib takes it: a stock directory (str), a
+# libtable.LibraryResolver (symbol_source) or a library map dict.
+SymbolSource = Any
 
 
 class FileModelError(ValueError):
@@ -46,11 +59,15 @@ class FileModelError(ValueError):
 # ----------------------------------------------------------------------------
 # Symbol libraries (shared with the pipeline: server/tools/sch_build.py)
 # ----------------------------------------------------------------------------
-def sch_build():
-    """Import server/tools/sch_build.py — the pipeline's symbol flattener / emitter
-    helpers (flatten, embed, unit_pins, dumps, pin_offsets). Needs sexpdata."""
+def _tools_on_path() -> None:
     if str(tc.TOOLS_DIR) not in sys.path:
         sys.path.insert(0, str(tc.TOOLS_DIR))
+
+
+def sch_build():
+    """Import server/tools/sch_build.py — the pipeline's symbol flattener / emitter
+    helpers (flatten, embed, unit_pins, dumps, pin_offsets, q). Needs sexpdata."""
+    _tools_on_path()
     try:
         import sch_build as sb  # noqa: E402
     except ImportError as e:
@@ -59,20 +76,59 @@ def sch_build():
     return sb
 
 
-def flat_symbol(lib_id: str, symbols_dir: str) -> list:
-    """Flattened (extends-resolved) symbol sexp for a Library:Symbol id.
+def _libtable() -> ModuleType:
+    """server/tools/libtable.py: library tables and LibraryResolver (stdlib only)."""
+    _tools_on_path()
+    import libtable  # noqa: E402
+    return libtable
+
+
+def project_symbol_table(near: str) -> Path | None:
+    """The project sym-lib-table beside the schematic `near`, or None."""
+    lt = _libtable()
+    table = Path(near).parent / lt.TABLE_FILES[lt.SYMBOL]
+    return table if table.is_file() else None
+
+
+def symbol_source(near: str, symbols_dir: str | None) -> SymbolSource | None:
+    """Where the schematic `near` finds its library symbols (ROADMAP D1): a
+    LibraryResolver over its directory's project sym-lib-table, read as KiCad
+    reads it (``${KIPRJMOD}`` = that directory, every row counts), then the
+    stock library `symbols_dir` by naming convention. None when there is
+    neither. A malformed project table is a FileModelError naming it."""
+    if not symbols_dir and project_symbol_table(near) is None:
+        return None
+    lt = _libtable()
+    directory = Path(near).parent
+    try:
+        return lt.LibraryResolver.for_directory(directory, symbols_dir or None, None)
+    except lt.LibTableError as e:
+        raise FileModelError(f"cannot read the project library tables in {directory}: {e}. "
+                             f"Fix or remove the table, then try again.") from e
+
+
+def _where(near: str, stock: str | None) -> str:
+    """Where a schematic's symbols were looked up, for messages."""
+    table = project_symbol_table(near)
+    stock_text = stock or "no stock symbol library (KiCad not found; set KICAD_PATH)"
+    return f"the project {table} or {stock_text}" if table else stock_text
+
+
+def flat_symbol(lib_id: str, source: SymbolSource) -> list:
+    """Flattened (extends-resolved) symbol sexp for a Library:Symbol id from
+    `source` (a stock directory, a LibraryResolver -- see symbol_source -- or
+    a library map), parsed through symlib's file-version cache.
     Raises FileModelError when the library or the symbol cannot be found."""
     lib, sep, name = lib_id.partition(":")
     if not sep or not lib or not name:
         raise FileModelError(f"lib_id '{lib_id}' must be 'Library:Symbol' (e.g. Device:R)")
     sb = sch_build()
-    cache = _SYM_CACHE.setdefault(symbols_dir, {})
     try:
-        return sb.flatten(cache, symbols_dir, lib, name)
+        return sb.flatten({}, source, lib, name)
     except sb.SymbolLibError as e:  # library missing / unparsable / symbol absent
         raise FileModelError(str(e)) from e
     except (FileNotFoundError, KeyError) as e:
-        raise FileModelError(f"symbol {lib_id} not found under {symbols_dir}: {e}") from e
+        raise FileModelError(f"symbol {lib_id} not found: {e}") from e
 
 
 def pins_sidecar(lib_id: str, near: str) -> dict | None:
@@ -91,15 +147,18 @@ def pins_sidecar(lib_id: str, near: str) -> dict | None:
     return None
 
 
-def library_pin_map(lib_id: str) -> dict[str, dict] | None:
-    """{key: {x, y, unit, number}} derived from the KiCad symbol library, keyed
-    by number AND name (the same math build_pin_sidecars.py uses); None when
-    no symbol library dir is available. Raises FileModelError when the
-    library exists but the symbol does not."""
+def library_pin_map(lib_id: str, near: str = "") -> dict[str, dict] | None:
+    """{key: {x, y, unit, number}} derived from the library symbol, keyed by
+    number AND name (the same math build_pin_sidecars.py uses), resolved for
+    the schematic `near` (symbol_source: its project sym-lib-table, then the
+    newest install's stock library; the stock library alone without `near`).
+    None when no symbol library is available at all. Raises FileModelError
+    when a library is available but the symbol does not resolve."""
     syms = tc.symbols_dir()
-    if not syms:
+    source = symbol_source(near, syms) if near else (syms or None)
+    if source is None:
         return None
-    return sch_build().pin_offsets(flat_symbol(lib_id, syms))
+    return sch_build().pin_offsets(flat_symbol(lib_id, source))
 
 
 def pin_sources(lib_id: str, near: str) -> tuple[dict[str, dict] | None, dict | None]:
@@ -107,7 +166,7 @@ def pin_sources(lib_id: str, near: str) -> tuple[dict[str, dict] | None, dict | 
     raises FileModelError with the fix when no pin source exists."""
     side = pins_sidecar(lib_id, near)
     try:
-        lib = library_pin_map(lib_id)
+        lib = library_pin_map(lib_id, near)
     except FileModelError:
         if side is None:
             raise
@@ -115,9 +174,10 @@ def pin_sources(lib_id: str, near: str) -> tuple[dict[str, dict] | None, dict | 
     if lib is None and side is None:
         raise FileModelError(
             f"Pin coordinates for {lib_id} are unknown: no sidecar at "
-            f"pins/{lib_id.replace(':', '_')}.pins.json and the KiCad symbol "
-            f"libraries were not found (install KiCad or set KICAD_PATH), or use "
-            f"the explicit-coordinate tools (add_wire/add_label/add_power_port).")
+            f"pins/{lib_id.replace(':', '_')}.pins.json, the KiCad symbol "
+            f"libraries were not found (install KiCad or set KICAD_PATH) and there "
+            f"is no sym-lib-table beside the schematic; or use the explicit-coordinate "
+            f"tools (add_wire/add_label/add_power_port).")
     return lib, side
 
 
@@ -197,16 +257,22 @@ def new_model(path: str, paper: str = "A4") -> dict[str, Any]:
 # S-expression emission — the same file format as server/tools/sch_build.py
 # ----------------------------------------------------------------------------
 def _q(s: Any) -> str:
-    """Quote a string atom for a KiCad S-expression."""
-    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """Quote a string atom for a KiCad S-expression: sch_build.q, the
+    pipeline's quoting (sexpdata's escapes, so a raw newline cannot make KiCad
+    refuse the file). A NUL character is a FileModelError."""
+    try:
+        return sch_build().q(s)
+    except ValueError as e:
+        raise FileModelError(str(e)) from e
 
 
-def _lib_symbols(model: dict[str, Any], symbols_dir: str | None
+def _lib_symbols(model: dict[str, Any], symbols: SymbolSource | None
                  ) -> tuple[list[str], dict[str, dict[int, list[str]]], list[str]]:
-    """Flatten + embed every distinct lib_id in the model.
+    """Flatten + embed every distinct lib_id in the model from `symbols` (a
+    stock directory, a LibraryResolver or a library map; None = no library).
     Returns (lib_symbols lines, {lib_id: {unit: [pin numbers]}}, unresolved lib_ids)."""
     lib_ids = list(dict.fromkeys(s["lib_id"] for s in model["symbols"]))
-    if not symbols_dir or not lib_ids:
+    if symbols in (None, "") or not lib_ids:
         return [], {}, []
     sb = sch_build()
     blocks: list[str] = []
@@ -214,7 +280,7 @@ def _lib_symbols(model: dict[str, Any], symbols_dir: str | None
     unresolved: list[str] = []
     for lib_id in lib_ids:
         try:
-            flat = flat_symbol(lib_id, symbols_dir)
+            flat = flat_symbol(lib_id, symbols)
         except FileModelError:
             unresolved.append(lib_id)
             continue
@@ -253,8 +319,10 @@ def _item_lines(model: dict[str, Any]) -> list[str]:
         L.append(f"\t(wire (pts (xy {x1:.4f} {y1:.4f}) (xy {x2:.4f} {y2:.4f})) "
                  f"(stroke (width 0) (type default)) (uuid \"{uuid.uuid4()}\"))")
     for lb in model["labels"]:
-        L.append(f"\t(label {_q(lb['net'])} (at {lb['x']:.4f} {lb['y']:.4f} {int(lb.get('rot', 0))}) "
-                 f"(effects (font (size 1.27 1.27)) (justify left bottom)) (uuid \"{uuid.uuid4()}\"))")
+        rot = int(lb.get("rot", 0))
+        L.append(f"\t(label {_q(lb['net'])} (at {lb['x']:.4f} {lb['y']:.4f} {rot}) "
+                 f"(effects (font (size 1.27 1.27)) (justify left bottom)) "
+                 f"(uuid \"{uuid.uuid4()}\"))")
     for p in model["power"]:
         L.append(f"\t(global_label {_q(p['net'])} (shape input) (at {p['x']:.4f} {p['y']:.4f} 0) "
                  f"{_FONT} (uuid \"{uuid.uuid4()}\"))")
@@ -266,10 +334,12 @@ def _item_lines(model: dict[str, Any]) -> list[str]:
     return L
 
 
-def emit(model: dict[str, Any], symbols_dir: str | None) -> tuple[str, list[str]]:
+def emit(model: dict[str, Any], symbols: SymbolSource | None) -> tuple[str, list[str]]:
     """Render the model as a KiCad 9/10-format .kicad_sch (identical structure to
-    sch_build.py's output). Returns (text, lib_ids that could not be embedded)."""
-    blocks, units, unresolved = _lib_symbols(model, symbols_dir)
+    sch_build.py's output), library symbols from `symbols` (a stock directory,
+    a LibraryResolver or a library map; None = none). Returns (text, lib_ids
+    that could not be embedded)."""
+    blocks, units, unresolved = _lib_symbols(model, symbols)
     root, project = model["uuid"], model.get("project", "design")
     L = ["(kicad_sch", f"\t(version {SCH_FORMAT_VERSION})",
          f"\t(generator {_q(SCH_GENERATOR)})",
@@ -284,22 +354,53 @@ def emit(model: dict[str, Any], symbols_dir: str | None) -> tuple[str, list[str]
     return "\n".join(L) + "\n", unresolved
 
 
-def save_result(m: dict[str, Any], sch: str, symbols_dir: str | None,
-                unresolved: list[str]) -> dict:
-    res = {"ok": True, "path": sch, "symbols": len(m["symbols"]),
-           "wires": len(m["wires"]), "labels": len(m["labels"]),
-           "power_ports": len(m["power"]), "no_connects": len(m["no_connects"]),
-           "junctions": len(m["junctions"])}
-    if not symbols_dir:
-        return {**res, "warning": "lib_symbols empty: KiCad symbol libraries not found; "
-                                  "KiCad will rebuild from its configured libraries on open"}
+def write_kicad_pro(sch: str) -> dict:
+    """A minimal ``<stem>.kicad_pro`` beside `sch` unless one exists (never
+    overwritten): kicad-cli ERC reads the project sym-lib-table only beside
+    one (ROADMAP D0). Returns {kicad_pro, kicad_pro_written}, plus
+    kicad_pro_error when the file could not be created."""
+    pro = Path(sch).with_suffix(PROJECT_SUFFIX)
+    try:
+        written = _libtable().write_minimal_kicad_pro(pro)
+    except OSError as e:
+        return {"kicad_pro": str(pro), "kicad_pro_written": False,
+                "kicad_pro_error": f"{pro} could not be created ({e}); kicad-cli ERC does "
+                                   f"not read the project sym-lib-table without it"}
+    return {"kicad_pro": str(pro), "kicad_pro_written": written}
+
+
+def _symbols_result(res: dict, symbols: SymbolSource | None, unresolved: list[str],
+                    where: str) -> dict:
+    if symbols in (None, ""):
+        return {**res, "warning": "lib_symbols empty: KiCad symbol libraries not found and no "
+                                  "sym-lib-table beside the schematic; KiCad will rebuild "
+                                  "from its configured libraries on open"}
     if unresolved:
         return {**res, "ok": False, "written": True,
                 "unresolved_symbols": unresolved,
                 "reason": f"file written but lib_symbols is incomplete: {unresolved} not "
-                          f"found under {symbols_dir}. Fix the lib_id(s) (Library:Symbol, "
-                          f"e.g. Device:R) and call save_schematic again."}
+                          f"found in {where or symbols}. Fix the lib_id(s) (Library:Symbol, "
+                          f"e.g. Device:R) or declare the library in a sym-lib-table beside "
+                          f"the schematic, and call save_schematic again."}
     return res
+
+
+def save_result(m: dict[str, Any], sch: str, symbols: SymbolSource | None,
+                unresolved: list[str], *, where: str = "",
+                kicad_pro: dict | None = None) -> dict:
+    """save()'s answer: counts, the library verdict (`where` names the
+    libraries searched) and the write_kicad_pro fields; a .kicad_pro that
+    could not be created makes it ok false (the schematic is on disk)."""
+    res = {"ok": True, "path": sch, "symbols": len(m["symbols"]),
+           "wires": len(m["wires"]), "labels": len(m["labels"]),
+           "power_ports": len(m["power"]), "no_connects": len(m["no_connects"]),
+           "junctions": len(m["junctions"])}
+    out = {**_symbols_result(res, symbols, unresolved, where), **(kicad_pro or {})}
+    if out.get("kicad_pro_error"):
+        first = out.get("reason") or "file written"
+        return {**out, "ok": False, "written": True,
+                "reason": f"{first}; but {out['kicad_pro_error']}"}
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -543,13 +644,19 @@ class FileSchematic:
 
     # --- persistence ---------------------------------------------------------------
     def save(self, symbols_dir: str = "") -> dict:
-        """Write the .kicad_sch (library symbols embedded from KiCad's stock
-        libraries or `symbols_dir`). The caller runs the open-document guard."""
+        """Write the .kicad_sch with its library symbols embedded, resolved for
+        its directory (symbol_source: the project sym-lib-table beside it, then
+        KiCad's stock libraries or `symbols_dir`), plus a minimal
+        <stem>.kicad_pro when none exists (write_kicad_pro). Nothing is written
+        when the project tables cannot be read or a string cannot be quoted.
+        The caller runs the open-document guard."""
         syms = tc.symbols_dir(symbols_dir)
-        text, unresolved = emit(self.model, syms)
+        source = symbol_source(self.path, syms)
+        text, unresolved = emit(self.model, source)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.path).write_text(text, encoding="utf-8")
-        return save_result(self.model, self.path, syms, unresolved)
+        return save_result(self.model, self.path, source, unresolved,
+                           where=_where(self.path, syms), kicad_pro=write_kicad_pro(self.path))
 
     def save_as(self, path: str, symbols_dir: str = "") -> dict:
         if not str(path).endswith(".kicad_sch"):

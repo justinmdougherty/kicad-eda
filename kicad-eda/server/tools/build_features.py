@@ -2,15 +2,13 @@
 """Board features of the headless builder (swig_build_board.py, F3-11).
 
 KiCad's bundled Python (3.11 on 9.0.4; python3 in the 10.0.5 image): stdlib +
-pcbnew. Without pcbnew (the dev venv) only the pure helpers work.
-
+pcbnew; without pcbnew (the dev venv) only the pure helpers work.
 Outline source (ROADMAP_DECISIONS D2), resolved before placement:
-  (a) env KICAD_EDA_OUTLINE: an outline_resolve sidecar; its ``board``
+  (a) env KICAD_EDA_OUTLINE: an outline_resolve sidecar whose ``board``
       replaces design['board'] in a NEW design dict;
   (b) a board block with outline.loop / corner_radius / cutouts / datum;
   (c) outline.dxf without a sidecar: refused (DXF_UNRESOLVED);
-  (d) otherwise LEGACY: unchanged (rectangle Edge.Cuts and planes, no aux
-      origin, A4 sheet), so existing boards keep their geometry.
+  (d) otherwise LEGACY, unchanged: rectangle Edge.Cuts and planes, no aux origin, A4.
 Frames: board = mm, Y down, origin = outline bbox top-left; sheet = board +
 (ox, oy). Each feature is ONE function taking (board, design, ...) and
 returning (result, warnings); D7-14 replaces add_planes and add_antenna_keepout.
@@ -19,9 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-import os
 import sys
-import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +45,7 @@ LEGACY_SHEET = ("A4", 297.0, 210.0)        # CreateEmptyBoard's page, saved as (
 PAPER_SIZES = (LEGACY_SHEET, ("A3", 420.0, 297.0), ("A2", 594.0, 420.0),
                ("A1", 841.0, 594.0), ("A0", 1189.0, 841.0))       # landscape, mm
 SHEET_MARGIN_MM = 20.0
+MAX_USER_SHEET_MM = 1219.2       # pcbnew's User page limit (48000 mils); larger is clamped on load
 LEGACY_PAPER = b'(paper "A4")'
 RECT_SOURCES = ("rect", "rounded_rect")
 DEFAULT_HOLE_INSET_MM = 4.0
@@ -93,13 +90,6 @@ def is_legacy_block(board: Mapping | None) -> bool:
             and not board.get("cutouts") and board.get("datum") is None)
 
 
-def _read_sidecar(path: str) -> tuple[dict, bytes]:
-    try:
-        return orz.read_sidecar(path), Path(path).read_bytes()
-    except (orz.ResolveError, OSError) as e:
-        raise BuildError(f"{orz.ENV_VAR}={path}: {e}") from e
-
-
 def resolve_outline_source(design: Mapping, env: Mapping[str, str]) -> OutlineSource:
     """The board block to build (module doc, sources a-d). Raises BuildError
     for an unresolved DXF, a bad sidecar or an invalid outline. Never mutates
@@ -107,7 +97,10 @@ def resolve_outline_source(design: Mapping, env: Mapping[str, str]) -> OutlineSo
     path = env.get(orz.ENV_VAR) or None
     raw, source = b"", None
     if path:
-        side, raw = _read_sidecar(path)
+        try:
+            side, raw = orz.read_sidecar(path), Path(path).read_bytes()
+        except (orz.ResolveError, OSError) as e:
+            raise BuildError(f"{orz.ENV_VAR}={path}: {e}") from e
         design, source = {**design, "board": side["board"]}, side["source"]
     board = design.get("board") or {}
     if not isinstance(board, Mapping):
@@ -142,12 +135,25 @@ def kiid_seed(netlist_bytes: bytes, sidecar_bytes: bytes = b"") -> int:
 # --- sheet / paper (pure + file splice) -----------------------------------------------------
 def choose_sheet(w: float, h: float) -> tuple[str, float, float]:
     """The smallest landscape A-size holding the board + SHEET_MARGIN_MM on
-    every side, else a "User" sheet of that size (whole mm)."""
+    every side, else a "User" sheet of that size (whole mm), each side capped
+    at MAX_USER_SHEET_MM (pcbnew would clamp it on load; sheet_warnings)."""
     need_w, need_h = w + 2 * SHEET_MARGIN_MM, h + 2 * SHEET_MARGIN_MM
     for name, sw, sh in PAPER_SIZES:
         if need_w <= sw and need_h <= sh:
             return (name, sw, sh)
-    return ("User", float(math.ceil(need_w)), float(math.ceil(need_h)))
+    return ("User", min(float(math.ceil(need_w)), MAX_USER_SHEET_MM),
+            min(float(math.ceil(need_h)), MAX_USER_SHEET_MM))
+
+
+def sheet_warnings(w: float, h: float, sheet: tuple[str, float, float]) -> list[str]:
+    """A warning when the w x h board + margins does not fit `sheet` (only a
+    board beyond pcbnew's largest User sheet: it is centred and overhangs)."""
+    need_w, need_h = w + 2 * SHEET_MARGIN_MM, h + 2 * SHEET_MARGIN_MM
+    if need_w <= sheet[1] and need_h <= sheet[2]:
+        return []
+    return [f"the {w:g} x {h:g} mm board + {SHEET_MARGIN_MM:g} mm margins does not fit "
+            f"pcbnew's largest sheet ({MAX_USER_SHEET_MM:g} mm a side): the sheet is "
+            f"{sheet[1]:g} x {sheet[2]:g} mm and the board, centred on it, overhangs it"]
 
 
 def paper_sexpr(sheet: tuple[str, float, float]) -> bytes:
@@ -171,26 +177,20 @@ def splice_paper_bytes(data: bytes, sheet: tuple[str, float, float]) -> bytes:
 
 
 def splice_paper(pcb_path: str, sheet: tuple[str, float, float]) -> None:
-    """Rewrite the saved board's paper token in place (temp file + os.replace)."""
+    """Rewrite the just-saved board's paper token in place (bytes, so line
+    endings are kept; the file is the builder's own fresh SaveBoard output)."""
     path = Path(pcb_path)
     data = path.read_bytes()
-    if (new := splice_paper_bytes(data, sheet)) == data:
-        return
-    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(new)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    if (new := splice_paper_bytes(data, sheet)) != data:
+        path.write_bytes(new)
 
 
 def apply_page(board: Any, paper: str) -> list[str]:
-    """Set the page type where pcbnew has a real SetType (9.0.4 / 10.0.5 do not:
-    CreateEmptyBoard is A4 and splice_paper sets the rest). Returns warnings."""
+    """Set a named page type where pcbnew has a real SetType (9.0.4 / 10.0.5 do
+    not: CreateEmptyBoard is A4 and splice_paper sets the rest; a User size
+    needs its W H, so it is always spliced). Returns warnings."""
     ps = board.GetPageSettings()
-    if not hasattr(ps, "SetType"):
+    if paper == "User" or not hasattr(ps, "SetType"):
         return []
     try:
         ps.SetType(paper)
@@ -218,8 +218,8 @@ def add_board_outline(board: Any, design: Mapping, frame: Frame,
                       sheet: tuple[str, float, float]) -> tuple[dict, list[str]]:
     """Edge.Cuts (+ the aux/grid origin for an outline board). Legacy: the
     w x h rectangle (board_shapes.add_outline), no aux origin. Returns the
-    result's "outline" record and warnings; BuildError when KiCad cannot use
-    the outline (board_outline.OutlineBuildError)."""
+    result's "outline" record and warnings (sheet_warnings); BuildError when
+    KiCad cannot use the outline (board_outline.OutlineBuildError)."""
     import board_outline as bo
     import board_shapes
     base = {"source": frame.source, "legacy": frame.outline is None, "paper": sheet[0],
@@ -238,26 +238,26 @@ def add_board_outline(board: Any, design: Mapping, frame: Frame,
     return ({**base, "bbox_mm": _r6(ol.bbox(frame.outline)),
              "area_mm2": round(ol.area(frame.outline), 4),
              "cutouts": len(frame.outline.cutouts), "datum_board": _r6((dx, dy)),
-             "aux_origin_sheet": _r6(bo.get_aux_origin(board))}, [])
+             "aux_origin_sheet": _r6(bo.get_aux_origin(board))},
+            sheet_warnings(frame.w, frame.h, sheet))
 
 
 # --- preroutes ---------------------------------------------------------------------------------
-def _mm(v: float) -> int:
-    return pcbnew.FromMM(float(v))
-
-
 def _vec(x: float, y: float) -> Any:
-    return pcbnew.VECTOR2I(_mm(x), _mm(y))
+    return pcbnew.VECTOR2I(pcbnew.FromMM(float(x)), pcbnew.FromMM(float(y)))
 
 
 def _preroute_point(pt: list, placed: Mapping, ox: float, oy: float) -> tuple[Any, float | None]:
     """["pad", ref, num, (width)] or ["xy", x, y, (width)] -> (sheet point,
     width of the segment STARTING here or None)."""
     w = float(pt[3]) if len(pt) > 3 else None
-    if pt[0] == "pad":
-        pad = next(p for p in placed[pt[1]].Pads() if p.GetNumber() == str(pt[2]))
-        return pad.GetPosition(), w
-    return _vec(float(pt[1]) + ox, float(pt[2]) + oy), w
+    if pt[0] != "pad":
+        return _vec(float(pt[1]) + ox, float(pt[2]) + oy), w
+    pads = placed[pt[1]].Pads() if pt[1] in placed else []
+    pad = next((p for p in pads if p.GetNumber() == str(pt[2])), None)
+    if pad is None:
+        raise BuildError(f"preroute point {pt!r}: the board has no pad {pt[1]}.{pt[2]}")
+    return pad.GetPosition(), w
 
 
 def add_preroutes(board: Any, design: Mapping, placed: Mapping, get_net: Callable[[str], Any],
@@ -277,7 +277,7 @@ def add_preroutes(board: Any, design: Mapping, placed: Mapping, get_net: Callabl
             t = pcbnew.PCB_TRACK(board)
             t.SetStart(a)
             t.SetEnd(b)
-            t.SetWidth(_mm(wa if wa is not None else pr["width"]))
+            t.SetWidth(pcbnew.FromMM(float(wa if wa is not None else pr["width"])))
             t.SetLayer(layer)
             t.SetNet(ni)
             board.Add(t)
@@ -286,8 +286,8 @@ def add_preroutes(board: Any, design: Mapping, placed: Mapping, get_net: Callabl
         for vx, vy in pr.get("vias", []):
             v = pcbnew.PCB_VIA(board)
             v.SetPosition(_vec(float(vx) + ox, float(vy) + oy))
-            v.SetWidth(_mm(via_d))
-            v.SetDrill(_mm(via_drill))
+            v.SetWidth(pcbnew.FromMM(float(via_d)))
+            v.SetDrill(pcbnew.FromMM(float(via_drill)))
             v.SetViaType(pcbnew.VIATYPE_THROUGH)
             v.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
             v.SetNet(ni)
@@ -438,11 +438,9 @@ def add_antenna_keepout(board: Any, design: Mapping, frame: Frame) -> tuple[dict
     if not ako:
         return None, []
     local = keepout_rect(ako, frame.w, frame.h)
-    warnings = []
-    if leaves_bbox(local, frame.w, frame.h):
-        warnings.append("antenna keep-out [{:g}, {:g}, {:g}, {:g}] leaves the board outline "
-                        "bbox 0..{:g} x 0..{:g} mm (board frame)".format(*local, frame.w,
-                                                                         frame.h))
+    warnings = ["antenna keep-out [{:g}, {:g}, {:g}, {:g}] leaves the board outline bbox "
+                "0..{:g} x 0..{:g} mm (board frame)".format(*local, frame.w, frame.h)
+                ] if leaves_bbox(local, frame.w, frame.h) else []
     kx, ky, kw, kh = keepout_rect(ako, frame.w, frame.h, frame.ox, frame.oy)
     zone = board_shapes.add_keepout(board, kx, ky, kw, kh, ako.get("name", "ANTENNA"))
     return (ako if zone else None), warnings

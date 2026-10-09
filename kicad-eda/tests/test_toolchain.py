@@ -12,6 +12,8 @@ boards are header-only files, so no KiCad is needed.
 from __future__ import annotations
 
 import json
+import shutil
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -21,7 +23,8 @@ import kicad_env as env
 import toolchain as tc
 
 
-def _install(base: Path, version: str, vt: tuple[int, int, int], *, python: bool) -> env.KiCadInstall:
+def _install(base: Path, version: str, vt: tuple[int, int, int], *,
+             python: bool) -> env.KiCadInstall:
     root = base / version
     return env.KiCadInstall(
         version=version, version_tuple=vt, root=root, kicad_cli=root / "bin" / "kicad-cli.exe",
@@ -116,9 +119,10 @@ def test_drc_counts_runs_the_board_cli_and_records_it(machine, nightly, stable, 
                                                       monkeypatch) -> None:
     machine(stable, nightly)
     calls = _capture(monkeypatch, {"violations": [{"type": "clearance"}], "unconnected_items": []})
-    pcb = tmp_path / "b.kicad_pcb"
-    res = tc.drc_counts(str(pcb))
+    pcb = _board(tmp_path, "9.0", 20241229)
+    res = tc.drc_counts(pcb)
     assert calls[0][0] == str(stable.kicad_cli) and calls[0][1:3] == ["pcb", "drc"]
+    assert calls[0][-1] == pcb and "--severity-error" in calls[0]
     assert res["kicad_cli"] == str(stable.kicad_cli)
     assert res["errors"] == 1 and res["types"] == {"clearance": 1} and res["unconnected"] == 0
     assert res["report"] == str(tmp_path / "b_drc.json")
@@ -128,9 +132,11 @@ def test_drc_counts_unreadable_report_still_names_the_cli(machine, stable, tmp_p
                                                           monkeypatch) -> None:
     machine(stable)
     monkeypatch.setattr(tc, "run", lambda args, **kw: _Done())      # writes no report
-    res = tc.drc_counts(str(tmp_path / "b.kicad_pcb"))
-    assert res["errors"] == -1 and "DRC report unreadable" in res["error"]
+    res = tc.drc_counts(_board(tmp_path, "9.0", 20241229))
+    assert res["errors"] == -1 and "wrote no DRC report b_drc.json" in res["error"]
     assert res["kicad_cli"] == str(stable.kicad_cli)
+    assert (res["unconnected"], res["types"]) == (-1, {})
+    assert res["report"] == str(tmp_path / "b_drc.json")
 
 
 def test_erc_json_runs_the_newest_cli(machine, nightly, stable, tmp_path, monkeypatch) -> None:
@@ -150,6 +156,7 @@ def test_run_detaches_stdin_by_default(monkeypatch) -> None:
     tc.run(["kicad-cli", "version"], timeout=5)
     assert seen["stdin"] is tc.subprocess.DEVNULL
     assert seen["capture_output"] is True and seen["text"] is True and seen["timeout"] == 5
+    assert seen["encoding"] == "utf-8" and seen["errors"] == "replace"   # wx.LogStderr is UTF-8
 
 
 def test_run_keeps_an_explicit_stdin(monkeypatch) -> None:
@@ -355,7 +362,7 @@ def test_drc_counts_picks_the_cli_by_the_board_file(machine, nightly, stable, tm
     assert tc.drc_counts(new)["kicad_cli"] == str(nightly.kicad_cli)
     assert tc.drc_counts(old)["kicad_cli"] == str(stable.kicad_cli)
     assert [c[0] for c in calls] == [str(nightly.kicad_cli), str(stable.kicad_cli)]
-    assert [c[3] for c in calls] == [new, old]
+    assert [c[-1] for c in calls] == [new, old]
     assert "kicad_cli_note" not in tc.drc_counts(old)
 
 
@@ -432,3 +439,207 @@ def test_pipeline_board_cli_follows_the_file(machine, nightly, stable, tmp_path)
     old = _board(tmp_path, "9.0", 20241229, name="old.kicad_pcb")
     assert rp._board_cli(new) == str(nightly.kicad_cli)
     assert rp._board_cli(old) == str(stable.kicad_cli)
+
+
+# ----------------------------------------------------------------------------
+# run: child output is UTF-8 (wx.LogStderr writes UTF-8), never a decode crash
+# ----------------------------------------------------------------------------
+def test_run_decodes_child_output_as_utf8_with_replacement() -> None:
+    code = ("import sys; sys.stdout.buffer.write('µm Ω ✓'.encode('utf-8') + b'\\xff'); "
+            "sys.stderr.buffer.write('Fehler: Größe'.encode('utf-8'))")
+    done = tc.run([sys.executable, "-c", code], timeout=60)
+    assert done.returncode == 0
+    assert done.stdout == "µm Ω ✓�" and done.stderr == "Fehler: Größe"
+
+
+# ----------------------------------------------------------------------------
+# drc_counts delegates to drc_guard.run_drc: never a stale or half-run report
+# ----------------------------------------------------------------------------
+def _fake_run(monkeypatch: pytest.MonkeyPatch, *, report: dict | None = None, rc: int = 0,
+              stdout: str = "") -> list[dict]:
+    """tc.run standing in for kicad-cli DRC: records argv, timeout and whether
+    the report existed when it started; writes `report` (None: nothing)."""
+    seen: list[dict] = []
+
+    def fake(args: list[str], **kw):
+        out = Path(args[args.index("-o") + 1])
+        seen.append({"args": list(args), "timeout": kw.get("timeout"),
+                     "report_existed": out.exists()})
+        if report is not None:
+            out.write_text(json.dumps(report), encoding="utf-8")
+        return _done(stdout) if not rc else type("R", (), {"returncode": rc, "stdout": stdout,
+                                                          "stderr": ""})()
+
+    monkeypatch.setattr(tc, "run", fake)
+    return seen
+
+
+def test_drc_counts_deletes_the_last_report_before_kicad_cli_runs(machine, stable, tmp_path,
+                                                                 monkeypatch) -> None:
+    machine(stable)
+    pcb = _board(tmp_path, "9.0", 20241229)
+    stale = tmp_path / "b_drc.json"
+    stale.write_text(json.dumps({"violations": [{"type": "clearance"}] * 5}), encoding="utf-8")
+    seen = _fake_run(monkeypatch)                                   # writes nothing this time
+    res = tc.drc_counts(pcb)
+    assert seen[0]["report_existed"] is False and not stale.exists()
+    assert seen[0]["timeout"] == tc.KICAD_CLI_TIMEOUT_S
+    assert res["errors"] == -1 and "wrote no DRC report" in res["error"]
+    seen = _fake_run(monkeypatch, report={"violations": [], "unconnected_items": [{}]})
+    fresh = tc.drc_counts(pcb)
+    assert (fresh["errors"], fresh["unconnected"], fresh["types"]) == (0, 1, {})
+    assert "error" not in fresh and fresh["kicad_cli"] == str(stable.kicad_cli)
+
+
+@pytest.mark.parametrize("rc, crash, words", [
+    (3, False, "kicad-cli pcb drc exited 3"),
+    (3221226356, True, "kicad-cli crashed"),
+    (-1073740940, True, "heap corruption")])
+def test_drc_counts_reports_a_failed_or_crashed_kicad_cli(machine, stable, tmp_path, monkeypatch,
+                                                          rc: int, crash: bool,
+                                                          words: str) -> None:
+    machine(stable)
+    _fake_run(monkeypatch, report={"violations": [], "unconnected_items": []}, rc=rc)
+    res = tc.drc_counts(_board(tmp_path, "9.0", 20241229))
+    assert res["errors"] == -1 and res["unconnected"] == -1 and res["types"] == {}
+    assert words in res["error"] and res["crash"] is crash and res["rc"] == rc
+
+
+def test_drc_counts_reports_an_error_line_even_with_exit_0(machine, stable, tmp_path,
+                                                           monkeypatch) -> None:
+    machine(stable)
+    _fake_run(monkeypatch, report={"violations": [], "unconnected_items": []},
+              stdout="12:00:01: Error: Failed to load board\n")
+    res = tc.drc_counts(_board(tmp_path, "9.0", 20241229))
+    assert res["errors"] == -1 and "Error: Failed to load board" in res["error"]
+
+
+def test_drc_counts_refuses_a_missing_board_or_an_undeletable_report(machine, stable, tmp_path,
+                                                                     monkeypatch) -> None:
+    machine(stable)
+    monkeypatch.setattr(tc, "run", lambda args, **kw: pytest.fail("kicad-cli ran"))
+    missing = tc.drc_counts(str(tmp_path / "gone.kicad_pcb"))
+    assert missing["errors"] == -1 and "board file not found" in missing["error"]
+    pcb = _board(tmp_path, "9.0", 20241229)
+    (tmp_path / "b_drc.json").mkdir()                     # a report path that cannot be deleted
+    stuck = tc.drc_counts(pcb)
+    assert stuck["errors"] == -1 and "cannot be deleted" in stuck["error"]
+
+
+def test_drc_check_carries_the_run_failure_as_its_reason(machine, stable, tmp_path,
+                                                         monkeypatch) -> None:
+    machine(stable)
+    _fake_run(monkeypatch, rc=3)
+    res = tc.drc_check(_board(tmp_path, "9.0", 20241229), 5)
+    assert res["ok"] is False and "exited 3" in res["reason"] and "errors" not in res
+    assert res["kicad_cli"] == str(stable.kicad_cli) and res["report"].endswith("b_drc.json")
+
+
+# ============================================================================
+# keep_agent_copy (an agent's KiCad 11 copy is rotated, never lost)
+# ============================================================================
+SET_EXTS = (".kicad_pcb", ".kicad_pro", ".kicad_prl", ".kicad_dru")
+K11_SET = {".kicad_pro": '{"meta": {"version": 3}}\n', ".kicad_prl": '{"meta": {"version": 7}}\n',
+           ".kicad_dru": "(version 1)\n"}
+
+
+def _sib(pcb: str, tag: str, ext: str) -> Path:
+    return Path(str(Path(pcb).with_suffix("")) + tag + ext)
+
+
+def _k11_set(tmp_path: Path, *, dru: bool = True) -> str:
+    """netlist.kicad_pcb saved by KiCad 11 with its project, prl, rules and lock."""
+    pcb = _board(tmp_path, "10.99", 20260901, name="netlist.kicad_pcb")
+    for ext, text in K11_SET.items():
+        if dru or ext != ".kicad_dru":
+            _sib(pcb, "", ext).write_text(text, encoding="utf-8")
+    (tmp_path / "~netlist.kicad_pro.lck").write_text("{}", encoding="utf-8")
+    return pcb
+
+
+def _set(pcb: str, tag: str = ".agent") -> dict[str, bytes]:
+    """{ext: bytes} of the X<tag>.* files that exist (tag "" = the canonical set)."""
+    return {ext: _sib(pcb, tag, ext).read_bytes() for ext in SET_EXTS
+            if _sib(pcb, tag, ext).is_file()}
+
+
+def _listing(folder: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()}
+
+
+def _append(path: str | Path, text: str) -> None:
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def test_keep_agent_copy_copies_the_set_and_rotates_older_copies(tmp_path) -> None:
+    pcb = _k11_set(tmp_path)
+    first_set = _set(pcb, "")
+    first = tc.keep_agent_copy(pcb, move=False)                # the harness preservation
+    assert first["agent_copy"] == tc.agent_copy_path(pcb) and first["previous_agent_copy"] is None
+    assert sorted(Path(f).name for f in first["files"]) == [
+        "netlist.agent.kicad_dru", "netlist.agent.kicad_pcb", "netlist.agent.kicad_prl",
+        "netlist.agent.kicad_pro"]
+    assert first["rotated"] == [] and _set(pcb) == first_set and _set(pcb, "") == first_set
+    _append(pcb, "; second\n")
+    second = tc.keep_agent_copy(pcb, move=False)
+    assert second["previous_agent_copy"] == str(_sib(pcb, ".agent.1", ".kicad_pcb"))
+    assert sorted(Path(f).name for f in second["rotated"]) == [
+        "netlist.agent.1.kicad_dru", "netlist.agent.1.kicad_pcb", "netlist.agent.1.kicad_prl",
+        "netlist.agent.1.kicad_pro"]
+    assert _set(pcb, ".agent.1") == first_set                  # the first copy survives
+    assert _set(pcb)[".kicad_pcb"].endswith(b"; second\n")
+    third = tc.keep_agent_copy(pcb, move=False)
+    assert third["previous_agent_copy"] == str(_sib(pcb, ".agent.2", ".kicad_pcb"))
+    assert _set(pcb, ".agent.1") == first_set
+    assert _set(pcb, ".agent.2")[".kicad_pcb"].endswith(b"; second\n")
+
+
+def test_keep_agent_copy_move_takes_the_kicad11_files_and_copies_the_rules(tmp_path) -> None:
+    pcb = _k11_set(tmp_path)
+    canonical = _set(pcb, "")
+    res = tc.keep_agent_copy(pcb, move=True)                   # the snapshot restore's step
+    assert _set(pcb) == canonical and res["previous_agent_copy"] is None
+    assert _set(pcb, "") == {".kicad_dru": canonical[".kicad_dru"]}   # KiCad 11 never writes it
+    assert (tmp_path / "~netlist.kicad_pro.lck").is_file()     # the lock is not part of the set
+
+
+def test_keep_agent_copy_takes_the_first_free_number(tmp_path) -> None:
+    pcb = _k11_set(tmp_path, dru=False)
+    _sib(pcb, ".agent", ".kicad_pcb").write_text("agent 0", encoding="utf-8")
+    _sib(pcb, ".agent.1", ".kicad_pcb").write_text("agent 1", encoding="utf-8")
+    _sib(pcb, ".agent.2", ".kicad_pro").write_text("{}", encoding="utf-8")   # holds 2 too
+    res = tc.keep_agent_copy(pcb, move=False)
+    assert res["previous_agent_copy"] == str(_sib(pcb, ".agent.3", ".kicad_pcb"))
+    assert _sib(pcb, ".agent.3", ".kicad_pcb").read_text(encoding="utf-8") == "agent 0"
+    assert _sib(pcb, ".agent.1", ".kicad_pcb").read_text(encoding="utf-8") == "agent 1"
+    assert not _sib(pcb, ".agent.2", ".kicad_pcb").exists()
+
+
+def test_keep_agent_copy_refuses_a_missing_board(tmp_path) -> None:
+    before = _listing(tmp_path)
+    with pytest.raises(ValueError, match="not found; there is no board to keep"):
+        tc.keep_agent_copy(str(tmp_path / "netlist.kicad_pcb"), move=False)
+    assert _listing(tmp_path) == before
+
+
+@pytest.mark.parametrize("move, failing_copy", [(True, 1), (False, 3)])
+def test_keep_agent_copy_undoes_every_step_when_one_fails(tmp_path, monkeypatch, move: bool,
+                                                          failing_copy: int) -> None:
+    pcb = _k11_set(tmp_path)
+    tc.keep_agent_copy(pcb, move=False)                        # an older copy to rotate
+    _append(pcb, "; newer\n")
+    before = _listing(tmp_path)
+    real = shutil.copy2
+    calls: list[str] = []
+
+    def flaky(src, dst, **kw):
+        calls.append(str(dst))
+        if len(calls) == failing_copy:
+            raise OSError("disk full")
+        return real(src, dst, **kw)
+
+    monkeypatch.setattr(shutil, "copy2", flaky)
+    with pytest.raises(OSError, match="disk full"):
+        tc.keep_agent_copy(pcb, move=move)
+    assert _listing(tmp_path) == before and not _sib(pcb, ".agent.1", ".kicad_pcb").exists()

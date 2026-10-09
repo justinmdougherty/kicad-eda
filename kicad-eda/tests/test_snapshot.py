@@ -15,13 +15,10 @@ Freerouting, skipped when any of them is absent.
 """
 from __future__ import annotations
 
-import csv
-import io
 import json
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Callable
 
@@ -29,10 +26,12 @@ import pytest
 
 import board_pipeline_tools as bpt
 import board_route_tools as brt
+import board_sessions as bs
 import kicad_env as env
 import kicad_ipc as ipc
 import toolchain as tc
 from backends.pcb_api import BoardApi
+from fixtures.kicad_procs import owned_pids
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
@@ -82,6 +81,35 @@ def _k11_save(pcb: str) -> None:
 def _bump_mtime(path: Path, seconds: int = 5) -> None:
     st = path.stat()
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + seconds * 1_000_000_000))
+
+
+def _listing(folder: Path, skip: str = "\0") -> dict[str, bytes]:
+    """{name: bytes} of every file in `folder` whose name does not contain `skip`."""
+    return {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file() and skip not in p.name}
+
+
+class Editors:
+    """A fake running KiCad for kicad_ipc.editor_holding: `held` maps a
+    normalised path to the editor kind holding it; `asked` records queries."""
+
+    def __init__(self) -> None:
+        self.held: dict[str, str] = {}
+        self.asked: list[str] = []
+
+    def __call__(self, path: str) -> str | None:
+        self.asked.append(path)
+        return self.held.get(ipc.norm_path(path))
+
+
+REAL_EDITOR_HOLDING = ipc.editor_holding
+
+
+@pytest.fixture(autouse=True)
+def editors(monkeypatch) -> Editors:
+    """No unit test asks a real KiCad GUI what it holds (the live tests do)."""
+    fake = Editors()
+    monkeypatch.setattr(ipc, "editor_holding", fake)
+    return fake
 
 
 # ============================================================================
@@ -160,7 +188,8 @@ def test_take_snapshot_copies_the_set_with_mtimes_and_skips_the_lock(tmp_path) -
         assert dst.read_bytes() == src.read_bytes()
         assert dst.stat().st_mtime_ns == src.stat().st_mtime_ns
     assert not (tmp_path / "~netlist.k9.kicad_pro.lck").exists()
-    assert sorted(p.name for p in tmp_path.iterdir() if "lck" in p.name) == ["~netlist.kicad_pro.lck"]
+    locks = sorted(p.name for p in tmp_path.iterdir() if "lck" in p.name)
+    assert locks == ["~netlist.kicad_pro.lck"]
     assert tc.snapshot_current(pcb) is True
 
 
@@ -172,7 +201,8 @@ def test_take_snapshot_drops_stale_optional_files_of_an_older_snapshot(tmp_path)
     res = tc.take_snapshot(pcb)
     assert sorted(Path(f).name for f in res["files"]) == ["netlist.k9.kicad_pcb",
                                                           "netlist.k9.kicad_pro"]
-    assert not _sib(pcb, ".k9", ".kicad_dru").exists() and not _sib(pcb, ".k9", ".kicad_prl").exists()
+    assert not _sib(pcb, ".k9", ".kicad_dru").exists()
+    assert not _sib(pcb, ".k9", ".kicad_prl").exists()
 
 
 def test_take_snapshot_of_a_board_without_a_project(tmp_path) -> None:
@@ -293,8 +323,130 @@ def test_restore_undoes_its_moves_when_a_copy_fails(tmp_path, monkeypatch) -> No
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
 
 
+def test_restore_refuses_a_missing_board_and_moves_nothing(tmp_path) -> None:
+    pcb = str(tmp_path / "netlist.kicad_pcb")                 # only the snapshot is left
+    _write(_sib(pcb, ".k9", ".kicad_pcb"), _header(*K9))
+    _write(_sib(pcb, ".k9", ".kicad_pro"), K9_PRO)
+    before = _listing(tmp_path)
+    with pytest.raises(ValueError, match="netlist.kicad_pcb not found; the snapshot") as exc:
+        tc.restore_snapshot(pcb)
+    assert "is left as it is" in str(exc.value)
+    assert _listing(tmp_path) == before and not Path(tc.agent_copy_path(pcb)).exists()
+
+
 # ============================================================================
-# board_route_tools.release_for_rewrite + the board_pipeline_tools flow
+# toolchain: a second restore rotates the first agent copy (keep_agent_copy)
+# ============================================================================
+SET_EXTS = (".kicad_pcb", ".kicad_pro", ".kicad_prl", ".kicad_dru")
+
+
+def _set(pcb: str, tag: str = ".agent") -> dict[str, bytes]:
+    """{ext: bytes} of the X<tag>.* files that exist (tag "" = the canonical set)."""
+    return {ext: _sib(pcb, tag, ext).read_bytes() for ext in SET_EXTS
+            if _sib(pcb, tag, ext).is_file()}
+
+
+def _second_kicad11_save(pcb: str) -> None:
+    """After a restore: Freerouting routed the K9 board, the agent saved it
+    through KiCad 11 again (a fresh snapshot first, as the board tools do)."""
+    _write(Path(pcb), _header(*K9) + "; routed\n")
+    _bump_mtime(Path(pcb))
+    tc.take_snapshot(pcb)
+    _k11_save(pcb)
+    _write(Path(pcb), _header(*K11) + "; second agent\n")
+
+
+def test_a_second_restore_keeps_the_first_agent_copy_as_agent_1(tmp_path) -> None:
+    pcb = _snapshotted_k11_board(tmp_path)
+    first_agent = _set(pcb, "")                                # board, project, prl of KiCad 11
+    first = tc.restore_snapshot(pcb)
+    assert first["previous_agent_copy"] is None and _set(pcb) == first_agent
+    _second_kicad11_save(pcb)
+    second = tc.restore_snapshot(pcb)
+    assert second["agent_copy"] == tc.agent_copy_path(pcb)
+    assert second["previous_agent_copy"] == str(_sib(pcb, ".agent.1", ".kicad_pcb"))
+    assert _set(pcb, ".agent.1") == first_agent                # nothing of the first copy lost
+    assert _set(pcb)[".kicad_pcb"].rstrip().endswith(b"; second agent")
+    assert Path(pcb).read_text(encoding="utf-8").endswith("; routed\n") and tc.is_pre_k11(pcb)
+
+
+def test_a_failed_second_restore_puts_every_file_back(tmp_path, monkeypatch) -> None:
+    pcb = _snapshotted_k11_board(tmp_path, dru=True)
+    tc.restore_snapshot(pcb)
+    _second_kicad11_save(pcb)
+    before = _listing(tmp_path)
+    real = shutil.copy2
+    calls: list[str] = []
+
+    def flaky(src, dst, **kw):
+        calls.append(str(dst))
+        if len(calls) == 3:                    # the rules copy, then the snapshot board, then...
+            raise OSError("disk full")
+        return real(src, dst, **kw)
+
+    monkeypatch.setattr(shutil, "copy2", flaky)
+    with pytest.raises(OSError, match="disk full"):
+        tc.restore_snapshot(pcb)
+    assert _listing(tmp_path) == before and not _sib(pcb, ".agent.1", ".kicad_pcb").exists()
+
+
+# ============================================================================
+# toolchain: restore_snapshot and the KiCad 11 project lock
+# ============================================================================
+def test_restore_removes_the_leftover_lock_when_nothing_holds_the_board(tmp_path,
+                                                                        editors) -> None:
+    pcb = _snapshotted_k11_board(tmp_path)
+    lock = tmp_path / "~netlist.kicad_pro.lck"
+    res = tc.restore_snapshot(pcb)
+    assert res["lock_removed"] is True and not lock.exists() and "lock_note" not in res
+    assert ipc.norm_path(pcb) in [ipc.norm_path(p) for p in editors.asked]
+
+
+def test_restore_keeps_the_lock_while_a_session_or_an_editor_holds_the_board(
+        tmp_path, registry, editors) -> None:
+    for name in ("session", "pcbnew", "manager"):
+        (tmp_path / name).mkdir()
+    held = _snapshotted_k11_board(tmp_path / "session")
+    registry(held)                                          # this process's board API session
+    res = tc.restore_snapshot(held)
+    assert res["lock_removed"] is False and "session" in res["lock_note"]
+    assert (tmp_path / "session" / "~netlist.kicad_pro.lck").is_file() and editors.asked == []
+    gui = _snapshotted_k11_board(tmp_path / "pcbnew")
+    editors.held[ipc.norm_path(gui)] = "pcb"                # open in a running PCB editor
+    res = tc.restore_snapshot(gui)
+    assert res["lock_removed"] is False and "Pcbnew" in res["lock_note"]
+    assert (tmp_path / "pcbnew" / "~netlist.kicad_pro.lck").is_file()
+    project = _snapshotted_k11_board(tmp_path / "manager")
+    editors.held[ipc.norm_path(str(_sib(project, "", ".kicad_pro")))] = "project"
+    res = tc.restore_snapshot(project)
+    assert res["lock_removed"] is False and "project manager" in res["lock_note"]
+    assert (tmp_path / "manager" / "~netlist.kicad_pro.lck").is_file()
+
+
+def test_restore_without_a_lock_asks_no_editor(tmp_path, editors) -> None:
+    pcb = _snapshotted_k11_board(tmp_path)
+    (tmp_path / "~netlist.kicad_pro.lck").unlink()
+    res = tc.restore_snapshot(pcb)
+    assert res["lock_removed"] is False and "lock_note" not in res and editors.asked == []
+
+
+def test_restore_reports_a_lock_it_cannot_remove(tmp_path, monkeypatch) -> None:
+    pcb = _snapshotted_k11_board(tmp_path)
+    real = Path.unlink
+
+    def denied(self: Path, missing_ok: bool = False) -> None:
+        if self.name.endswith(".lck"):
+            raise PermissionError("in use")
+        real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", denied)
+    res = tc.restore_snapshot(pcb)
+    assert res["lock_removed"] is False and "could not be removed (in use)" in res["lock_note"]
+    assert tc.is_pre_k11(pcb) and (tmp_path / "~netlist.kicad_pro.lck").is_file()
+
+
+# ============================================================================
+# the board_pipeline_tools flow over a stub registry session
 # ============================================================================
 class StubSession:
     """The registry face of a BoardApi: path, mode, dirty flag, close."""
@@ -313,45 +465,18 @@ class StubSession:
 @pytest.fixture
 def registry(monkeypatch) -> Callable[..., StubSession]:
     """An isolated board registry; hold(pcb) puts a stub session on it."""
-    monkeypatch.setattr(brt, "_BOARDS", {})
-    monkeypatch.setattr(brt, "_PROGRESS", {})
+    monkeypatch.setattr(bs, "_BOARDS", {})
+    monkeypatch.setattr(bs, "_PROGRESS", {})
 
     def hold(pcb: str, **kw) -> StubSession:
         stub = StubSession(pcb, **kw)
-        brt._BOARDS[brt._key(pcb)] = stub
+        bs._BOARDS[bs._key(pcb)] = stub
         return stub
     return hold
 
 
-def test_release_for_rewrite_closes_idle_and_refuses_dirty_sessions(tmp_path, registry) -> None:
-    pcb = str(tmp_path / "x.kicad_pcb")
-    assert brt.release_for_rewrite(pcb) == {}
-    brt._PROGRESS[brt._key(pcb)] = (5, 5, 5)
-    dirty = registry(pcb, modified=True)
-    refused = brt.release_for_rewrite(pcb)
-    assert refused["ok"] is False and refused["blocking_board"] == pcb
-    assert "unsaved changes" in refused["reason"] and "save_board or close_board" in refused["reason"]
-    assert not dirty.closed and brt._PROGRESS[brt._key(pcb)] == (5, 5, 5)
-    dirty.is_modified = False
-    released = brt.release_for_rewrite(pcb)
-    assert released["released_boards"] == [pcb] and dirty.closed
-    assert brt._BOARDS == {} and brt._PROGRESS == {}                     # stall history restarts
-
-
-def test_release_for_rewrite_reports_a_close_error(tmp_path, registry) -> None:
-    pcb = str(tmp_path / "x.kicad_pcb")
-    stub = registry(pcb)
-
-    def broken() -> None:
-        raise RuntimeError("api-server did not stop")
-
-    stub.close = broken
-    res = brt.release_for_rewrite(pcb)
-    assert res["released_boards"] == [pcb]
-    assert res["released_board_close_errors"] == [f"{pcb}: RuntimeError: api-server did not stop"]
-
-
-def _install(base: Path, version: str, vt: tuple[int, int, int], *, python: bool) -> env.KiCadInstall:
+def _install(base: Path, version: str, vt: tuple[int, int, int], *,
+             python: bool) -> env.KiCadInstall:
     root = base / version
     return env.KiCadInstall(
         version=version, version_tuple=vt, root=root, kicad_cli=root / "bin" / "kicad-cli.exe",
@@ -405,14 +530,14 @@ def test_autoroute_from_snapshot_restores_and_routes_the_pre11_board(tmp_path, m
     stable, _ = machine
     pcb = _snapshotted_k11_board(tmp_path)
     idle = registry(pcb)                                   # the agent's saved headless session
-    brt._PROGRESS[brt._key(pcb)] = (4, 4, 4, 4)
+    bs._PROGRESS[bs._key(pcb)] = (4, 4, 4, 4)
     seen = _fake_chain(monkeypatch, pcb)
     res = bpt.autoroute_board(pcb, from_snapshot=True)
     assert res["ok"] is True and res["fallback_from_snapshot"] is True, res
     assert res["pcb"] == pcb and res["agent_copy"] == tc.agent_copy_path(pcb)
     assert res["pre_k11_snapshot"] == tc.pre_k11_snapshot_path(pcb)
     assert res["tracks"] == 21 and res["unconnected"] == 0
-    assert res["released_boards"] == [pcb] and idle.closed and brt._PROGRESS == {}
+    assert res["released_boards"] == [pcb] and idle.closed and bs._PROGRESS == {}
     # every SWIG step and the DRC saw the restored KiCad 9 board, never the KiCad 11 one
     assert {s["board"]["generator_version"] for s in seen} == {"9.0"}
     assert seen[-1]["args"][0] == str(stable.kicad_cli)
@@ -486,6 +611,42 @@ def test_autoroute_reports_a_failed_restore(tmp_path, machine, registry, monkeyp
     assert "permission denied" in res["reason"]
 
 
+def test_autoroute_refuses_a_snapshot_the_pcbnew_cannot_read_either(tmp_path, machine, registry,
+                                                                     monkeypatch) -> None:
+    pcb = _project(tmp_path, K11, pro=K11_PRO)
+    _write(_sib(pcb, ".k9", ".kicad_pcb"), _header(*K10))    # 9.0.4's pcbnew cannot load 10.0
+    before = _listing(tmp_path)
+    monkeypatch.setattr(tc, "run", lambda args, **kw: pytest.fail(f"ran {args[:2]}"))
+    res = bpt.autoroute_board(pcb, from_snapshot=True)
+    assert res["ok"] is False and res["pre_k11_snapshot"] == tc.pre_k11_snapshot_path(pcb)
+    assert res["reason"].startswith("the snapshot is unreadable too: netlist.k9.kicad_pcb was "
+                                    "saved by KiCad 10.0 (format 20260206)")
+    assert "pcbnew Python cannot read it" in res["reason"]
+    assert _listing(tmp_path) == before and not Path(tc.agent_copy_path(pcb)).exists()
+
+
+def test_drc_check_reports_a_report_that_cannot_be_read_back(tmp_path, machine,
+                                                              monkeypatch) -> None:
+    stable, _ = machine
+    pcb = _project(tmp_path)
+    _fake_chain(monkeypatch, pcb)                           # kicad-cli writes a clean report
+    real = tc.drc_counts
+
+    def counted_then_corrupted(path: str) -> dict:
+        counts = real(path)
+        Path(counts["report"]).write_text("{not json", encoding="utf-8")
+        return counts
+
+    monkeypatch.setattr(tc, "drc_counts", counted_then_corrupted)
+    before = _listing(tmp_path, skip="_drc.json")
+    res = tc.drc_check(pcb, 10)
+    report = str(tmp_path / "netlist_drc.json")
+    assert res["ok"] is False and res["reason"].startswith(f"DRC report {report} unreadable: ")
+    assert "errors" not in res and res["report"] == report
+    assert res["kicad_cli"] == str(stable.kicad_cli)
+    assert _listing(tmp_path, skip="_drc.json") == before
+
+
 def test_build_board_refuses_or_releases_a_held_session(tmp_path, machine, registry,
                                                          monkeypatch) -> None:
     netlist = _write(tmp_path / "netlist.json", json.dumps({"components": [], "nets": {}}))
@@ -520,18 +681,23 @@ def _skip_unless_live() -> None:
 
 
 def _kicad_cli_pids() -> set[int] | None:
-    if sys.platform != "win32":
-        return None
-    proc = subprocess.run(["tasklist", "/FI", "IMAGENAME eq kicad-cli.exe", "/FO", "CSV", "/NH"],
-                          capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
-    return {int(row[1]) for row in csv.reader(io.StringIO(proc.stdout))
-            if len(row) > 1 and row[1].isdigit()}
+    """kicad-cli.exe PIDs this test run owns (Windows; other agents' servers on
+    the same machine are not ours); None off Windows."""
+    return owned_pids("kicad-cli.exe")
 
 
-def test_live_k11_save_snapshots_then_freerouting_routes_the_snapshot(tmp_path, monkeypatch):
+def _java_pids() -> set[int] | None:
+    """java.exe PIDs this test run owns (Freerouting); None off Windows."""
+    return owned_pids("java.exe")
+
+
+def _live_lm358(tmp_path: Path, monkeypatch) -> str:
+    """A fresh registry, the real GUI probe, and examples/lm358_buffer built by
+    KiCad 9's pcbnew in tmp_path (its 1 A outputs get net classes)."""
     _skip_unless_live()
-    monkeypatch.setattr(brt, "_BOARDS", {})
-    monkeypatch.setattr(brt, "_PROGRESS", {})
+    monkeypatch.setattr(bs, "_BOARDS", {})
+    monkeypatch.setattr(bs, "_PROGRESS", {})
+    monkeypatch.setattr(ipc, "editor_holding", REAL_EDITOR_HOLDING)
     design = json.loads((EXAMPLES / "lm358_buffer" / "netlist.json").read_text(encoding="utf-8"))
     design["net_specs"] = {"OUT_A": {"voltage": 5, "current": 1.0},
                            "OUT_B": {"voltage": 5, "current": 1.0}}
@@ -540,6 +706,11 @@ def test_live_k11_save_snapshots_then_freerouting_routes_the_snapshot(tmp_path, 
     built = bpt.build_board_from_netlist(netlist, 50, 25, out_pcb=pcb)
     assert built.get("ok"), built
     assert tc.is_pre_k11(pcb) and "NC_OUT_A" in _sib(pcb, "", ".kicad_pro").read_text("utf-8")
+    return pcb
+
+
+def test_live_k11_save_snapshots_then_freerouting_routes_the_snapshot(tmp_path, monkeypatch):
+    pcb = _live_lm358(tmp_path, monkeypatch)
     snap = tc.pre_k11_snapshot_path(pcb)
     before = _kicad_cli_pids()
     try:
@@ -568,3 +739,42 @@ def test_live_k11_save_snapshots_then_freerouting_routes_the_snapshot(tmp_path, 
     assert "NC_OUT_A" in _sib(pcb, "", ".kicad_pro").read_text("utf-8")
     if before is not None:
         assert _kicad_cli_pids() <= before, "kicad-cli api-server leaked"
+
+
+def test_live_stall_then_two_fallbacks_keep_the_first_agent_copy(tmp_path, monkeypatch):
+    """ROADMAP D5 end to end: headless route_check x5 on the unrouted board
+    reports the stall, Freerouting routes the snapshot, the agent saves
+    through KiCad 11 again, and a second fallback keeps the first agent copy
+    as X.agent.1.*; no kicad-cli api-server or java process is left."""
+    pcb = _live_lm358(tmp_path, monkeypatch)
+    lock = tmp_path / "~netlist.kicad_pro.lck"
+    clis, javas = _kicad_cli_pids(), _java_pids()
+    try:
+        rounds = [brt.route_check(pcb) for _ in range(5)]          # nothing is routed: no gain
+        assert [r["progress"]["rounds"] for r in rounds] == [1, 2, 3, 4, 5], rounds[-1]
+        assert [r["stalled"] for r in rounds] == [False, False, False, True, True]
+        assert "from_snapshot=true" in rounds[-1]["stall_note"]
+        first = bpt.autoroute_board(pcb, route_timeout=600, from_snapshot=True)
+        assert first["ok"] is True and first["fallback_from_snapshot"] is True, first
+        assert first["released_boards"] == [pcb] and first["unconnected"] == 0
+        agent = Path(first["agent_copy"])
+        first_agent = agent.read_bytes()
+        assert not tc.is_pre_k11(str(agent)) and not lock.exists()
+        saved = brt.save_board(pcb) if brt.open_board(pcb, mode="headless")["ok"] else None
+        assert saved and saved["saved"] is True, saved            # the routed board, now K11
+        assert saved["pre_k11_snapshot_taken"] == tc.pre_k11_snapshot_path(pcb)
+        assert not tc.is_pre_k11(pcb)
+        second = bpt.autoroute_board(pcb, route_timeout=600, from_snapshot=True)
+        assert second["ok"] is True and second["fallback_from_snapshot"] is True, second
+        assert second["released_boards"] == [pcb] and second["unconnected"] == 0
+    finally:
+        brt.close_all()
+    kept = _sib(pcb, ".agent.1", ".kicad_pcb")
+    assert kept.read_bytes() == first_agent                       # the first agent copy survives
+    assert _sib(pcb, ".agent.1", ".kicad_pro").is_file() and agent.read_bytes() != first_agent
+    assert tc.is_pre_k11(pcb) and not lock.exists()
+    drc = tc.drc_counts(pcb)
+    assert drc["errors"] == 0 and drc["unconnected"] == 0, drc
+    if clis is not None:
+        assert _kicad_cli_pids() <= clis, "kicad-cli api-server leaked"
+        assert _java_pids() <= javas, "java (Freerouting) leaked"

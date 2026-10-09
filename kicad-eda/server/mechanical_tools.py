@@ -52,7 +52,7 @@ POS_NOTE = ("mechanical datum CPL: positions relative to the drill / aux origin 
 STEP_ASSEMBLY_NOTE = ("board_only=False: component models sit in their own STEP products placed "
                       "by assembly transforms this text scan does not apply, so the bbox is the "
                       "board body's only with board_only=True")
-_ERRORS = (ValueError, OSError, ImportError)    # DxfOutlineError, ResolveError, OutlineError, ...
+_ERRORS = (ValueError, TypeError, OSError, ImportError)  # DxfOutlineError etc. are ValueErrors
 
 
 class ToolError(ValueError):
@@ -69,7 +69,8 @@ def _fail(exc: BaseException) -> dict:
     if isinstance(exc, ImportError):
         return {"ok": False, "reason": f"a Python dependency is missing ({exc}); install "
                                        "server/requirements.txt into the server's Python"}
-    return {"ok": False, "reason": str(exc) or type(exc).__name__}
+    prefix = "malformed netlist or argument: " if isinstance(exc, TypeError) else ""
+    return {"ok": False, "reason": prefix + (str(exc) or type(exc).__name__)}
 
 
 def _r(v: float) -> float:
@@ -196,8 +197,7 @@ def _import(netlist: str, dxf: str, layer: str, units: str, mode: str, parts: ob
             **({"units": read.source.units} if units and units.strip() else {})}
     geometry = {"outline": spec} if mode == "reference" else read.to_board_block()
     board, notes = mx.dxf_board(design.get("board"), geometry)
-    anchors = mx.fusion_anchors(_load_parts(parts, base), read.datum,
-                                design.get("components") or [])
+    anchors = mx.fusion_anchors(_load_parts(parts, base), read.datum, design.get("components"))
     new = mx.with_anchors(design, board, anchors)
     resolved = orv.resolve_board(new, base)         # validated before anything is written
     profile, profile_notes = _profile()
@@ -296,8 +296,8 @@ def _export_dxf(pcb: str, out_dxf: str) -> dict:
     board, out, cli, base, mx = _job(pcb, out_dxf, "out_dxf")
     import dxf_io
     reference = mx.board_file_outline(board)
-    help_text = mx.cli_help(tc.run, cli, ("pcb", "export", "dxf"))
-    args, warnings, mm = mx.dxf_command(cli, str(board), str(out), help_text)
+    help_text, why = mx.cli_help(tc.run, cli, ("pcb", "export", "dxf"))
+    args, warnings, mm = mx.dxf_command(cli, str(board), str(out), help_text, why)
     run = mx.run_cli(tc.run, args, out, "DXF")
     base = {"dxf": str(out), **base, "command": args}
     if not run.ok:
@@ -416,7 +416,7 @@ def _validate(netlist: str) -> dict:
                                         "parts, so there is no outline to validate")],
                         source="none", fab_profile=profile)
     issues = [*oa.fab_issues(o, profile=profile),
-              *mx.part_issues(o, design.get("components") or []),
+              *mx.part_issues(o, mx.component_list(design.get("components"))),
               *mx.hole_issues(o, design, resolved.source, profile),
               *(oa.Issue("dxf_warning", "warning", None, w) for w in resolved.warnings),
               *(oa.Issue("fab_profile", "warning", None, n) for n in profile_notes)]

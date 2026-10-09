@@ -10,194 +10,57 @@ stays available for a KiCad 9-format board but is no longer the default.
     route_check (kicad-cli DRC) / route_status (the routed gate)        verify
     save_board / close_board / list_open_boards                         lifecycle
 
-Every tool takes the board path first and opens it ON DEMAND through
-backends.pcb_api.BoardApi: a headless KiCad 11 ``kicad-cli api-server`` with
-the file preloaded, or a running KiCad GUI whose PCB editor has it open (the
-mode is resolved before anything else, so a board the GUI holds is served
-by the GUI). A headless server holds ONE board: opening another releases an
-idle (saved) headless board, named in ``released_boards``, and refuses while
-one has unsaved changes (``blocking_board`` names it). Responses are JSON
-dicts with ``ok``, ``backend: "api"``, ``mode`` and ``path``; a
-BoardApiError / ValueError becomes ``{ok: false, reason}`` whose reason says
-what to do next, and any other exception inside a tool is reported the same
-way. The tools never raise. Every open board is closed at interpreter exit
-(atexit), so a normal shutdown leaves no api-server behind.
+Every tool takes the board path first and opens it ON DEMAND; the session
+registry and its policies (one headless board at a time, released_boards /
+blocking_board, {ok: false, reason} instead of an exception, atexit close,
+the D5 snapshot and stall history) live in board_sessions.py. Responses are
+JSON dicts with ``ok``, ``backend: "api"``, ``mode`` and ``path``.
 
 FILE FORMAT: the first save through a headless session rewrites the board in
 KiCad 11 format. KiCad 9/10 tools (Freerouting, the SWIG gate checks) then
 refuse it and kicad-cli 11 runs its DRC and exports (toolchain.board_cli picks
-the writer's kicad-cli). ROADMAP D5: _save copies a pre-11 file to X.k9.*
-first (KiCad 11 GUI: at open), responses carry ``pre_k11_snapshot`` and
-route_check flags ``stalled``. Units: millimetres everywhere, 4 decimals.
+the writer's kicad-cli). ROADMAP D5: a pre-11 file is copied to X.k9.* first
+(KiCad 11 GUI: at open), responses carry ``pre_k11_snapshot`` and route_check
+flags ``stalled``. Units: millimetres everywhere, 4 decimals.
 """
 from __future__ import annotations
 
-import atexit
 import json
 import math
+import sys
+import types
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
-import kicad_ipc as ipc
+import board_sessions as bs
 import route_planner as rp
 import toolchain as tc
-from backends import pcb_session as sess
 from backends.errors import BoardApiError
 from backends.pcb_api import BoardApi
-from session_release import Release, close_error_fields
 
-BACKEND = "api"
 DEFAULT_CLASS = "Default"      # nets in KiCad's default class carry no width binding (SWIG parity)
 ROUND = 4
 NO_CONNECTIVITY = ("KiCad's connectivity (GetConnectedItems) is unavailable on this session, so "
                    "what is still unrouted cannot be listed; route_check's unconnected_items say "
                    "what is open")
-_ERRORS = (BoardApiError, ValueError)
 Item = Mapping[str, Any]
 
-_BOARDS: dict[str, BoardApi] = {}      # kicad_ipc.norm_path(pcb) -> BoardApi
-_PROGRESS: dict[str, tuple[int, ...]] = {}   # same key -> score of each judged route_check
+# the session registry (board_sessions); other modules call these names here
+BACKEND, _key, _note, _with_board = bs.BACKEND, bs._key, bs._note, bs._with_board
+release_for_rewrite, close_all, status = bs.release_for_rewrite, bs.close_all, bs.status
 
 
-# ----------------------------------------------------------------------------
-# registry: one BoardApi per board path, opened on demand
-# ----------------------------------------------------------------------------
-def _key(pcb: str) -> str:
-    return ipc.norm_path(pcb)
+class _RegistryNames(types.ModuleType):
+    """board_route_tools._BOARDS / _PROGRESS ARE board_sessions' registry:
+    reading or rebinding them here (tests written before the F5-04 split
+    monkeypatch these names) reads or rebinds board_sessions'."""
+    _BOARDS = property(lambda self: bs._BOARDS,
+                       lambda self, value: setattr(bs, "_BOARDS", value))
+    _PROGRESS = property(lambda self: bs._PROGRESS,
+                         lambda self, value: setattr(bs, "_PROGRESS", value))
 
 
-def _note(value: Any, key: str = "note") -> dict:
-    return {key: value} if value else {}
-
-
-def _fail(api: BoardApi, reason: str) -> dict:
-    return {"ok": False, "backend": BACKEND, "mode": api.mode, "path": api.path, "reason": reason}
-
-
-def _forget(key: str, discard: bool = False) -> str | None:
-    """Drop a board and release its session (``discard`` reverts unsaved
-    headless changes first); the close error text, if any."""
-    api = _BOARDS.pop(key, None)
-    if api is None:
-        return None
-    try:
-        if discard:
-            api.discard()
-        else:
-            api.close()
-    except Exception as exc:  # a dead headless server must not wedge the registry
-        return f"{type(exc).__name__}: {exc}"
-    return None
-
-
-def _take_snapshot(api: BoardApi, consequence: str) -> dict:
-    """{"pre_k11_snapshot_taken": path} when the pre-11 file was copied now (D5)."""
-    try:
-        return _note(tc.snapshot_before_k11_write(api.path, api.kicad_version),
-                     "pre_k11_snapshot_taken")
-    except RuntimeError as exc:
-        raise BoardApiError(f"{exc} ({consequence})") from exc
-
-
-def _save(api: BoardApi) -> dict:
-    """The one way this module saves: snapshot first (ROADMAP D5), then write."""
-    taken = _take_snapshot(api, "the board was not saved")
-    api.save()
-    return taken
-
-
-def _blocked_by(api: BoardApi, pcb: str, why: str = "the api-server holds one board at a time") -> dict:
-    """The refusal for ``pcb`` while the dirty board ``api`` is in the way."""
-    return {"ok": False, "backend": BACKEND, "path": pcb, "blocking_board": api.path,
-            "mode": api.mode,
-            "reason": f"{api.path} is open in the {api.mode} KiCad session with unsaved changes; "
-                      f"save_board or close_board it first ({why})"}
-
-
-def _release_headless(pcb: str) -> Release:
-    """The headless api-server holds ONE board at a time: drop idle (saved)
-    headless boards before opening ``pcb`` there; refuse (naming the dirty
-    board in ``blocking_board``) while one has unsaved changes."""
-    released: list[str] = []
-    errors: list[str] = []
-    for key, api in list(_BOARDS.items()):
-        if key == _key(pcb) or api.mode != "headless":
-            continue
-        if api.is_modified:
-            return Release(_blocked_by(api, pcb), tuple(released), tuple(errors), kind="board")
-        error = _forget(key)
-        released.append(api.path)
-        if error:
-            errors.append(f"{api.path}: {error}")
-    return Release(released=tuple(released), errors=tuple(errors), kind="board")
-
-
-def _open(pcb: str, mode: str) -> tuple[BoardApi | None, dict]:
-    """Open ``pcb`` into the registry: (api, notes) or (None, refusal). The
-    mode is resolved FIRST, so the one-board-at-a-time sweep of the headless
-    server runs only for a headless open and a board the running GUI holds
-    is served there even while another headless board is dirty."""
-    try:
-        resolved = BoardApi.resolve_mode(pcb, mode)
-    except Exception as exc:  # BoardApiError (bad mode) or a GUI probe failure
-        return None, {"ok": False, "backend": BACKEND, "path": pcb,
-                      "reason": f"{type(exc).__name__}: {exc}"}
-    notes: dict = {}
-    if resolved == "headless":
-        release = _release_headless(pcb)
-        if release.blocked:
-            return None, release.blocked
-        notes = release.fields()
-    try:
-        api = BoardApi.open(pcb, mode=resolved)
-    except Exception as exc:  # BoardApiError (actionable) or a launch failure
-        return None, {"ok": False, "backend": BACKEND, "path": pcb,
-                      "reason": f"{type(exc).__name__}: {exc}", **notes}
-    _BOARDS[_key(pcb)] = api
-    if resolved == "gui":           # its user may save at any time: snapshot now (D5)
-        try:
-            notes = {**notes, **_take_snapshot(api, "the GUI session was not kept open")}
-        except BoardApiError as exc:
-            return None, {**_fail(api, str(exc)), **_note(_forget(_key(pcb)), "close_error")}
-    return api, notes
-
-
-def _board(pcb: str, mode: str = "auto") -> tuple[BoardApi | None, dict]:
-    """The registered BoardApi for ``pcb``, opened on demand: (api, notes) or
-    (None, refusal)."""
-    api = _BOARDS.get(_key(pcb))
-    if api is not None:
-        return api, {}
-    return _open(pcb, mode)
-
-
-def _with_board(pcb: str, fn: Callable[[BoardApi], dict]) -> dict:
-    """Every tool's path: open on demand, run ``fn(api)``, stamp the response;
-    a BoardApiError / ValueError from either step is {ok: false, reason}, and
-    so is any other exception (a kipy wrapper surprise on an unusual board):
-    a tool answers, it never raises out of the MCP server."""
-    api, notes = _board(pcb)
-    if api is None:
-        return notes
-    try:
-        result = fn(api)
-    except _ERRORS as exc:
-        return {**_fail(api, str(exc)), **notes}
-    except Exception as exc:  # noqa: BLE001 - reported with its type, never swallowed
-        return {**_fail(api, f"unexpected {type(exc).__name__}: {exc} (the board stays open; "
-                             "report this with the board file)"), **notes}
-    return {"ok": True, "backend": BACKEND, "mode": api.mode, "path": api.path, **result, **notes}
-
-
-def _not_open(pcb: str) -> dict:
-    return {"ok": False, "backend": BACKEND, "path": pcb,
-            "reason": f"{pcb} is not open; open boards: "
-                      f"{[api.path for api in _BOARDS.values()] or 'none'}"}
-
-
-def _open_list() -> list[dict]:
-    return [{"path": api.path, "mode": api.mode, "unsaved_changes": api.is_modified,
-             **tc.snapshot_field(api.path)} for api in _BOARDS.values()]
+sys.modules[__name__].__class__ = _RegistryNames
 
 
 # ----------------------------------------------------------------------------
@@ -442,26 +305,15 @@ def _remove(api: BoardApi, net: str, ids: Sequence[str] | None) -> dict:
 # ----------------------------------------------------------------------------
 # verify: kicad-cli DRC and the routed gate
 # ----------------------------------------------------------------------------
-def _record_round(api: BoardApi, drc: Item) -> dict:
-    """Score this round (errors + unconnected) into the board's history and judge
-    it (tc.route_progress); a DRC of a stale disk copy (unsaved copper) is skipped."""
-    if api.is_modified:
-        return {"progress_note": "not counted toward stall detection: DRC judged the file on "
-                                 "disk, not the unsaved board"}
-    key = _key(api.path)
-    _PROGRESS[key] = _PROGRESS.get(key, ()) + (int(drc["errors"]) + int(drc["unconnected"]),)
-    return tc.route_progress(_PROGRESS[key])
-
-
 def _route_check(api: BoardApi, refill: bool, save: bool, max_items: int) -> dict:
     if max_items < 0:
         raise ValueError(f"max_items must be >= 0, got {max_items}")
     out: dict = {}
-    if refill:
+    if refill:                  # a refill marks the board modified: save=true then rewrites it
         out["zones_refilled"] = api.refill_zones()
     if save and api.is_modified:
-        out.update(_save(api), saved=True)
-    else:                       # an untouched board is never rewritten (it would change format)
+        out.update(bs._save(api), saved=True)
+    else:                       # save=false, or nothing changed (possible only with refill=false)
         out["saved"] = False
         if api.is_modified:
             out["unsaved_note"] = ("the board has unsaved changes; DRC judged the file on disk "
@@ -473,12 +325,13 @@ def _route_check(api: BoardApi, refill: bool, save: bool, max_items: int) -> dic
         raise BoardApiError("kicad-cli not found; install KiCad (or set KICAD_PATH): route_check "
                             "needs it to run DRC")
     drc = {**out, **tc.drc_check(api.path, max_items), **tc.snapshot_field(api.path)}
-    return drc if "reason" in drc else {**drc, **_record_round(api, drc)}
+    return {**drc, **bs._record_round(api, drc)}
 
 
 def _net_status(net: str, pads: Sequence[Item], tracks: Sequence[Item], vias: Sequence[Item],
                 clusters: Sequence[Sequence[str]] | None, netclass: Item | None,
-                preroute_width: float | None, preroute_authored: float | None) -> tuple[dict, list[str]]:
+                preroute_width: float | None,
+                preroute_authored: float | None) -> tuple[dict, list[str]]:
     """One net's row of route_status and its width issues. Only a net bound
     to a non-default class is policed for width (SWIG gate parity)."""
     cls = dict(netclass or {})
@@ -564,19 +417,11 @@ def open_board(pcb: str, mode: str = "auto") -> dict:
     the mode or to re-read the file. A board that is already open with
     unsaved changes is not re-opened (save_board or close_board it first).
     A KiCad 11 GUI session copies a KiCad 9/10 file to X.k9.* at once
-    (pre_k11_snapshot_taken): its user may save at any time. On {ok: false} the reason names the fix: install a KiCad 11 nightly (or
-    open the board in a KiCad GUI), save/close the dirty headless board that
-    blocks the single server, or check the path."""
-    key = _key(pcb)
-    existing = _BOARDS.get(key)
-    if existing is not None and existing.is_modified:
-        return _fail(existing, f"{existing.path} is already open with unsaved changes; "
-                               "save_board or close_board it before re-opening")
-    notes = close_error_fields(_forget(key))
-    api, more = _open(pcb, mode)
-    if api is None:
-        return {**more, **notes}
-    return {**_with_board(pcb, _opened), **more, **notes}
+    (pre_k11_snapshot_taken): its user may save at any time. On {ok: false}
+    the reason names the fix: install a KiCad 11 nightly (or open the board
+    in a KiCad GUI), save/close the dirty headless board that blocks the
+    single server, or check the path."""
+    return bs._reopen(pcb, mode, _opened)
 
 
 def board_overview(pcb: str) -> dict:
@@ -654,10 +499,12 @@ def remove_routing(pcb: str, net: str = "", ids: list[str] | None = None) -> dic
 def route_check(pcb: str, refill: bool = True, save: bool = True, max_items: int = 40) -> dict:
     """Verify with KiCad: refill the zones, save the board when it has
     unsaved changes (kicad-cli reads the file; the first headless save
-    writes KiCad 11 format, after copying a KiCad 9/10 file to X.k9.*; the
-    refill counts as a change: only refill=false leaves an untouched board
-    as it is, saved false + save_note) and run kicad-cli DRC at error
-    severity with the kicad-cli of the KiCad that wrote the file. Returns
+    writes KiCad 11 format, after copying a KiCad 9/10 file to X.k9.*) and
+    run kicad-cli DRC at error severity with the kicad-cli of the KiCad that
+    wrote the file. The refill counts as a change, so with the defaults even
+    an untouched board is saved (headless: rewritten in KiCad 11 format);
+    only refill=false leaves an unmodified board as it is (saved false +
+    save_note). Returns
     {ok: errors == 0 and unconnected == 0, errors, unconnected, types,
     violations: [{type, severity, description, items: [{description, x,
     y}]}] (first max_items), unconnected_items: [same shape; an item names a
@@ -667,8 +514,11 @@ def route_check(pcb: str, refill: bool = True, save: bool = True, max_items: int
     its items' x, y, remove_routing(net=...) the offending net, re-route,
     run again; stalled (3 rounds without a new best) = stop, stall_note
     names the fallback. save=false keeps the file (unsaved_note: DRC judged
-    the disk copy, round not counted). {ok: false, reason} without counts:
-    DRC itself failed (no kicad-cli, or no report)."""
+    the disk copy). {ok: false, reason} without counts: DRC itself failed (no
+    kicad-cli; it exited non-zero, crashed or wrote no report: the last
+    report is deleted first, never re-read). A round that is not counted
+    (unsaved copper, failed DRC) says so in progress_note and still returns
+    the progress / stalled verdict so far."""
     return _with_board(pcb, lambda api: _route_check(api, refill, save, max_items))
 
 
@@ -713,11 +563,7 @@ def save_board(pcb: str) -> dict:
     refuse the file; kicad-cli 11 checks and exports it), after copying a
     KiCad 9/10 file to X.k9.* (pre_k11_snapshot_taken). Refused when the
     board is not open or that copy fails (nothing saved)."""
-    api = _BOARDS.get(_key(pcb))
-    if api is None:
-        return _not_open(pcb)
-    return _with_board(pcb, lambda a: {**_save(a), "saved": True, "path": a.path,
-                                       **tc.snapshot_field(a.path)})
+    return bs._save_open(pcb)
 
 
 def close_board(pcb: str, save: bool = True) -> dict:
@@ -729,70 +575,15 @@ def close_board(pcb: str, save: bool = True) -> dict:
     session the copper STAYS in the running KiCad editor (discarded_changes
     false + note: save or undo it there). Refused when the board is not
     open, or when the save (or its X.k9.* copy) fails: the board stays open."""
-    key = _key(pcb)
-    api = _BOARDS.get(key)
-    if api is None:
-        return _not_open(pcb)
-    res = {"ok": True, "backend": BACKEND, "mode": api.mode, "path": api.path, "saved": False,
-           "discarded_changes": False}
-    if save and api.is_modified:
-        try:
-            res.update(_save(api))
-        except _ERRORS as exc:
-            return _fail(api, f"save failed, board left open: {exc}")
-        res["saved"] = True
-    if api.is_modified and api.mode == "headless":
-        res["discarded_changes"] = True
-    elif api.is_modified:
-        res["note"] = (f"unsaved copper stays in the KiCad editor ({api.mode} session): save "
-                       "or undo it there")
-    return {**res, "closed": True, **tc.snapshot_field(api.path),
-            **_note(_forget(key, discard=not save), "close_error")}
+    return bs._close(pcb, save)
 
 
 def list_open_boards() -> dict:
     """The boards this server holds: {boards: [{path, mode, unsaved_changes,
     pre_k11_snapshot?}]}. A headless api-server holds one board; a "gui"
     entry is a board open in a running KiCad."""
-    return {"ok": True, "backend": BACKEND, "boards": _open_list()}
+    return {"ok": True, "backend": BACKEND, "boards": bs._open_list()}
 
-
-def status() -> dict:
-    """server_status's board-API keys: board_api (a headless KiCad 11 board
-    session can run here), board_api_reason (why not), boards_open."""
-    reason = BoardApi.unavailable_reason()
-    return {"board_api": reason is None, "board_api_reason": reason, "boards_open": _open_list()}
-
-
-def release_for_rewrite(pcb: str) -> dict:
-    """Before another tool rewrites `pcb` (a session holding it could save its
-    OLD board over the new file): close an idle session ({released_boards}),
-    refuse a dirty one ({ok: false, blocking_board}); reset stall history."""
-    key = _key(pcb)
-    api = _BOARDS.get(key)
-    if api is not None and api.is_modified:
-        return _blocked_by(api, pcb, "it would save its old copy over the rewritten file")
-    _PROGRESS.pop(key, None)
-    if api is None:
-        return {}
-    error = _forget(key)
-    return Release(released=(api.path,), errors=(f"{api.path}: {error}",) if error else (),
-                   kind="board").fields()
-
-
-def close_all() -> list[str]:
-    """Release every open board without saving (registered with atexit: a
-    normal interpreter exit must not leave a kicad-cli api-server running);
-    the close errors, if any."""
-    errors: list[str] = []
-    for key in list(_BOARDS):
-        error = _forget(key)
-        if error:
-            errors.append(error)
-    return errors
-
-
-atexit.register(close_all)
 
 TOOLS = (open_board, board_overview, board_pads, unrouted_connections, route_net, add_vias,
          remove_routing, route_check, route_status, save_board, close_board, list_open_boards)

@@ -30,6 +30,7 @@ import pytest
 
 import fd_sections as fs
 import fieldsolve2d as fd
+import tline
 from tline.types import ETA0, LineGeometry, MaskModel, Ply
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -295,11 +296,22 @@ def test_synthesize_validates_arguments() -> None:
                          "ground_gap", 0.2, budget=fd.FdBudget(0.0))
 
 
+def test_pair_z0_cannot_be_synthesised_by_the_pair_gap() -> None:
+    """A pair's z0 = sqrt(z_even z_odd) is nearly flat in the gap (DSL100_off: 57.13 -> 58.93
+    ohm from gap 0.1 to 0.25) and never exceeds the uncoupled line's Z0: refused up front."""
+    pair = sl_off(0.0894, pair="edge", pair_gap=0.15)
+    with pytest.raises(ValueError, match="z0.*pair_gap"):
+        fd.synthesize_fd(pair, 58.0, "z0", "pair_gap", 0.15, budget=fd.FdBudget(0.0))
+    with pytest.raises(ValueError, match="z0.*pair_gap"):
+        fd.slope_guess("pair_gap", "z0")
+
+
 def test_pair_gap_slope_guess_follows_the_mode() -> None:
     """Z(pair gap) rises for the odd / differential mode and falls for the even / common one."""
     assert fd.slope_guess("pair_gap", "zdiff") > 0 and fd.slope_guess("pair_gap", "zodd") > 0
     assert fd.slope_guess("pair_gap", "zeven") < 0 and fd.slope_guess("pair_gap", "zcomm") < 0
     assert fd.slope_guess("width", "zeven") < 0 and fd.slope_guess("ground_gap", "zeven") > 0
+    assert fd.slope_guess("width", "z0") < 0 and fd.slope_guess("ground_gap", "z0") > 0
 
 
 # ---------------------------------------------------------------- cache key
@@ -569,7 +581,28 @@ def test_fd_matches_cohn_broadside_at_zero_thickness(w: float, core: float, pp: 
     if w / b >= 0.35 * (1 - pp / b):                     # Cohn's Zeven validity
         assert res.z_even == pytest.approx(z_even, rel=3e-3)
     assert res.z_comm == pytest.approx(res.z_even / 2)
-    assert res.z0 == res.z_odd and res.eeff == res.eeff_odd   # tline pair convention
+    # one pair convention with tline (stripline.pair_line_result): z0 = sqrt(z_even z_odd)
+    assert res.z0 == pytest.approx(math.sqrt(res.z_even * res.z_odd), rel=1e-12)
+    assert res.eeff == res.eeff_odd
+
+
+PAIR_VECTORS = ("DSL100_off", "DMS90_7628", "BSL100")
+
+
+@needs_fd
+@pytest.mark.parametrize("name", PAIR_VECTORS)
+def test_pair_z0_is_one_convention_across_fd_and_tline(name: str) -> None:
+    """FD and the closed forms report the same quantity as a pair's z0, sqrt(z_even z_odd),
+    so a class B z0 check or a z0 synthesis target compares like with like across the tiers
+    (with z_odd on one side and sqrt(z_even z_odd) on the other they were 17-33 % apart)."""
+    geom = VECTORS[name][0]
+    res, closed = fd.solve(geom), tline.evaluate(geom)
+    for r in (res, closed):
+        assert r.z0 == pytest.approx(math.sqrt(r.z_even * r.z_odd), rel=1e-12), name
+        assert r.z_diff == pytest.approx(2 * r.z_odd, rel=1e-12)
+        assert r.z_comm == pytest.approx(r.z_even / 2, rel=1e-12)
+    assert res.z0 == pytest.approx(closed.z0, rel=0.05), name      # measured -3.8..+0.3 %
+    assert res.z_diff == pytest.approx(closed.z_diff, rel=0.05), name
 
 
 # ---------------------------------------------------------------- numerics: D7.14 vectors
@@ -640,6 +673,18 @@ def test_synthesize_fd_solves_for_the_pair_gap() -> None:
     assert stats["converged"], stats
     assert out.pair_gap == pytest.approx(0.15, rel=0.03) and out.width == 0.0894
     assert res.z_diff == pytest.approx(100.0, rel=0.002)
+
+
+@needs_fd
+def test_synthesize_fd_pair_z0_by_width_targets_sqrt_of_even_and_odd() -> None:
+    """target_kind 'z0' on a pair means sqrt(z_even z_odd), the quantity tline reports."""
+    target = fd.solve(sl_off(0.0894, pair="edge", pair_gap=0.15)).z0      # 58.25 ohm
+    out, res, stats = fd.synthesize_fd(sl_off(0.1003, pair="edge", pair_gap=0.15), target,
+                                       "z0", "width")
+    assert stats["converged"] and stats["solves"] <= 8, stats
+    assert out.width == pytest.approx(0.0894, rel=0.01) and out.pair_gap == 0.15
+    assert res.z0 == pytest.approx(math.sqrt(res.z_even * res.z_odd), rel=1e-12)
+    assert res.z0 == pytest.approx(target, rel=0.002) and res.z_odd < 0.9 * target
 
 
 @needs_fd

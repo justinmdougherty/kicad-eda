@@ -1,6 +1,6 @@
 """Harness stages after G4: the route-cache manifest of the final board, and
-G5 (fabrication package, final renders and the offline sourcing audit).
-Feature hook (rp_hooks): g5_verdict."""
+G5 (fabrication package, final renders, the offline sourcing audit and the
+D5 safety screen). Feature hook (rp_hooks): g5_verdict."""
 from __future__ import annotations
 
 import json
@@ -13,6 +13,7 @@ import kicad_server as k
 import rp_context
 import rp_hooks
 import rp_kicad
+import safety_screen
 
 
 @rp_context.stage
@@ -34,7 +35,9 @@ def stage_cache_manifest(ctx: rp_context.RunContext) -> bool:
 
 @rp_context.stage
 def stage_g5(ctx: rp_context.RunContext) -> bool:
-    """G5: fabrication package (release)."""
+    """G5: fabrication package (release). A safety-relevant design (D5:
+    mains or > 50 V, Li-ion charging) is released with a HUMAN REVIEW
+    REQUIRED warning per safety kind (safety_screen.safety_warnings)."""
     r = k.export_fab_package(ctx.pcb, netlist=ctx.netlist)
     fab = {"ok": r.get("ok"), "zip": Path(r.get("zip", "")).name,
            "files": len(r.get("files", [])),
@@ -44,6 +47,9 @@ def stage_g5(ctx: rp_context.RunContext) -> bool:
     src = sourcing(ctx.design)
     ctx.report["sourcing"] = src
     verdict = gates.g5_fab(fab, require_assembly=True, sourcing=src)
+    safety = safety_screen.safety_warnings(ctx.design)
+    if safety:
+        verdict = {**verdict, "warnings": [*verdict["warnings"], *safety]}
     return rp_context.record_gate(ctx, rp_hooks.chain("g5_verdict", ctx, verdict))
 
 

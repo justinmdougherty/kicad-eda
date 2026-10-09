@@ -11,21 +11,23 @@ Unit tier (no KiCad):
   * net_class_widths(pro, nets): every matching pattern and netclass_assignment
     contributes, the class order is (priority, name), the first class with a
     track width wins, a Default winner or no width means no class width; the
-    combined matcher (an anchored regex whose match starts at the net's first
-    character, with ARE bracket classes, OR an anchored * / ? wildcard); bus
-    patterns as 9.0.4 reads them; the empty net
-    is unclassed; nets is required, so a net's answer never depends on which
-    other nets are asked; {} for a missing file; ValueError naming the file for
-    malformed JSON or entries; class_width / class_of;
+    combined matcher (an anchored PCRE2 regex whose match starts at the net's
+    first character, OR an anchored * / ? wildcard) and pcre_to_python's
+    rewrites (POSIX bracket classes, ASCII escapes, \\Z / \\z, \\Q..\\E, inline
+    options as scoped groups); the documented gaps; bus patterns and {,n} as
+    9.0.4 reads them; the empty net is unclassed; nets is required, so a net's
+    answer never depends on which other nets are asked; {} for a missing file;
+    ValueError naming the file for malformed JSON or entries; class_width /
+    class_of;
   * check_routed_widths reads classes through netclass_read and keeps its
     issue strings byte-identical (fake board, pcbnew stubbed for the import);
   * swig_copper: the helpers moved out of swig_board_fixes keep their names
     there as aliases (the very same function objects).
 
 Live tier (skipped without a KiCad 9/10 bundled Python that imports pcbnew):
-  KiCad's own resolution of every scenario equals netclass_read's, and
-  `swig_gate_checks.py routed` on a real saved board reports the class-width
-  issues through netclass_read.
+  KiCad's own resolution of every scenario equals netclass_read's, every
+  documented gap still differs, and `swig_gate_checks.py routed` on a real
+  saved board reports the class-width issues through netclass_read.
 """
 from __future__ import annotations
 
@@ -192,6 +194,42 @@ MATCHES = [
     ("N[[.a.]]", "N[[.a.]]", True), ("N[[.a.]]", "Na]", False), ("N[[.a.]]", "Na", False),
     ("N[[=a=]]", "N[[=a=]]", True), ("N[[=a=]]", "Na]", False),
     ("a&&b", "a&&b", True), ("a&&b", "a&b", False),
+    # an invalid regex is dropped, never matched as a substring of '^<pattern>$'
+    ("N[[:foo:]]", "^N[[:foo:]]$", False), ("N[[:foo:]]", "N[[:foo:]]X", False),
+    # a trailing '\$' counts as the '$' anchor, so no '$' is appended
+    ("A\\$", "A$", True), ("A\\$", "A$X", True), ("A\\$", "A", False), ("A\\$", "A\\$", True),
+    # PCRE2, as wxRegEx compiles it: an inline option lasts to the end of its
+    # group and carries into the group's later '|' branches
+    ("(?i)vin", "VIN", True), ("(?i)vin", "Vin", True), ("(?i)vin", "(Xi)vin", True),
+    ("V(?i)in", "VIN", True), ("V(?i)in", "vIN", False),
+    ("(V(?i)i)n", "VIn", True), ("(V(?i)i)n", "VIN", False),
+    ("(?-i)VIN", "VIN", True), ("(?-i)VIN", "vin", False),
+    ("(?i)V(?-i)IN", "vIN", True), ("(?i)V(?-i)IN", "vin", False),
+    ("(a(?i)b|c)", "aB", True), ("(a(?i)b|c)", "C", True), ("(a(?i)b|c)", "Ab", False),
+    ("(a(?i)b|c)", "ac", False),
+    ("a(?i)b|c", "aBx", True), ("a(?i)b|c", "C", True), ("a(?i)b|c", "xC", False),
+    ("a(?i)b|c", "AB", False),
+    ("(?i)a|b", "B", True), ("(?i)a|b", "Ax", True), ("(?i)a|b", "xB", False),
+    ("(?i:v)IN", "vIN", True), ("(?i:v)IN", "vin", False), ("(?i:a)|b", "B", False),
+    ("(?s)V.N", "VIN", True), ("(?-s)A.B", "A\nB", False), ("(?-s)A.B", "AxB", True),
+    ("(?m)A$", "A\nB", True), ("(?x)V I N", "VIN", True), ("(?x)V I N", "V I N", False),
+    ("(?x)a b|c d", "cd", True), ("(?i)Né", "NÉ", True),
+    # no UCP: \d \w \s \b and their negations are ASCII-only, in and out of sets
+    ("in\\d+", "in١٢", False), ("A\\DB", "A١B", True), ("A\\DB", "A1B", False),
+    ("N\\w", "Né", False), ("N\\w", "N_", True), ("A\\WB", "AéB", True),
+    ("A\\sB", "A B", False), ("A\\sB", "A\x0bB", True), ("A\\SB", "A B", True),
+    ("Né\\b", "Né", False), ("N\\b", "N", True), ("N\\Bé", "Né", False),
+    ("[\\d]X", "١X", False), ("[\\d]X", "1X", True), ("[\\w]X", "éX", False),
+    ("[\\s]X", " X", False), ("[\\s]X", " X", True),
+    # \Z allows a final newline, \z does not; \Q..\E quotes (without \E up to the
+    # end, the appended '$' included); a stray \E is ignored
+    ("A\\Z", "A\n", True), ("A\\z", "A", True), ("A\\z", "A\n", False),
+    ("\\QA.B\\E", "A.B", True), ("\\QA.B\\E", "AxB", False),
+    ("\\QA.B", "A.B", False), ("\\QA.B", "A.B$X", True),
+    ("(?i)A\\QB.C\\E", "ab.c", True), ("(?i)A\\QB.C\\E", "abxc", False),
+    ("A\\EB", "AB", True), ("A\\EB", "A\\EB", True),
+    ("(?#c)AB", "AB", True), ("(?#a[b)X", "X", True), ("A++B", "AAB", True),
+    ("(?>A+)B", "AAB", True), ("(A)\\1", "AA", True), ("(A)\\1", "AB", False),
     # KiCad's own net-name shapes (overbar, unnamed net, subscript)
     ("~{RST}", "~{RST}", True), ("~{RST}", "~RST", False),
     ("Net-(U1-Pad3)", "Net-(U1-Pad3)", True), ("Net-(U1-Pad3)", "Net-U1-Pad3", True),
@@ -200,14 +238,28 @@ MATCHES = [
     ("*", "ANY", True),
 ]
 
-# Patterns that parse as a KiCad bus (vector D[0..3], group X{A B}): 9.0.4 and
-# netclass_read match them as regex / wildcard (these rows); 10.0.5 expands
-# them into member names first and differs on AA, D1, D. and A.
-BUS_MATCHES = [
+# KiCad 9.0.4 answers that 10.0.5 does not share; netclass_read follows 9.0.4.
+# Patterns that parse as a KiCad bus (vector D[0..3], group X{A B}): 9.0.4
+# matches them as regex / wildcard; 10.0.5 expands them into member names first
+# and differs on AA, D1, D. and A. The open quantifier {,n}: 9.0.4 (and Python)
+# read {0,n}; 10.0.5 reads it literally.
+KICAD9_MATCHES = [
     ("A{2}", "AA", True), ("A{2}", "A{2}", True), ("A{2}", "A", False),
     ("D[0..3]", "D0", True), ("D[0..3]", "D1", False), ("D[0..3]", "D.", True),
     ("D[0..3]", "D4", False), ("X{A B}", "X{A B}", True), ("X{A B}", "A", False),
+    ("A{,2}B", "B", True), ("A{,2}B", "AAB", True), ("A{,2}B", "A{,2}B", True),
 ]
+
+# Documented gaps: PCRE2-only syntax that Python's re rejects (netclass_read then
+# has only the wildcard reading) or reads otherwise (\v), so netclass_read answers
+# the OPPOSITE of KiCad (these rows hold KiCad's answer; the live tier checks
+# that KiCad still gives it and that netclass_read still differs).
+KNOWN_GAPS = [   # (pattern, net, KiCad matches?, where the docstring lists it)
+    ("A\\hB", "A B", True, "\\h"), ("A\\R", "A\r\n", True, "\\R"), ("A\\vB", "A\nB", True, "\\v"),
+    ("\\pL+", "ABC", True, "\\p{..}"), ("(?<n>A)B", "AB", True, "(?<name>..)"),
+    ("(?|(A)|(B))", "B", True, "(?|..)"),
+]
+NC_R = ("NC_R", 0.45)
 
 
 def _scenario_pro(tmp_path: Path, name: str, sc: dict) -> Path:
@@ -216,16 +268,18 @@ def _scenario_pro(tmp_path: Path, name: str, sc: dict) -> Path:
 
 
 def _matcher_scenarios() -> dict:
-    """One project per MATCHES / BUS_MATCHES pattern, binding NC_R (0.45 mm);
-    the bus rows are KiCad 9 answers only."""
+    """One project per MATCHES / KICAD9_MATCHES / KNOWN_GAPS pattern, binding
+    NC_R (0.45 mm); expect holds KiCad's answer."""
     out = {}
-    for prefix, rows_all, extra in (("match", MATCHES, {}), ("bus", BUS_MATCHES, {"kicad_max": 9})):
+    for prefix, rows_all, extra in (("match", MATCHES, {}),
+                                    ("k9", KICAD9_MATCHES, {"kicad_max": 9}),
+                                    ("gap", KNOWN_GAPS, {"gap": True})):
         for i, (pattern, rows) in enumerate(itertools.groupby(rows_all, key=lambda r: r[0])):
             rows = list(rows)
             out[f"{prefix}_{i}"] = dict(
-                classes=[nc("NC_R", 0.45, 0)], patterns=[bind(pattern, "NC_R")],
-                nets=[net for _p, net, _m in rows],
-                expect={net: ("NC_R", 0.45) for _p, net, m in rows if m}, **extra)
+                classes=[nc(NC_R[0], NC_R[1], 0)], patterns=[bind(pattern, NC_R[0])],
+                nets=[row[1] for row in rows],
+                expect={row[1]: NC_R for row in rows if row[2]}, **extra)
     return out
 
 
@@ -259,20 +313,46 @@ def test_file_order_of_classes_and_patterns_is_irrelevant(tmp_path: Path, name: 
     assert ncr.net_class_widths(_scenario_pro(tmp_path, "b", rev), sc["nets"][::-1]) == first
 
 
-@pytest.mark.parametrize("pattern,net,expected", MATCHES + BUS_MATCHES)
+@pytest.mark.parametrize("pattern,net,expected", MATCHES + KICAD9_MATCHES)
 def test_pattern_matches_like_kicad(pattern: str, net: str, expected: bool):
     assert ncr.pattern_matches(pattern, net) is expected
 
 
-@pytest.mark.parametrize("are,python", [
+@pytest.mark.parametrize("pattern,net,kicad,doc_token", KNOWN_GAPS)
+def test_known_gaps_are_documented_and_still_differ(pattern: str, net: str, kicad: bool,
+                                                    doc_token: str):
+    assert ncr.pattern_matches(pattern, net) is not kicad
+    doc = ncr.__doc__ or ""
+    gaps = doc[doc.index("Known differences"):]
+    assert f"``{doc_token}``" in gaps, doc_token
+
+
+D, W, S = "0-9", "0-9A-Za-z_", "\\t\\n\\x0b\\f\\r "
+
+
+@pytest.mark.parametrize("pcre,python", [
     ("^N[[:digit:]]$", "^N[0-9]$"), ("^N[^[:upper:][:digit:]_]$", "^N[^A-Z0-9_]$"),
     ("^N[]x]$", "^N[\\]x]$"), ("^N[^]x]$", "^N[^\\]x]$"), ("^N[[x&|~]$", "^N[\\[x\\&\\|\\~]$"),
     ("^A\\[B\\]\\$$", "^A\\[B\\]\\$$"), ("^N[\\]]$", "^N[\\]]$"),
     ("^N[[:foo:]]$", None), ("^N[[:digit]]$", None), ("^N[[.a.]]$", None),
     ("^N[[=a=]]$", None), ("^N[x$", None),
+    # inline options become scoped groups, closed with their group, reopened per branch
+    ("^(?i)vin$", "^(?i:vin$)"), ("^(a(?i)b|c)$", "^(a(?i:b)|(?i:c))$"),
+    ("^a(?i)b|c$", "^a(?i:b)|(?i:c$)"), ("^(?i)V(?-i)IN$", "^(?i:V(?-i:IN$))"),
+    ("^(?i:a)|b$", "^(?i:a)|b$"), ("^(?:a|b)$", "^(?:a|b)$"), ("^(?#a[b)X$", "^(?#a[b)X$"),
+    # ASCII escapes, \Z / \z, \Q..\E, stray \E
+    ("^A\\dB$", f"^A[{D}]B$"), ("^[\\d\\w\\s]$", f"^[{D}{W}{S}]$"),
+    ("^A\\D\\W\\S$", f"^A[^{D}][^{W}][^{S}]$"),
+    ("^A\\Z$", "^A(?=\\n?\\Z)$"), ("^A\\z$", "^A\\Z$"), ("^\\QA.B\\E$", "^A\\.B$"),
+    ("^\\QA.B$", "^A\\.B\\$"), ("^A\\EB$", "^AB$"), ("^A\\1$", "^A\\1$"),
 ])
-def test_are_bracket_expressions_become_python_sets(are: str, python: str | None):
-    assert ncr.are_to_python(are) == python
+def test_pcre_text_becomes_python_re_text(pcre: str, python: str | None):
+    assert ncr.pcre_to_python(pcre) == python
+
+
+def test_word_boundaries_are_ascii():
+    text = ncr.pcre_to_python("\\b\\B")
+    assert text is not None and "\\b" not in text and "\\B" not in text and f"[{W}]" in text
 
 
 @pytest.mark.parametrize("pattern", ["W[[:digit:]]", "W[[x]", "W[a&&b]", "W[a--b]", "W[a||b]"])
@@ -632,13 +712,23 @@ def test_live_kicad_resolves_every_scenario_like_netclass_read(kicad_swig_python
                                    [str(asks)]))["classes"]
     for name, sc in scenarios.items():
         ours = ncr.net_class_widths(pcbs[name].with_suffix(".kicad_pro"), sc["nets"])
-        default_w = sc.get("default", DEFAULT)["track_width"]
-        for net, (kicad_name, kicad_w) in kicad[str(pcbs[name])].items():
-            want = ours[net][1] if net in ours else default_w
-            assert kicad_w == pytest.approx(want), (name, net, kicad_name, ours.get(net))
-            if net in ours:
-                assert ours[net][0] in kicad_name.split(","), (name, net, kicad_name)
-        assert ours == sc["expect"], name
+        reference = sc["expect"] if sc.get("gap") else ours
+        _assert_kicad_gives(name, kicad[str(pcbs[name])], reference,
+                            sc.get("default", DEFAULT)["track_width"])
+        if sc.get("gap"):                               # a documented gap still differs
+            assert all((n in ours) != (n in reference) for n in sc["nets"]), (name, ours)
+        else:
+            assert ours == sc["expect"], name
+
+
+def _assert_kicad_gives(name: str, kicad_rows: dict, reference: dict, default_w: float) -> None:
+    """KiCad's [class name, width] per net equals ``reference`` (a
+    net_class_widths-shaped answer; a net left out routes at default_w)."""
+    for net, (kicad_name, kicad_w) in kicad_rows.items():
+        want = reference[net][1] if net in reference else default_w
+        assert kicad_w == pytest.approx(want), (name, net, kicad_name, reference.get(net))
+        if net in reference:
+            assert reference[net][0] in kicad_name.split(","), (name, net, kicad_name)
 
 
 def test_live_routed_gate_reads_classes_through_netclass_read(kicad_swig_python, tmp_path):

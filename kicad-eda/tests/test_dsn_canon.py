@@ -9,7 +9,9 @@ Fixtures: tests/fixtures/dsn/buck_r01/r02/r05.dsn.sexpr are three raw KiCad
 10.0.5 exports of the SAME placed buck_5v3a board from T07 (different UUID
 orders: r01 and r05 failed G4, r02 passed); quoted_names.dsn.sexpr (X-01) has
 quoted names with spaces and parentheses and a class net list wrapped across
-lines. Unit tier only (no KiCad); the live tier is test_dsn_canon_live.py.
+lines; poly_outline_k9.dsn.txt (F3-02's, read only) is a KiCad 9.0.4 CRLF
+export with a duplicated image id (C5 at 90 deg uses C_0603_1608Metric::1).
+Unit tier only (no KiCad); the live tier is test_dsn_canon_live.py.
 """
 from __future__ import annotations
 
@@ -29,11 +31,15 @@ TOOLS = Path(__file__).resolve().parents[1] / "server" / "tools"
 MODULE = TOOLS / "dsn_canon.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "dsn"
 BUCK = ("buck_r01", "buck_r02", "buck_r05")
+POLY = "poly_outline_k9.dsn.txt"        # KiCad 9.0.4 export (T10 polyA; F3-02's fixture)
+C0603 = "C_0603_1608Metric"             # in POLY: C5 at 90 deg has its own image ...::1
 STDLIB = set(sys.stdlib_module_names) | {"dsn_sexpr"}
 
 
 def _raw(name: str) -> str:
-    return (FIXTURES / f"{name}.dsn.sexpr").read_text(encoding="utf-8")
+    """A fixture by stem (<name>.dsn.sexpr) or by its .dsn.txt file name."""
+    file = name if name.endswith(".dsn.txt") else f"{name}.dsn.sexpr"
+    return (FIXTURES / file).read_text(encoding="utf-8")
 
 
 def _section(text: str, name: str) -> list:
@@ -61,6 +67,35 @@ def _pins(text: str, net: str) -> list[str]:
     raise AssertionError(f"no net {net}")
 
 
+def _components(text: str) -> list[tuple[str, list[str]]]:
+    """(image id, its place references) per placement component, in order."""
+    return [(c[1], [p[1] for p in ds.children(c, "place")])
+            for c in ds.children(_section(text, "placement"), "component")]
+
+
+def _ref_geometry(text: str) -> dict[str, str | None]:
+    """reference -> the emitted image (without its id) its footprint uses."""
+    tree = ds.parse(text)
+    images = {im[1]: ds.emit(["image", *im[2:]])
+              for im in ds.children(ds.find(tree, "library") or [], "image")}
+    return {ref: images.get(image) for image, refs in _components(text) for ref in refs}
+
+
+def _renamed(item: object, kind: str, mapping: dict[str, str]) -> object:
+    if isinstance(item, list) and len(item) > 1 and item[0] == kind:
+        return [kind, mapping.get(item[1], item[1]), *item[2:]]
+    return item
+
+
+def _swap_image_ids(text: str, mapping: dict[str, str]) -> str:
+    """`text` with image ids renamed by `mapping` in the library and the
+    placement: what KiCad writes when it meets the footprints in another order."""
+    kinds = {"placement": "component", "library": "image"}
+    return ds.emit([[x[0], *(_renamed(y, kinds[x[0]], mapping) for y in x[1:])]
+                    if isinstance(x, list) and x and x[0] in kinds else x
+                    for x in ds.parse(text)])
+
+
 # ----------------------------------------------------------------------------
 # seed 0: the canonical order
 # ----------------------------------------------------------------------------
@@ -78,7 +113,7 @@ def test_permuted_dsns_canonicalise_to_identical_text() -> None:
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("name", BUCK + ("quoted_names",))
+@pytest.mark.parametrize("name", BUCK + ("quoted_names", POLY))
 def test_canonicalize_is_idempotent(name: str, seed: int) -> None:
     once = dc.canonicalize(_raw(name), seed=seed)
     assert dc.canonicalize(once, seed=seed) == once
@@ -87,10 +122,17 @@ def test_canonicalize_is_idempotent(name: str, seed: int) -> None:
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("name", BUCK + ("quoted_names",))
+@pytest.mark.parametrize("name", BUCK + ("quoted_names", POLY))
 def test_canonicalize_keeps_the_token_multiset(name: str, seed: int) -> None:
     raw = _raw(name)
     assert _tokens_without_id(dc.canonicalize(raw, seed=seed)) == _tokens_without_id(raw)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("name", BUCK + ("quoted_names", POLY))
+def test_every_footprint_keeps_its_image(name: str, seed: int) -> None:
+    raw = _raw(name)
+    assert _ref_geometry(dc.canonicalize(raw, seed=seed)) == _ref_geometry(raw)
 
 
 def test_pins_sort_naturally_and_nets_by_name() -> None:
@@ -151,6 +193,70 @@ def test_quoted_names_survive_and_wrapped_class_lists_parse() -> None:
         ds.children(_section(raw, "network"), "class")
     assert "(place D1 110000 -85000 front 0\n" in out and '(PN "LED (red)"))' in out
     assert '(net "Net-(D1-A)")' in out
+
+
+# ----------------------------------------------------------------------------
+# duplicated image ids: KiCad names a footprint's second, different image
+# X::1, its third X::2, ... in the order it meets the footprints (UUID order)
+# ----------------------------------------------------------------------------
+TRIPLE = ("(pcb t (placement (component X::2 (place R1 0 0 front 0))"
+          " (component X (place R3 0 0 front 0)) (component X::1 (place R2 0 0 front 0)))\n"
+          " (library (image X::2 (pin P 1 0 0)) (image X (pin P 1 10 0))"
+          " (image X::1 (pin P 1 20 0)) (padstack P (shape (circle F.Cu 100))))\n"
+          " (network (net N (pins R1-1 R2-1 R3-1))))")
+
+
+def test_the_poly_fixture_holds_a_duplicated_image() -> None:
+    comps = dict(_components(_raw(POLY)))
+    assert comps[C0603] == ["C4", "C1"] and comps[f"{C0603}::1"] == ["C5"]
+
+
+def test_duplicated_image_ids_follow_the_design_not_the_footprint_order() -> None:
+    raw = _raw(POLY)
+    other = _swap_image_ids(raw, {C0603: f"{C0603}::1", f"{C0603}::1": C0603})
+    assert _ref_geometry(other) == _ref_geometry(raw)                # same board ...
+    assert dict(_components(other))[C0603] == ["C5"]                 # ... other naming
+    for seed in (0, 1, 2):
+        assert dc.canonicalize(other, seed=seed) == dc.canonicalize(raw, seed=seed)
+    comps = dict(_components(dc.canonicalize(other)))
+    assert comps[C0603] == ["C1", "C4"] and comps[f"{C0603}::1"] == ["C5"]
+
+
+def test_three_variants_are_numbered_in_reference_order() -> None:
+    out = dc.canonicalize(TRIPLE)
+    assert _components(out) == [("X", ["R1"]), ("X::1", ["R2"]), ("X::2", ["R3"])]
+    assert [im[1] for im in ds.children(_section(out, "library"), "image")] == \
+        ["X", "X::1", "X::2"]
+    assert _ref_geometry(out) == _ref_geometry(TRIPLE)
+    swapped = _swap_image_ids(TRIPLE, {"X": "X::2", "X::2": "X::1", "X::1": "X"})
+    assert dc.canonicalize(swapped) == out
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4, 5])
+def test_a_seed_numbers_the_variants_by_first_use_in_its_order(seed: int) -> None:
+    out = dc.canonicalize(TRIPLE, seed=seed)
+    comps = _components(out)
+    assert [image for image, _ in comps] == ["X", "X::1", "X::2"]
+    assert [refs[0] for _, refs in comps] == dc.footprint_order(TRIPLE, seed)
+    assert _ref_geometry(out) == _ref_geometry(TRIPLE)
+
+
+def test_quoted_duplicated_ids_keep_their_quoting() -> None:
+    text = ('(pcb t (placement (component "S-1::1" (place Q1 0 0 front 0))'
+            ' (component "S-1" (place Q2 0 0 front 0)))\n'
+            ' (library (image "S-1::1" (pin P 1 0 0)) (image "S-1" (pin P 1 5 0))))')
+    out = dc.canonicalize(text)
+    assert _components(out) == [('"S-1"', ["Q1"]), ('"S-1::1"', ["Q2"])]
+    assert _ref_geometry(out) == _ref_geometry(text)
+
+
+def test_an_image_no_footprint_uses_sorts_after_the_used_variants() -> None:
+    text = ("(pcb t (placement (component X::1 (place R1 0 0 front 0)))\n"
+            " (library (image X (pin P 1 9 0)) (image X::1 (pin P 1 0 0))))")
+    out = dc.canonicalize(text)
+    assert _components(out) == [("X", ["R1"])] and _ref_geometry(out) == _ref_geometry(text)
+    assert ds.children(_section(out, "library"), "image")[1] == ["image", "X::1",
+                                                                 ["pin", "P", "1", "9", "0"]]
 
 
 # ----------------------------------------------------------------------------
@@ -301,5 +407,8 @@ def test_module_is_stdlib_only_py311_and_small() -> None:
                 for a in n.names}
     assert imported <= STDLIB, imported - STDLIB
     assert "re" not in imported                                # no regexes on DSN structure
-    assert source.count("\n") < 400
+    assert source.count("\n") < 500                            # RULES: < 800; keep it lean
+    longest = max(n.end_lineno - n.lineno + 1 for n in ast.walk(tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    assert longest < 50, longest
     assert "canonicalize_file" in (ast.get_docstring(tree) or "")

@@ -14,12 +14,8 @@ The rotation/mirror oracle asks KiCad itself: a wire from the position
 """
 from __future__ import annotations
 
-import csv
-import io
 import json
 import re
-import subprocess
-import sys
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +33,7 @@ from backends.sch_api import SchematicApi, build_from_netlist
 from backends.sch_erc import run_erc, summarize
 from backends.sch_netlist_build import power_flag_nets, validate_design
 from conftest import load_example
+from fixtures.kicad_procs import owned_pids
 
 requires_api = pytest.mark.skipif(not SchematicApi.available(),
                                   reason=SchematicApi.unavailable_reason() or "")
@@ -541,13 +538,9 @@ def test_open_sch_build_file_and_read_it(session, tmp_path):
 
 
 def _kicad_cli_pids() -> set[int] | None:
-    """PIDs of every kicad-cli.exe (Windows); None where tasklist is absent."""
-    if sys.platform != "win32":
-        return None
-    proc = subprocess.run(["tasklist", "/FI", "IMAGENAME eq kicad-cli.exe", "/FO", "CSV", "/NH"],
-                          capture_output=True, text=True, timeout=30)
-    return {int(row[1]) for row in csv.reader(io.StringIO(proc.stdout))
-            if len(row) > 1 and row[1].isdigit()}
+    """kicad-cli.exe PIDs this test run owns (Windows; other agents' servers on
+    the same machine are not ours); None off Windows."""
+    return owned_pids("kicad-cli.exe")
 
 
 def _assert_no_server_left(started: set[int] | None) -> None:

@@ -41,6 +41,7 @@ T10_BOARD = {"outline": {"loop": [[4, 0], [56, 0, _R4], [60, 4], [60, 36, _R4], 
 U_BOARD = {"outline": {"loop": [[0, 0], [20, 0], [20, 25], [40, 25], [40, 0], [60, 0],
                                 [60, 45], [0, 45]]}}
 ROUND_BOARD = {"w": 50, "h": 30, "corner_radius": 6.0, "cutouts": [{"circle": [25, 15, 4]}]}
+DISC_BOARD = {"outline": {"loop": [[0, 20, 1], [40, 20, 1]]}}     # r 20: two half arcs
 EDGE_CLEARANCE = 0.3
 INSCRIBED_CLEARANCE = EDGE_CLEARANCE + 0.5      # auto_fields case (3)
 
@@ -425,8 +426,30 @@ def test_clip_is_exact_along_straight_edges() -> None:
                                            abs=1e-4)
 
 
-def test_explicit_field_fully_off_the_board_is_dropped_with_a_warning() -> None:
-    block = {**L_BOARD, "auto_b": {"x": 40.0, "y": 2.0, "w": 10.0, "h": 10.0}}
+@pytest.mark.parametrize("scale", [3.0, 6.0])
+@pytest.mark.parametrize("block", [ROUND_BOARD, DISC_BOARD, T10_BOARD],
+                         ids=["round", "disc", "T10"])
+def test_clip_of_a_request_larger_than_the_board_ignores_the_overhang(block: dict,
+                                                                     scale: float) -> None:
+    """The clip grid covers only the part of the request the board can reach, so a request
+    `scale` x the board clips exactly like one the size of the board (review round 2)."""
+    o = ol.from_board_block(block)
+    x0, y0, x1, y1 = ol.bbox(o)
+    cx, cy, hw, hh = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+    big = (cx - scale * hw, cy - scale * hh, cx + scale * hw, cy + scale * hh)
+    fields, warnings = bf.auto_fields(_explicit(block, big), o, EDGE_CLEARANCE)
+    same, _ = bf.auto_fields(_explicit(block, (x0, y0, x1, y1)), o, EDGE_CLEARANCE)
+    assert [f.source for f in fields] == ["clipped", "clipped"] and len(warnings) == 2
+    assert fields[0].rect == pytest.approx(same[0].rect, abs=1e-9)
+    assert ol.contains_rect(o, fields[0].rect, EDGE_CLEARANCE)
+    assert fields[0].area >= 0.9 * _grid_optimum(o, EDGE_CLEARANCE)
+
+
+@pytest.mark.parametrize("auto_b", [{"x": 40.0, "y": 2.0, "w": 10.0, "h": 10.0},    # the bay
+                                    {"x": 70.0, "y": 50.0, "w": 10.0, "h": 10.0}],  # past bbox
+                         ids=["in the bay", "outside the bbox"])
+def test_explicit_field_fully_off_the_board_is_dropped_with_a_warning(auto_b: dict) -> None:
+    block = {**L_BOARD, "auto_b": auto_b}
     o = ol.from_board_block(block)
     fields, warnings = bf.auto_fields(block, o, EDGE_CLEARANCE)
     assert [f.side for f in fields] == ["F"] and fields[0].source == "clipped"

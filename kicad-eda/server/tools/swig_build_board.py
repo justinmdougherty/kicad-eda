@@ -30,7 +30,9 @@ Plain w/h and auto-sized boards keep the legacy geometry exactly. KIIDs are
 seeded from sha256(netlist + sidecar), so rebuilds save the same file order.
 Emits a JSON result on stdout.
 """
+import functools
 import json
+import math
 import os
 import sys
 import traceback
@@ -46,11 +48,11 @@ import fp_dialect
 import libtable
 
 
-def mm(v):
+def mm(v: float) -> int:
     return pcbnew.FromMM(float(v))
 
 
-def vec(x, y):
+def vec(x: float, y: float) -> "pcbnew.VECTOR2I":
     return pcbnew.VECTOR2I(mm(x), mm(y))
 
 
@@ -130,7 +132,7 @@ FAB_RULES_MM = {"m_MinClearance": 0.15, "m_TrackMinWidth": 0.15,
                 "m_CopperEdgeClearance": 0.3}
 
 
-def apply_design_rules(board, rules_mm=FAB_RULES_MM):
+def apply_design_rules(board: "pcbnew.BOARD", rules_mm: dict = FAB_RULES_MM) -> list[str]:
     """Set the fab floors on the board's design settings. Returns the list of
     fields this pcbnew does not expose so the caller can report them; setattr
     on a missing SWIG field would silently create a dead Python attribute, so
@@ -215,18 +217,260 @@ def assign_pads(design: dict, placed: dict,
     return assigned, missing
 
 
+def new_board() -> tuple["pcbnew.BOARD", list[str]]:
+    """An empty 4-layer board with the JLCPCB-class design rules (so
+    default-rule DRC reflects the real fab), and the warnings. A rule that
+    silently fails to apply means every later DRC runs against the wrong fab
+    floors, so a failed set is a hard error and a field this pcbnew version
+    lacks is reported, not hidden."""
+    board = pcbnew.CreateEmptyBoard()
+    board.SetCopperLayerCount(4)
+    skipped_rules = apply_design_rules(board)
+    if not skipped_rules:
+        return board, []
+    return board, [f"design rules not exposed by pcbnew {pcbnew.GetBuildVersion()} and "
+                   f"skipped: {', '.join(skipped_rules)}"]
+
+
+def pack_scale() -> float:
+    """PACK_SCALE loosens spacing on a retry, so a deterministic router that
+    left one pad unrouted gets more room."""
+    return float(os.environ.get("PACK_SCALE", "1.0"))
+
+
+def full_targets(design: dict, board_spec: dict, outline_wh: tuple[float, float] | None,
+                 dims: tuple[float, float]) -> tuple[dict, dict, float, float]:
+    """Every part has x/y: honour them verbatim. The board is the outline
+    bbox (an outline board may have no w/h), else the board block's w x h,
+    else argv / DEFAULT_SIZE_MM. Returns (targets, rotations, w, h)."""
+    targets = {c["ref"]: (c["x"], c["y"]) for c in design["components"]}
+    board_w, board_h = dims
+    if outline_wh is not None:
+        board_w, board_h = outline_wh
+    elif board_spec:
+        board_w, board_h = float(board_spec["w"]), float(board_spec["h"])
+    return targets, {}, board_w, board_h
+
+
+def mixed_fields(board_spec: dict, auto_comps: list[dict], board_w: float, board_h: float,
+                 scale: float) -> dict[str, tuple]:
+    """The F and B auto fields (x0 or None, y0, w, h) of a fixed-size board:
+    the rectangle left over after the FIXED parts (a HAT's header along the
+    top, connectors down an edge, corner holes). The packer can't see those,
+    so the netlist may carve the field: auto_x/auto_w bound it horizontally,
+    auto_y drops its top below the fixed header, auto_h bounds its height
+    (default: the board inside the edge margins). The B side may carve its
+    OWN field (board-absolute x/y/w/h via "auto_b") to dodge front-side
+    through copper: THT connector pads and thermal-via arrays exist on BOTH
+    faces. Outline boards use their bbox here (F3-12 refines the fields)."""
+    edge = 2.0 * scale
+    has_conn = any(c["ref"][:1] == "J" and not c.get("interior") for c in auto_comps)
+    edge_top = 1.2 if has_conn else edge
+    y0 = edge_top + float(board_spec.get("auto_y", 0.0))
+    x0_spec = board_spec.get("auto_x")
+    avail_w = float(board_spec.get("auto_w", board_w - 2 * edge))
+    avail_h = float(board_spec.get("auto_h", board_h - y0 - edge))
+    ab = board_spec.get("auto_b") or {}
+    return {"F": (x0_spec, y0, avail_w, avail_h),
+            "B": (ab.get("x", x0_spec), float(ab.get("y", y0)),
+                  float(ab.get("w", avail_w)), float(ab.get("h", avail_h)))}
+
+
+def pack_side(design: dict, side: str, comps: list[dict], field: tuple, parts: tuple,
+              board_wh: tuple[float, float], scale: float) -> tuple[dict, dict]:
+    """One side's auto parts functionally placed in its field, centred
+    horizontally (in auto_x/auto_w when given, else on the board):
+    (targets, rotations). BuildError when the cluster does not fit."""
+    extents, pincount, mouth = parts
+    sx0, sy0, s_w, s_h = field
+    board_w, board_h = board_wh
+    packed, rots, used_w, used_h = functional_place(
+        {**design, "components": comps}, extents, pincount, mouth, margin=1.5 * scale,
+        width_limit=s_w)
+    if used_w > s_w or used_h > s_h:
+        raise bf.BuildError(f"{side}-side auto cluster {used_w}x{used_h} mm does not fit the "
+                            f"free field {s_w}x{s_h} mm of the fixed board {board_w}x{board_h} "
+                            f"mm at pack_scale {scale}")
+    x0 = (float(sx0) + (s_w - used_w) / 2.0
+          if sx0 is not None else (board_w - used_w) / 2.0)
+    return {ref: (x0 + bx, sy0 + by) for ref, (bx, by) in packed.items()}, rots
+
+
+def mixed_targets(design: dict, board_spec: dict, outline_wh: tuple[float, float] | None,
+                  fixed_refs: set[str], parts: tuple) -> tuple[dict, dict, float, float]:
+    """MIXED placement: mechanically spec'd parts (a HAT's header, holes,
+    connectors) sit at their exact board-relative coordinates; everything
+    else is functionally packed into the remaining field, the "side": "B"
+    parts into their own field on the back (F/B courtyards don't collide,
+    so the field is effectively doubled). Needs a fixed board size (a spec'd
+    position is meaningless on an auto-sized board); an outline board is
+    fixed by its outline. Collisions surface at the G3 courtyard gate."""
+    if not board_spec:
+        raise bf.BuildError('mixed placement requires "board": {"w": mm, "h": mm}')
+    board_w, board_h = outline_wh or (float(board_spec["w"]), float(board_spec["h"]))
+    scale = pack_scale()
+    auto_comps = [c for c in design["components"] if c["ref"] not in fixed_refs]
+    fields = mixed_fields(board_spec, auto_comps, board_w, board_h, scale)
+    b_refs = {c["ref"] for c in auto_comps if str(c.get("side", "F")).upper() == "B"}
+    targets, rots = {}, {}
+    for side in ("F", "B"):
+        comps = [c for c in auto_comps if (c["ref"] in b_refs) == (side == "B")]
+        if comps:
+            side_targets, side_rots = pack_side(design, side, comps, fields[side], parts,
+                                                (board_w, board_h), scale)
+            targets.update(side_targets)
+            rots.update(side_rots)
+    for c in design["components"]:
+        if c["ref"] in fixed_refs:
+            targets[c["ref"]] = (c["x"], c["y"])
+        ov = float(c.get("overhang", 0) or 0)
+        if ov and c["ref"] in targets and c["ref"] not in fixed_refs:
+            tx, ty = targets[c["ref"]]
+            targets[c["ref"]] = (tx, ty - ov)
+    return targets, rots, board_w, board_h
+
+
+def auto_targets(design: dict, parts: tuple) -> tuple[dict, dict, float, float]:
+    """FUNCTIONAL placement (each support passive clustered at the IC it
+    serves, connectors mouth-out on the edge), then the board sized to fit.
+    Connectors stay FLUSH to the edge they mate through whatever the
+    pack_scale (a USB/SMA recessed 3 mm can't mate through an enclosure
+    panel): the connector row sits along the top, so only the top margin is
+    pinned. Corner mounting holes need a clear ring (hole at inset 4.0 with a
+    ~6.4 mm courtyard reaches 7.2 mm in). An "overhang" part moves UP so its
+    radiator extends past Edge.Cuts (antenna over air, ground plane under
+    the module body only)."""
+    extents, pincount, mouth = parts
+    scale = pack_scale()
+    packed, rots, used_w, used_h = functional_place(design, extents, pincount, mouth,
+                                                    margin=1.5 * scale)
+    edge = 2.0 * scale  # board margin around the placed cluster
+    has_conn = any(c["ref"][:1] == "J" and not c.get("interior") for c in design["components"])
+    edge_top = 1.2 if has_conn else edge
+    if design.get("mounting_holes"):
+        edge = max(edge, 7.5)
+    board_w = round(used_w + 2 * edge, 2)
+    board_h = round(used_h + edge_top + edge, 2)
+    targets = {ref: (bx + edge, by + edge_top) for ref, (bx, by) in packed.items()}
+    for c in design["components"]:
+        ov = float(c.get("overhang", 0) or 0)
+        if ov and c["ref"] in targets:
+            tx, ty = targets[c["ref"]]
+            targets[c["ref"]] = (tx, ty - ov)
+    return targets, rots, board_w, board_h
+
+
+def placement_targets(design: dict, outline_wh: tuple[float, float] | None,
+                      dims: tuple[float, float], parts: tuple) -> tuple[dict, dict, float, float]:
+    """(targets: ref -> board-frame bbox centre, rotations, board w, h).
+    Every part fixed: full; some fixed, or an outline board: mixed (an
+    outline board packs its auto parts into fields of its bbox); else auto."""
+    board_spec = design.get("board") or {}
+    fixed_refs = {c["ref"] for c in design["components"] if "x" in c and "y" in c}
+    if not [c for c in design["components"] if c["ref"] not in fixed_refs]:
+        return full_targets(design, board_spec, outline_wh, dims)
+    if fixed_refs or outline_wh is not None:
+        return mixed_targets(design, board_spec, outline_wh, fixed_refs, parts)
+    return auto_targets(design, parts)
+
+
+def place_parts(board: "pcbnew.BOARD", design: dict, fps: dict, extents: dict, targets: dict,
+                rots: dict, ox: float, oy: float) -> dict:
+    """Add every footprint so its bbox centre lands on its target (sheet =
+    board + (ox, oy)); returns {ref: footprint}. The bbox-centre offset was
+    measured at rot 0, so it is rotated with the part. KiCad's footprint
+    rotation is clockwise-positive (Y down), the opposite sin sign from the
+    textbook: get it wrong and a 90/270 part lands 2x its offset away. A
+    back-side part flips around its own bbox centre so its courtyard stays on
+    the target, mirrored onto B.Cu; Flip needs the board parent set (a
+    parentless Flip segfaults pcbnew), hence after Add."""
+    placed = {}
+    for c in design["components"]:
+        ref = c["ref"]
+        fp = fps[ref]
+        rot = float(c.get("rot", rots.get(ref, 0)))
+        if rot:
+            fp.SetOrientationDegrees(rot)
+        _w, _h, cxo, cyo = extents[ref]
+        tx, ty = targets[ref]
+        a = math.radians(rot)
+        rx = cxo * math.cos(a) + cyo * math.sin(a)
+        ry = -cxo * math.sin(a) + cyo * math.cos(a)
+        fp.SetPosition(vec(tx - rx + ox, ty - ry + oy))
+        board.Add(fp)
+        if str(c.get("side", "F")).upper() == "B":
+            fp.Flip(vec(tx + ox, ty + oy), True)
+        placed[ref] = fp
+    return placed
+
+
+def net_registry(board: "pcbnew.BOARD") -> tuple[Callable[[str], object], dict]:
+    """(get_net, netmap): get_net(name) adds the board net on first use."""
+    netmap: dict = {}
+
+    def get_net(name: str) -> "pcbnew.NETINFO_ITEM":
+        if name not in netmap:
+            ni = pcbnew.NETINFO_ITEM(board, name)
+            board.Add(ni)
+            netmap[name] = ni
+        return netmap[name]
+    return get_net, netmap
+
+
+def load_hole(footprints: str | dict, mh_fp: str) -> "pcbnew.FOOTPRINT":
+    """A mounting-hole footprint, nickname-stamped like every part (D1)."""
+    fp = load_footprint(footprints, mh_fp)
+    return fp
+
+
+def add_features(board: "pcbnew.BOARD", design: dict, placed: dict, nets: tuple,
+                 frame: "bf.Frame", sheet: tuple, footprints: str | dict) -> tuple[dict, list]:
+    """Edge.Cuts (+ the aux origin of an outline board), then build_features'
+    preroutes, mounting holes (nickname-stamped like every part, D1), planes
+    and antenna keep-out, in that order. Returns (result keys, warnings)."""
+    get_net, netmap = nets
+    outline_info, warnings = bf.add_board_outline(board, design, frame, sheet)
+    preroutes, notes = bf.add_preroutes(board, design, placed, get_net, frame.ox, frame.oy)
+    warnings = warnings + notes
+    holes, notes = bf.add_mounting_holes(board, design, functools.partial(load_hole, footprints),
+                                         frame, libtable.DEFAULT_MOUNTING_HOLE_FOOTPRINT)
+    warnings = warnings + notes
+    zones, notes = bf.add_planes(board, design, netmap, frame,
+                                 FAB_RULES_MM["m_CopperEdgeClearance"])
+    warnings = warnings + notes
+    keepout, notes = bf.add_antenna_keepout(board, design, frame)
+    return ({"zones": zones, "antenna_keepout": keepout, "mounting_holes": holes,
+             "preroutes": preroutes, "outline": outline_info}, warnings + notes)
+
+
+def place_silk(board: "pcbnew.BOARD") -> list[str]:
+    """Silkscreen hygiene: refs placed ADJACENT to their part (visible after
+    assembly), centre-on-body only as the dense fallback, everything clamped
+    inside Edge.Cuts (shared with the post-route fixer). Returns warnings."""
+    try:
+        import silk_place
+        silk = silk_place.place_refs(board)
+        return [f"silkscreen: {e}" for e in silk.get("errors", [])]
+    except Exception as e:
+        traceback.print_exc()
+        return [f"silkscreen ref placement failed ({type(e).__name__}: {e}); refs left at "
+                f"their footprint defaults"]
+
+
 def save_and_fill(board: "pcbnew.BOARD", out_path: str, zones: list[str], sheet: tuple,
-                  legacy: bool, warnings: list[str]) -> None:
+                  legacy: bool) -> list[str]:
     """SaveBoard, the sheet splice (outline boards), then the zone fill on a
     FRESHLY LOADED board: the in-memory CreateEmptyBoard board lacks the
     connectivity the headless ZONE_FILLER needs and segfaults 9.0.4. The
     splice runs first so the fill saves the final sheet. An unfilled plane is
-    a board with no ground/power copper, so a fill failure is fatal."""
+    a board with no ground/power copper, so a fill failure is fatal.
+    Returns warnings."""
+    warnings = []
     try:
         board.BuildConnectivity()
     except Exception as e:
-        warnings.append(f"BuildConnectivity failed before save "
-                        f"({type(e).__name__}: {e}); ratsnest rebuilt on load")
+        warnings.append(f"BuildConnectivity failed before save ({type(e).__name__}: {e}); "
+                        f"ratsnest rebuilt on load")
     pcbnew.SaveBoard(out_path, board)
     if not legacy:
         bf.splice_paper(out_path, sheet)
@@ -235,12 +479,12 @@ def save_and_fill(board: "pcbnew.BOARD", out_path: str, zones: list[str], sheet:
         b2.BuildConnectivity()
         pcbnew.ZONE_FILLER(b2).Fill(b2.Zones())
         pcbnew.SaveBoard(out_path, b2)
+    return warnings
 
 
 def main() -> None:
     netlist_path, out_path = sys.argv[1], sys.argv[2]
     footprints = footprint_libraries(sys.argv[3])
-    board_w, board_h = argv_dims(sys.argv)
     netlist_bytes, design = read_design(netlist_path, sys.argv[6] if len(sys.argv) > 6 else None)
     # the outline source (env sidecar / board block / legacy), then KIIDs
     # seeded from the inputs so every rebuild saves the same file order
@@ -248,250 +492,36 @@ def main() -> None:
     design = src.design
     pcbnew.KIID.SeedGenerator(bf.kiid_seed(netlist_bytes, src.sidecar_bytes))
     outline_wh = bf.outline_dims(src)          # None: legacy
-
-    board = pcbnew.CreateEmptyBoard()
-    board.SetCopperLayerCount(4)
-    warnings = []   # non-fatal degradations, reported in the result JSON
-
-    # JLCPCB-class design rules (so default-rule DRC reflects the real fab).
-    # A rule that silently fails to apply means every later DRC runs against
-    # the wrong fab floors, so a failed set is a hard error and a field this
-    # pcbnew version lacks is reported, not hidden.
-    skipped_rules = apply_design_rules(board)
-    if skipped_rules:
-        warnings.append(f"design rules not exposed by pcbnew "
-                        f"{pcbnew.GetBuildVersion()} and skipped: "
-                        f"{', '.join(skipped_rules)}")
-
+    board, warnings = new_board()
     # The board is centred on its sheet: A4 for legacy boards (CreateEmptyBoard's
     # default, saved as (paper "A4")); an outline board gets the smallest
     # landscape size holding it + 20 mm margins, spliced in after SaveBoard
     # (page settings are an opaque SWIG object on 9.0.4 and 10.0.5).
     sheet = bf.LEGACY_SHEET if outline_wh is None else bf.choose_sheet(*outline_wh)
-    warnings += bf.apply_page(board, sheet[0])
-    SHEET_W, SHEET_H = sheet[1], sheet[2]
-
-    # --- load + measure every footprint (at the origin) ---
-    placed = {}
+    warnings = warnings + bf.apply_page(board, sheet[0])
     fps, extents, pincount, mouth = load_parts(design, footprints)
-    # ref -> "nick:name" as stamped (D1), mounting holes added below
+    # ref -> "nick:name" as stamped (D1); the mounting holes are added below
     fpids = {ref: str(fp.GetFPID().GetUniStringLibId()) for ref, fp in fps.items()}
-
-    auto_rots = {}
-    board_spec = design.get("board") or {}
-    fixed_refs = {c["ref"] for c in design["components"] if "x" in c and "y" in c}
-    auto_comps = [c for c in design["components"] if c["ref"] not in fixed_refs]
-    have_full_placement = not auto_comps
-    if have_full_placement:
-        # caller supplied coords + board size: honor them verbatim. An
-        # outline board's size is its outline bbox (it may have no w/h).
-        targets = {c["ref"]: (c["x"], c["y"]) for c in design["components"]}
-        if outline_wh is not None:
-            board_w, board_h = outline_wh
-        elif board_spec:
-            board_w, board_h = float(board_spec["w"]), float(board_spec["h"])
-    elif fixed_refs or outline_wh is not None:
-        # MIXED placement: mechanically-spec'd parts (a HAT's header, holes,
-        # connectors) sit at their exact board-relative coordinates; everything
-        # else is functionally packed into the remaining field. Requires a
-        # fixed board size — a spec'd part position is meaningless on an
-        # auto-sized outline. Collisions surface at the G3 courtyard gate.
-        # An outline board (fixed by its outline) packs its auto parts here
-        # too, into fields of its bbox (F3-12 refines them with board_field).
-        if not board_spec:
-            print(json.dumps({"ok": False, "error":
-                  'mixed placement requires "board": {"w": mm, "h": mm}'}))
-            sys.exit(1)
-        board_w, board_h = outline_wh or (float(board_spec["w"]), float(board_spec["h"]))
-        scale = float(os.environ.get("PACK_SCALE", "1.0"))
-        edge = 2.0 * scale
-        has_conn = any(c["ref"][:1] == "J" and not c.get("interior")
-                       for c in auto_comps)
-        edge_top = 1.2 if has_conn else edge
-        # The auto field is the rectangle left over after the FIXED parts (a
-        # HAT's header along the top, connectors down an edge, corner holes).
-        # The packer can't see those, so the netlist may carve the field
-        # explicitly: auto_x/auto_w bound it horizontally, auto_y drops its
-        # top below the fixed header, auto_h bounds its height. Defaults are
-        # the full board inside the edge margins.
-        auto_y = float(board_spec.get("auto_y", 0.0))
-        y0 = edge_top + auto_y
-        x0_spec = board_spec.get("auto_x")
-        avail_w = float(board_spec.get("auto_w", board_w - 2 * edge))
-        avail_h = float(board_spec.get("auto_h", board_h - y0 - edge))
-        # Two-sided: components flagged "side":"B" pack into their own field
-        # on the back of the board (the dense-HAT idiom — power stage and
-        # connectors on top, support logic and passives underneath). Each side
-        # is an independent functional placement over the SAME field rect;
-        # F/B courtyards don't collide, so the field is effectively doubled.
-        b_refs = {c["ref"] for c in auto_comps
-                  if str(c.get("side", "F")).upper() == "B"}
-        f_comps = [c for c in auto_comps if c["ref"] not in b_refs]
-        b_comps = [c for c in auto_comps if c["ref"] in b_refs]
-        # The B side may carve its OWN field (board-absolute x/y/w/h via
-        # "auto_b") to dodge front-side through copper — THT connector pads
-        # and thermal-via arrays exist on BOTH faces, so the back field must
-        # avoid them where the front field need not.
-        ab = board_spec.get("auto_b") or {}
-        fields = {
-            "F": (x0_spec, y0, avail_w, avail_h),
-            "B": (ab.get("x", x0_spec), float(ab.get("y", y0)),
-                  float(ab.get("w", avail_w)), float(ab.get("h", avail_h))),
-        }
-        targets = {}
-        for side_comps, side_name in ((f_comps, "F"), (b_comps, "B")):
-            if not side_comps:
-                continue
-            sx0, sy0, s_w, s_h = fields[side_name]
-            sub = {**design, "components": side_comps}
-            packed, rots_s, used_w, used_h = functional_place(
-                sub, extents, pincount, mouth, margin=1.5 * scale,
-                width_limit=s_w)
-            if used_w > s_w or used_h > s_h:
-                print(json.dumps({"ok": False, "error":
-                      f"{side_name}-side auto cluster {used_w}x{used_h} mm does "
-                      f"not fit the free field {s_w}x{s_h} mm of the "
-                      f"fixed board {board_w}x{board_h} mm at pack_scale {scale}"}))
-                sys.exit(1)
-            x0 = (float(sx0) + (s_w - used_w) / 2.0
-                  if sx0 is not None else (board_w - used_w) / 2.0)
-            targets.update({ref: (x0 + bx, sy0 + by)
-                            for ref, (bx, by) in packed.items()})
-            auto_rots.update(rots_s)
-        for c in design["components"]:
-            if c["ref"] in fixed_refs:
-                targets[c["ref"]] = (c["x"], c["y"])
-            ov = float(c.get("overhang", 0) or 0)
-            if ov and c["ref"] in targets and c["ref"] not in fixed_refs:
-                tx, ty = targets[c["ref"]]
-                targets[c["ref"]] = (tx, ty - ov)
-    else:
-        # auto: FUNCTIONAL placement — cluster each support passive at the IC it
-        # serves, connectors mouth-out on the edge — then size the board to fit.
-        # PACK_SCALE loosens spacing on a retry so a deterministic router that left
-        # one pad unrouted gets more room.
-        scale = float(os.environ.get("PACK_SCALE", "1.0"))
-        packed, auto_rots, used_w, used_h = functional_place(
-            design, extents, pincount, mouth, margin=1.5 * scale)
-        edge = 2.0 * scale  # board margin around the placed cluster
-        # Connectors must stay FLUSH to the edge they mate through, regardless
-        # of pack_scale — a USB/SMA recessed 3 mm into the board can't mate
-        # through an enclosure panel. The connector row sits along the top, so
-        # only the top margin is pinned; the parts cluster keeps the scaled
-        # breathing room on the other three sides.
-        has_conn = any(c["ref"][:1] == "J" and not c.get("interior")
-                       for c in design["components"])
-        edge_top = 1.2 if has_conn else edge
-        # corner mounting holes need a clear ring: hole at inset 4.0 with a
-        # ~6.4 mm courtyard reaches 7.2 mm in from each edge
-        if design.get("mounting_holes"):
-            edge = max(edge, 7.5)
-        board_w = round(used_w + 2 * edge, 2)
-        board_h = round(used_h + edge_top + edge, 2)
-        targets = {ref: (bx + edge, by + edge_top) for ref, (bx, by) in packed.items()}
-        # antenna overhang: shift an edge_row part UP so its radiator section
-        # extends past Edge.Cuts (the vendor-preferred RF geometry — antenna
-        # over air, ground plane under the module body only)
-        for c in design["components"]:
-            ov = float(c.get("overhang", 0) or 0)
-            if ov and c["ref"] in targets:
-                tx, ty = targets[c["ref"]]
-                targets[c["ref"]] = (tx, ty - ov)
-
-    ox = round((SHEET_W - board_w) / 2.0, 3)
-    oy = round((SHEET_H - board_h) / 2.0, 3)
-
-    # --- place: anchor so each part's bbox-center lands on its target cell ---
-    import math
-    for c in design["components"]:
-        ref = c["ref"]
-        fp = fps[ref]
-        rot = float(c.get("rot", auto_rots.get(ref, 0)))
-        if rot:
-            fp.SetOrientationDegrees(rot)
-        w, h, cxo, cyo = extents[ref]
-        tx, ty = targets[ref]
-        # the bbox-center offset (cxo,cyo) was measured at rot 0; rotate it so the
-        # bbox-center still lands on the target after the footprint is rotated.
-        # NOTE: KiCad's footprint rotation is clockwise-positive (Y-down), the
-        # opposite sin sign from textbook rotation — get this wrong and a 90/270
-        # part's bbox lands 2x its anchor offset away. (Harmless at 0/180.)
-        a = math.radians(rot)
-        rx = cxo * math.cos(a) + cyo * math.sin(a)
-        ry = -cxo * math.sin(a) + cyo * math.cos(a)
-        ax = tx - rx + ox
-        ay = ty - ry + oy
-        fp.SetPosition(vec(ax, ay))
-        board.Add(fp)
-        # back-side part: flip around its own bbox-center so the courtyard
-        # stays on the target cell, mirrored onto B.Cu. Flip needs the board
-        # parent set (a parentless Flip segfaults pcbnew), hence after Add.
-        if str(c.get("side", "F")).upper() == "B":
-            fp.Flip(vec(tx + ox, ty + oy), True)
-        placed[ref] = fp
-
-    # --- nets + pad assignment ---
-    netmap = {}
-
-    def get_net(name: str) -> "pcbnew.NETINFO_ITEM":
-        if name not in netmap:
-            ni = pcbnew.NETINFO_ITEM(board, name)
-            board.Add(ni)
-            netmap[name] = ni
-        return netmap[name]
-
+    targets, rots, board_w, board_h = placement_targets(design, outline_wh, argv_dims(sys.argv),
+                                                        (extents, pincount, mouth))
+    ox = round((sheet[1] - board_w) / 2.0, 3)
+    oy = round((sheet[2] - board_h) / 2.0, 3)
+    placed = place_parts(board, design, fps, extents, targets, rots, ox, oy)
+    get_net, netmap = net_registry(board)
     assigned, missing_pads = assign_pads(design, placed, get_net)
-
-    # --- Edge.Cuts (+ aux origin), then the build_features: preroutes,
-    # mounting holes, planes, antenna keep-out (each ONE function) ---
     frame = bf.Frame(board_w, board_h, ox, oy, src.outline, src.source)
-    outline_info, notes = bf.add_board_outline(board, design, frame, sheet)
-    warnings += notes
-    preroute_count, notes = bf.add_preroutes(board, design, placed, get_net, ox, oy)
-    warnings += notes
-    def load_hole(mh_fp: str) -> "pcbnew.FOOTPRINT":
-        """A mounting-hole footprint, nickname-stamped like every part (D1)."""
-        fp = load_footprint(footprints, mh_fp)
-        return fp
-
-    holes, notes = bf.add_mounting_holes(board, design, load_hole, frame,
-                                         libtable.DEFAULT_MOUNTING_HOLE_FOOTPRINT)
-    warnings += notes
-    fpids.update(holes)
-    zones_added, notes = bf.add_planes(board, design, netmap, frame,
-                                       FAB_RULES_MM["m_CopperEdgeClearance"])
-    warnings += notes
-    keepout_added, notes = bf.add_antenna_keepout(board, design, frame)
-    warnings += notes
-
-    # --- silkscreen hygiene: refs placed ADJACENT to their part (visible
-    # after assembly), center-on-body only as the dense fallback, everything
-    # clamped inside Edge.Cuts. Shared with the post-route fixer.
-    try:
-        import silk_place
-        silk = silk_place.place_refs(board)
-        warnings += [f"silkscreen: {e}" for e in silk.get("errors", [])]
-    except Exception as e:
-        traceback.print_exc()
-        warnings.append(f"silkscreen ref placement failed ({type(e).__name__}: "
-                        f"{e}); refs left at their footprint defaults")
-
-    save_and_fill(board, out_path, zones_added, sheet, src.outline is None, warnings)
-
+    feats, notes = add_features(board, design, placed, (get_net, netmap), frame, sheet,
+                                footprints)
+    warnings = warnings + notes + place_silk(board)
+    warnings = warnings + save_and_fill(board, out_path, feats["zones"], sheet,
+                                        src.outline is None)
+    fpids = {**fpids, **feats["mounting_holes"]}
     print(json.dumps({
-        "ok": not missing_pads,
-        "pcb": out_path,
-        "footprints": len(placed),
-        "nets": len(netmap),
-        "pads_assigned": assigned,
-        "missing_pads": missing_pads,
-        "zones": zones_added,
-        "antenna_keepout": keepout_added,
-        "mounting_holes": list(holes),
-        "preroutes": preroute_count,
-        "board_mm": [board_w, board_h],
-        "outline": outline_info,
-        "fpids": fpids,
+        "ok": not missing_pads, "pcb": out_path, "footprints": len(placed),
+        "nets": len(netmap), "pads_assigned": assigned, "missing_pads": missing_pads,
+        "zones": feats["zones"], "antenna_keepout": feats["antenna_keepout"],
+        "mounting_holes": list(feats["mounting_holes"]), "preroutes": feats["preroutes"],
+        "board_mm": [board_w, board_h], "outline": feats["outline"], "fpids": fpids,
         "warnings": warnings,
     }))
 

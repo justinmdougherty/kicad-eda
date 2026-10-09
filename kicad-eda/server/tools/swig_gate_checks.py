@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Board-side gate checks — runs under KiCad's bundled Python (needs pcbnew).
 
-Two modes, both emit JSON {"issues": [...]} on stdout:
+Three modes, each emits JSON {"issues": [...], "warnings": [...]} on stdout:
 
   placement <pcb> [netlist.json]
       Pre-route placement-review checks (the G3 gate):
@@ -9,19 +9,34 @@ Two modes, both emit JSON {"issues": [...]} on stdout:
         interior) and sits at the edge it faces (<= 3 mm); a J* part the
         netlist flags "interior": true (jumper, Kelvin header) is exempt
       - if the netlist requests an antenna_keepout, a no-fill rule area exists
+      - exposed-pad via farms, pre-route plane integrity, height zones
+  placement_routed <pcb> [netlist.json]
+      The placement checks re-run on a routed board (plane integrity skipped).
   routed <pcb> [netlist.json]
       Post-route layout-review checks (part of the G4 gate):
       - every net bound to a net class is routed at >= the class track width
         (verifies the IPC-2221/2141A rules engine wasn't silently ignored)
+      - high-current layer transitions have enough via ampacity; declared
+        differential pairs are length-matched and coupled (warnings)
+      These live in swig_routed_checks.py and are re-exported here.
+
+main() loads the board through board_outline.load_board (a missing or
+unreadable file is one JSON issue, never a None board) and builds every
+footprint's courtyard cache: KiCad 9.0.4's LoadBoard leaves them EMPTY, so the
+connector rule never fired and check_heights measured the silk/text bbox (T02).
 
 These complement (not replace) kicad-cli DRC: DRC checks geometry against
 rules; these check the *design intent* a DRC can't see.
 """
 import json
 import sys
+from typing import Any
 
 import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
+
+# the routed (G4) checks: callers and tests import them from this module
+from swig_routed_checks import check_diff_pairs, check_routed_widths, check_via_ampacity
 
 
 def _world_mouth(fp):
@@ -105,8 +120,11 @@ def check_placement(board, design, routed=False):
                           f"edge it faces (must be at the edge, <=3 mm)")
 
     if design.get("antenna_keepout"):
-        ok = any(z.GetIsRuleArea() and z.GetDoNotAllowZoneFills()
-                 for z in board.Zones())
+        # the "no copper pour" getter differs between pcbnew 9.x and 10.x: read it
+        # through board_outline. Imported here: board_outline binds pcbnew when first
+        # imported, and unit tests import this module with a stub pcbnew briefly.
+        import board_outline
+        ok = any(board_outline.blocks_pour(z) for z in board.Zones())
         if not ok:
             issues.append("antenna_keepout requested in the netlist but no "
                           "no-fill rule area exists on the board")
@@ -291,16 +309,17 @@ def check_plane_integrity(board):
                 if p.GetNetCode() == nc]
         parent = list(range(len(islands) + len(pads)))
 
-        def find(a):
+        # parent / islands are bound per zone: the helpers run in this iteration only
+        def find(a, parent=parent):
             while parent[a] != a:
                 parent[a] = parent[parent[a]]
                 a = parent[a]
             return a
 
-        def union(a, b):
+        def union(a, b, parent=parent):
             parent[find(a)] = find(b)
 
-        def island_at(pos, reach=0.0):
+        def island_at(pos, reach=0.0, islands=islands):
             """Index of the island containing pos, else (with reach) the one
             with the smallest TRUE polygon distance — bbox distance is
             meaningless when one outline spans the whole board."""
@@ -338,7 +357,7 @@ def check_plane_integrity(board):
                     p = pad.GetPosition()
                     if math.hypot(to(p.x - ep.x), to(p.y - ep.y)) < 1.0:
                         ends.append(len(islands) + pi)
-            for a, b in zip(ends, ends[1:]):
+            for a, b in zip(ends, ends[1:], strict=False):
                 union(a, b)
 
         groups = {}
@@ -412,286 +431,61 @@ def check_ep_via_farms(board, design):
     return issues
 
 
-def check_routed_widths(board, pro_path, design=None):
-    """Every net bound to a net class must be routed at >= the class width.
-
-    Exemption: a sub-width segment whose endpoint lands on (or within 0.5 mm
-    of) a pad of the same net is an accepted PAD-ENTRY NECK — the pad itself
-    is narrower than the IPC trace, so the router necks down to enter it and
-    the short local section has negligible thermal effect. Only sub-width
-    copper in the open field is a real current-capacity violation."""
-    from pathlib import Path
-    issues = []
-    p = Path(pro_path)
-    if not p.is_file():
-        return issues
-    import netclass_read
-    classed = netclass_read.net_class_widths(
-        p, nets={t.GetNetname() for t in board.GetTracks()})
-    bound = {net: cls for net, (cls, _w) in classed.items()}
-    targets = {net: w for net, (_cls, w) in classed.items()}
-    bound = dict(bound)
-    # preroute nets carry no class (their taps route at signal width), but
-    # the designer-authored fat path itself must survive the router intact:
-    # police it by checking the LONGEST run of >=width copper exists, via
-    # the same open-field rule — sub-width TAP stubs are exempted by the
-    # narrow-entry rule below only near pads, so restrict the preroute
-    # check to segments WIDER than half the target (the fat path), and
-    # verify their total length is non-trivial.
-    pre_w = {}
-    authored = {}
-    for pr in (design or {}).get("preroutes", []):
-        net = pr["net"]
-        pre_w[net] = max(pre_w.get(net, 0), float(pr["width"]))
-        # authored fat length: segments at >= the net's preroute width
-        # (the router may legitimately TRIM a fat run where it enters a
-        # wide pad — only substantial REMOVAL is a violation)
-        pts = []
-        for p in pr.get("path", []):
-            if p[0] == "xy":
-                pts.append((float(p[1]), float(p[2]),
-                            float(p[3]) if len(p) > 3 else None))
-            else:
-                pts.append((None, None,
-                            float(p[3]) if len(p) > 3 else None))
-        for (x0, y0, w0), (x1, y1, _w1) in zip(pts, pts[1:]):
-            w_seg = w0 if w0 is not None else float(pr["width"])
-            if (w_seg + 1e-3 >= pre_w[net] and None not in (x0, y0, x1, y1)):
-                import math as _m
-                authored[net] = authored.get(net, 0) + _m.hypot(x1 - x0,
-                                                                y1 - y0)
-    to = pcbnew.ToMM
-    for net, w_req in pre_w.items():
-        fat_len = sum(
-            (to(t.GetLength()) if hasattr(t, "GetLength") else 0)
-            for t in board.GetTracks()
-            if t.GetClass() == "PCB_TRACK" and t.GetNetname() == net
-            and to(t.GetWidth()) + 1e-3 >= w_req)
-        need = min(1.0, 0.5 * authored.get(net, 2.0))
-        if fat_len + 1e-3 < need:
-            issues.append(f"{net}: prerouted {w_req} mm power path missing "
-                          f"from the routed board ({round(fat_len, 2)} mm of "
-                          f"fat copper survives, authored "
-                          f"{round(authored.get(net, 0), 2)} mm — router "
-                          f"removed it?)")
-            bound[net] = "preroute"
-
-    # Entry-neck exemption: a router MUST neck where the copper it enters (pad
-    # or via) is itself narrower than the class trace — e.g. a 1.1 mm-tall FB
-    # pad or a 1.0 mm via on a 1.375 mm conductor — and it carries that neck a
-    # short distance clear of the pad. So a sub-width segment is exempt when it
-    # sits within reach of a same-net NARROW entry (reach = the entry's long
-    # dimension + 1 mm, at least 3 mm). A long open-field run stays flagged —
-    # that is the real current-capacity violation.
-    to = pcbnew.ToMM
-    entries_by_net = {}
+def load_checked_board(pcb: str) -> Any:
+    """The board the checks read: board_outline.load_board (FileNotFoundError /
+    RuntimeError instead of a None board), then every footprint's courtyard
+    cache built. KiCad 9.0.4's LoadBoard leaves those caches EMPTY: without
+    this _world_mouth sees no courtyard (no J* was ever judged, T02) and
+    check_heights falls back to GetBoundingBox (silk and text included)."""
+    import board_outline
+    board = board_outline.load_board(pcb)
     for fp in board.GetFootprints():
-        for pad in fp.Pads():
-            entries_by_net.setdefault(pad.GetNetCode(), []).append(
-                pad.GetBoundingBox())
-    for t in board.GetTracks():
-        if t.GetClass() == "PCB_VIA":
-            entries_by_net.setdefault(t.GetNetCode(), []).append(
-                t.GetBoundingBox())
-
-    def near_narrow_entry(track, target_mm):
-        for ebb in entries_by_net.get(track.GetNetCode(), []):
-            ew, eh = to(ebb.GetWidth()), to(ebb.GetHeight())
-            if min(ew, eh) >= target_mm:        # wide entry — no neck needed
-                continue
-            cx, cy = to(ebb.GetCenter().x), to(ebb.GetCenter().y)
-            reach = max(3.0, max(ew, eh) + 1.0)
-            for pt in (track.GetStart(), track.GetEnd()):
-                dx, dy = to(pt.x) - cx, to(pt.y) - cy
-                if dx * dx + dy * dy <= reach * reach:
-                    return True
-        return False
-
-    flagged = set()
-    for t in board.GetTracks():
-        if t.GetClass() != "PCB_TRACK":
-            continue
-        net = t.GetNetname()
-        target = targets.get(net, 0)
-        if not target:
-            continue
-        w = to(t.GetWidth())
-        if (w + 1e-3 < target and net not in flagged
-                and not near_narrow_entry(t, target)):
-            flagged.add(net)
-            issues.append(f"{net}: open-field segment routed at {w:.3f} mm but "
-                          f"class {bound[net]} requires {target:.3f} mm")
-    return issues
+        fp.BuildCourtyardCaches()
+    return board
 
 
-def check_diff_pairs(board, design):
-    """Differential pairs must be ROUTED as pairs. Declared in net_specs:
-    "USB_DP": {"diff_pair": "USB_DM", "dp_tol_mm": 1.5, "dp_gap_mm": 1.0}.
-    Measures (a) intra-pair length mismatch and (b) the fraction of each
-    net's length that runs coupled (within dp_gap of its partner).
-
-    WARNING-grade by design: Freerouting cannot pair-route, so a blocker
-    would make every diff-pair board unbuildable headless — but a pair
-    routed as two independent meanders must never pass silently. For real
-    high-speed pairs, preroute them as a pair and let these numbers verify.
-    Returns warnings list."""
-    import math
-    warnings = []
-    to = pcbnew.ToMM
-    specs = design.get("net_specs", {})
-    seen = set()
-    for net_a, s in specs.items():
-        net_b = s.get("diff_pair")
-        if not net_b or tuple(sorted((net_a, net_b))) in seen:
-            continue
-        seen.add(tuple(sorted((net_a, net_b))))
-        tol = float(s.get("dp_tol_mm", 1.5))
-        gap = float(s.get("dp_gap_mm", 1.0))
-        segs = {}
-        for name in (net_a, net_b):
-            segs[name] = [t for t in board.GetTracks()
-                          if t.GetClass() == "PCB_TRACK"
-                          and t.GetNetname() == name]
-        if not segs[net_a] or not segs[net_b]:
-            continue                      # unrouted / plane-carried
-
-        def length(name):
-            return sum(to(t.GetLength()) for t in segs[name])
-
-        la, lb = length(net_a), length(net_b)
-        if abs(la - lb) > tol:
-            warnings.append(
-                f"diff pair {net_a}/{net_b}: length mismatch "
-                f"{abs(la - lb):.2f} mm ({la:.2f} vs {lb:.2f}) exceeds "
-                f"{tol} mm — add serpentine or preroute the pair")
-
-        def seg_pts(t):
-            s_, e_ = t.GetStart(), t.GetEnd()
-            return ((to(s_.x), to(s_.y)), (to(e_.x), to(e_.y)))
-
-        def dist_pt_seg(p, a, b):
-            ax, ay = a
-            vx, vy = b[0] - ax, b[1] - ay
-            L2 = vx * vx + vy * vy
-            if L2 < 1e-12:
-                return math.hypot(p[0] - ax, p[1] - ay)
-            t_ = max(0.0, min(1.0, ((p[0] - ax) * vx + (p[1] - ay) * vy) / L2))
-            return math.hypot(p[0] - (ax + t_ * vx), p[1] - (ay + t_ * vy))
-
-        other = [seg_pts(t) for t in segs[net_b]]
-        coupled = total = 0.0
-        for t in segs[net_a]:
-            (x0, y0), (x1, y1) = seg_pts(t)
-            ln = math.hypot(x1 - x0, y1 - y0)
-            if ln < 1e-6:
-                continue
-            total += ln
-            mid = ((x0 + x1) / 2, (y0 + y1) / 2)
-            d = min((dist_pt_seg(mid, a, b) for a, b in other), default=1e9)
-            if d <= gap + 0.2:            # gap is edge-ish; small slack
-                coupled += ln
-        frac = coupled / total if total else 0.0
-        if frac < 0.7:
-            warnings.append(
-                f"diff pair {net_a}/{net_b}: only {frac:.0%} of the routed "
-                f"length runs coupled (within {gap} mm of its partner) — "
-                f"the pair is routed as two independent traces; preroute it "
-                f"as a pair for impedance/EMI integrity")
-    return warnings
+def read_design(path: str) -> tuple[dict, list[str]]:
+    """(netlist, warnings). A missing or unreadable netlist still runs the
+    checks without design intent, as before, but now says so in a warning."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            design = json.load(f)
+    except (OSError, ValueError) as e:
+        return {}, [f"netlist {path} not read ({type(e).__name__}: {e}): checks ran "
+                    f"without design intent"]
+    if not isinstance(design, dict):
+        return {}, [f"netlist {path} is not a JSON object: checks ran without design intent"]
+    return design, []
 
 
-def check_via_ampacity(board, design):
-    """High-current nets must not bottleneck at a layer transition: the via
-    barrels on the net (taken together) must carry the net's specified
-    current per the IPC-2221 internal-conductor ampacity of one barrel.
-    Approximation: total barrel count vs. the per-transition requirement —
-    exact per-transition clustering is overkill when power nets tie into
-    planes, where every barrel shares the load."""
-    import ipc_rules
-    issues = []
-    to = pcbnew.ToMM
-    specs = design.get("net_specs", {})
-    preroutes = design.get("preroutes", [])
-    pre_nets = {p["net"] for p in preroutes}
-    for net, s in specs.items():
-        current = float(s.get("current", 0) or 0)
-        if current < 2.0:
-            continue
-        if net in pre_nets:
-            # the designer prerouted this net's current path. Router-added
-            # vias on it are signal TAPS (a gate divider on the back, a
-            # sense pin) that never see the chain current — only the
-            # AUTHORED via cluster (if the preroute itself changes layers)
-            # must carry it, judged by summed barrel ampacity.
-            layers = {p.get("layer", "F.Cu") for p in preroutes
-                      if p["net"] == net}
-            if len(layers) < 2:
-                continue                  # current path is single-layer
-            cap = 0.0
-            n_vias = 0
-            for p in preroutes:
-                if p["net"] != net:
-                    continue
-                d = (p.get("via_size") or [1.2, 0.9])[1]
-                n_vias += len(p.get("vias", []))
-                cap += len(p.get("vias", [])) * ipc_rules.via_ampacity_a(d)
-            if cap + 1e-6 < current:
-                issues.append(
-                    f"{net}: prerouted layer transition carries {current} A "
-                    f"but the authored via cluster ({n_vias} via(s)) totals "
-                    f"only {round(cap, 2)} A (IPC-2221) — add parallel vias")
-            continue
-        drills = [to(t.GetDrillValue()) for t in board.GetTracks()
-                  if t.GetClass() == "PCB_VIA" and t.GetNetname() == net]
-        if not drills:
-            continue                      # net never changes layers
-        # PTH pads on the net are barrels too — a THT inductor/connector leg
-        # bridging the same layers shares the transition current exactly like
-        # a via (the check's stated all-barrels-share approximation)
-        n_vias = len(drills)
-        for fp in board.GetFootprints():
-            for pad in fp.Pads():
-                if (pad.GetNetname() == net
-                        and pad.GetAttribute() == pcbnew.PAD_ATTRIB_PTH):
-                    try:
-                        d = to(pad.GetDrillSize().x)
-                    except Exception:
-                        d = 0
-                    if d > 0:
-                        drills.append(d)
-        cap = sum(ipc_rules.via_ampacity_a(d) for d in drills)
-        if cap + 1e-6 < current:
-            issues.append(
-                f"{net}: {current} A crosses layers through {n_vias} via(s) "
-                f"+ {len(drills) - n_vias} PTH barrel(s) totaling "
-                f"{round(cap, 2)} A (IPC-2221) — add parallel vias at the "
-                f"transition")
-    return issues
-
-
-def main():
-    mode, pcb = sys.argv[1], sys.argv[2]
-    design = {}
-    if len(sys.argv) > 3:
-        try:
-            design = json.load(open(sys.argv[3], encoding="utf-8"))
-        except Exception:
-            pass
-    board = pcbnew.LoadBoard(pcb)
-    warnings = []
+def run_mode(mode: str, pcb: str, board: Any, design: dict) -> tuple[list, list]:
+    """(issues, warnings) of one main() mode."""
     if mode == "placement":
-        issues, warnings = check_placement(board, design)
-    elif mode == "placement_routed":
-        issues, warnings = check_placement(board, design, routed=True)
-    elif mode == "routed":
+        return check_placement(board, design)
+    if mode == "placement_routed":
+        return check_placement(board, design, routed=True)
+    if mode == "routed":
         pro = pcb.rsplit(".", 1)[0] + ".kicad_pro"
         issues = check_routed_widths(board, pro, design)
         issues += check_via_ampacity(board, design)
-        warnings += check_diff_pairs(board, design)
-    else:
-        issues = [f"unknown mode {mode}"]
-    print(json.dumps({"issues": issues, "warnings": warnings}))
+        return issues, check_diff_pairs(board, design)
+    return [f"unknown mode {mode}"], []
+
+
+def main() -> int:
+    """argv: mode pcb [netlist.json]. Prints {"issues": [...], "warnings": [...]};
+    rc 1 (with one issue saying why) when the board cannot be loaded."""
+    mode, pcb = sys.argv[1], sys.argv[2]
+    design, warnings = read_design(sys.argv[3]) if len(sys.argv) > 3 else ({}, [])
+    try:
+        board = load_checked_board(pcb)
+    except (OSError, RuntimeError) as e:
+        print(json.dumps({"issues": [f"cannot load the board: {e}"], "warnings": warnings}))
+        return 1
+    issues, found = run_mode(mode, pcb, board, design)
+    print(json.dumps({"issues": issues, "warnings": warnings + found}))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

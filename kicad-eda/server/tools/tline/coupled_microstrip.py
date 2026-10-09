@@ -15,9 +15,12 @@ f*h = 2 GHz*mm, not modelled.
 No closed form covers a coated pair: with solder mask the BARE result is returned, class C
 ('mask ignored - class C fallback/FD required'; D7-05c fallback.apply adds the mask, FD
 synthesises); covering plies likewise. Pair results as in stripline.pair_line_result
-(z0 = sqrt(z_even z_odd), est_error_pct refers to z_diff; z_even is up to 2.8 % / 4.4 % off
-fit / held out). Dispersion of the pair is NOT modelled (eeff_f = eeff; flagged above
-f*h = 2 GHz*mm).
+(z0 = sqrt(z_even z_odd), as fieldsolve2d.FdResult; est_error_pct refers to z_diff; z_even
+is up to 2.8 % / 4.4 % off fit / held out). Dispersion of the pair is NOT modelled (eeff_f = eeff;
+flagged above f*h = 2 GHz*mm).
+Numeric domain: KJ84's odd-mode term exp(Q6 ln u u^-Q9) diverges once Q6 turns negative
+(mapped g < 0.0015), so a mapped gap under KJ84_MIN_G h is a ValueError, like a gap the
+thickness mapping closes; the air mapping then falls back to the closed-gap eeff.
 Registers ('microstrip', 'edge').
 """
 from __future__ import annotations
@@ -30,8 +33,8 @@ from .microstrip import (EST_OUTSIDE_PCT, etch_verdict, hj_eeff, hj_width_increm
 from .stripline import C_REQUIRED, pair_line_result
 from .types import ETA0, LineGeometry, LineResult, MaskModel, Verdict, combine
 
-__all__ = ["evaluate_coupled_microstrip", "hj_width_increments", "kj84_static",
-           "mapped_increments"]
+__all__ = ["evaluate_coupled_microstrip", "hj_width_increments", "kj84_domain_error",
+           "kj84_static", "mapped_increments"]
 
 MAPPING_WEIGHT = 0.2           # d = du_r + 0.2 (du1 - du_r) [R-imp]
 EST_KJ84_PCT = 0.3             # KJ84 at t = 0 vs FD: Zodd 0.04 % mean, 0.22 % worst [R-imp]
@@ -43,6 +46,10 @@ THICK_LIMIT = 0.5              # t/h covered by the calibration (fit 0.35, held 
 EST_MASK_IGNORED_PCT = 8.5
 EST_COVER_IGNORED_PCT = 10.0   # a cover shifts Z ~9 % (embedded microstrip study [R-imp])
 KJ84_RANGE = {"u": (0.1, 10.0), "g": (0.1, 10.0), "er": 18.0}
+# numeric floor of the mapped g = s'/h: KJ84's Q6 changes sign at g 0.00152, below which its
+# odd-mode term exp(Q6 ln u u^-Q9) diverges for u < 1 (OverflowError; D7-05 review 2)
+KJ84_MIN_G = 0.002
+EXP_LIMIT = 700.0              # math.exp overflows just above 709.78
 DISPERSION_NOTE_GHZ_MM = 2.0
 MODEL = "kj84@d-map(empirical, FD-calibrated)"
 MASK_IGNORED = "mask ignored - class C fallback/FD required"
@@ -77,18 +84,51 @@ def _q4(u: float, g: float) -> float:
     return 2.0 * q1 / _q2(g) / (math.exp(-g) * u ** q3 + (2.0 - math.exp(-g)) * u ** -q3)
 
 
-def _q10(u: float, g: float, q4: float) -> float:
-    q5 = 1.794 + 1.14 * math.log(1.0 + 0.638 / (g + 0.517 * g ** 2.43))
+def _q6_q9(g: float) -> tuple[float, float]:
     q6 = (0.2305 + math.log(g ** 10 / (1.0 + (g / 5.8) ** 10)) / 281.3
           + math.log(1.0 + 0.598 * g ** 1.154) / 5.1)
     q7 = (10.0 + 190.0 * g * g) / (1.0 + 82.3 * g ** 3)
     q8 = math.exp(-6.5 - 0.95 * math.log(g) - (g / 0.15) ** 5)
-    q9 = math.log(q7) * (q8 + 1.0 / 16.5)
-    return q4 - q5 / _q2(g) * math.exp(q6 * math.log(u) * u ** -q9)
+    return q6, math.log(q7) * (q8 + 1.0 / 16.5)
+
+
+def _q10_exponent(u: float, g: float) -> float:
+    """Q6 ln(u) u^-Q9, the exponent of KJ84's odd-mode term, formed in log space so its own
+    power cannot overflow; +-inf once its magnitude passes EXP_LIMIT."""
+    q6, q9 = _q6_q9(g)
+    lead = q6 * math.log(u)
+    if lead == 0.0:
+        return 0.0
+    log_mag = math.log(abs(lead)) - q9 * math.log(u)
+    if log_mag > math.log(EXP_LIMIT):
+        return math.copysign(math.inf, lead)
+    return math.copysign(math.exp(log_mag), lead)
+
+
+def _q10(u: float, g: float, q4: float) -> float:
+    q5 = 1.794 + 1.14 * math.log(1.0 + 0.638 / (g + 0.517 * g ** 2.43))
+    return q4 - q5 / _q2(g) * math.exp(_q10_exponent(u, g))
+
+
+def kj84_domain_error(u: float, g: float) -> str:
+    """Why KJ84 cannot be evaluated at (u, g), '' when it can: below KJ84_MIN_G its Q6 turns
+    negative and the odd-mode term diverges for u < 1; with u and g in the thousands (far
+    outside its validity) the term leaves the float range too."""
+    if not (u > 0.0 and g >= KJ84_MIN_G):
+        return (f"kj84: mapped u {u:.3g}, g {g:.3g}: needs u > 0 and g >= {KJ84_MIN_G:g} "
+                "(below it the odd-mode term diverges)")
+    if _q10_exponent(u, g) > EXP_LIMIT:
+        return (f"kj84: the odd-mode term overflows at mapped u {u:.3g}, g {g:.3g} (published "
+                f"validity u <= {KJ84_RANGE['u'][1]:g}, g <= {KJ84_RANGE['g'][1]:g})")
+    return ""
 
 
 def kj84_static(u: float, g: float, er: float) -> tuple[float, float, float, float]:
-    """(Zeven, Zodd, eeff_even, eeff_odd) of a zero-thickness pair, u = w/h, g = s/h."""
+    """(Zeven, Zodd, eeff_even, eeff_odd) of a zero-thickness pair, u = w/h, g = s/h.
+    ValueError outside KJ84's numeric domain (kj84_domain_error)."""
+    reason = kj84_domain_error(u, g)
+    if reason:
+        raise ValueError(reason)
     eeff = hj_eeff(u, er)
     z_single = hj_z01(u) / math.sqrt(eeff)
     load = z_single / ETA0 * math.sqrt(eeff)
@@ -158,12 +198,14 @@ def _context_verdict(geom: LineGeometry, h: float, freq_hz: float) -> Verdict:
 def _odd_eeff(w: float, s: float, h: float, d1: float, z_odd: float, kj_eeff_odd: float,
               er: float) -> tuple[float, Verdict]:
     """Odd-mode eeff from the air mapping (H&J's thickness treatment); KJ84's own eeff at the
-    d mapping when the air-mapped gap closes."""
-    if s - d1 <= 0.0:
-        return kj_eeff_odd, Verdict("A", 0.0, (
-            f"{LINE}: gap {s} mm closes at the air mapping (du1 {d1:.4f} mm): odd-mode eeff "
-            "and delay from the impedance mapping, up to ~25 % high",))
-    _, zo_air, _, _ = kj84_static((w + d1) / h, (s - d1) / h, 1.0)
+    d mapping when the air-mapped gap closes (or leaves KJ84's numeric domain)."""
+    u_air, g_air = (w + d1) / h, (s - d1) / h
+    reason = kj84_domain_error(u_air, g_air)
+    if reason:
+        return min(max(kj_eeff_odd, 1.0), er), Verdict("A", 0.0, (
+            f"{LINE}: no KJ84 air mapping at gap {s} mm (s - du1 = {s - d1:.4g} mm; {reason}): "
+            "odd-mode eeff and delay from the impedance mapping, up to ~25 % high",))
+    _, zo_air, _, _ = kj84_static(u_air, g_air, 1.0)
     return min(max((zo_air / z_odd) ** 2, 1.0), er), Verdict("A", 0.0)
 
 
@@ -175,9 +217,10 @@ def evaluate_coupled_microstrip(geom: LineGeometry, freq_hz: float) -> LineResul
     sub = substrate(geom.below)
     w, h, t = geom.width, sub.h, geom.t
     d, d1 = mapped_increments(w, h, t, sub.er)
-    if s - d <= 0.0:
-        raise ValueError(f"{LINE}: gap {s} mm is too small for the thickness mapping: "
-                         f"s - d = {s - d:.4f} mm at t {t} mm")
+    if (s - d) / h < KJ84_MIN_G:
+        raise ValueError(f"{LINE}: gap {s} mm is too small: the mapped gap s - d = "
+                         f"{s - d:.4g} mm (d {d:.4g} mm at t {t} mm) is below KJ84's numeric "
+                         f"floor {KJ84_MIN_G:g} h = {KJ84_MIN_G * h:.4g} mm")
     u, g = (w + d) / h, (s - d) / h
     z_even, z_odd, _, kj_eeff_odd = kj84_static(u, g, sub.er)
     eeff_odd, eeff_note = _odd_eeff(w, s, h, d1, z_odd, kj_eeff_odd, sub.er)

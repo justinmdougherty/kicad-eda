@@ -4,13 +4,14 @@
   LIB-E1  the project libraries did not load (``ctx.library_error``)
   LIB-E2  ``resolver.errors(**libtable.design_nicknames(design))``: a used
           nickname resolving nowhere or to a disabled row, a block-vs-project
-          conflict, a declared library file that is missing
+          conflict, a declared library file that is missing or of the wrong kind
   LIB-E3  a symbol / footprint name missing from its resolved library, or an
-          unreadable library file (one error per lib_id, naming its refs)
+          unreadable library (one error per lib_id, naming its users): the
+          components' and what the builds add (power:PWR_FLAG, the hole footprint)
   LIB-E4  a netted pad key that is not a pad of the footprint (the board build
           matches pad NUMBERS; a pin name maps to its number through the symbol
-          for the hint), or a no_connect key that is neither a pad nor a pin
-          (number or name) of the symbol: a no_connect may flag a pad-less pin
+          for the hint), or a no_connect key that is neither a pad nor a symbol
+          pin (number or name): a no_connect may flag a pad-less pin
   LIB-E5  the listed pins of one stacked group (one spot of one unit) sit on
           different nets, or a net and no_connect: KiCad joins stacked pins
   LIB-W1  symbol pins without a matching pad (once per symbol + footprint)
@@ -19,19 +20,17 @@
           Height property or component ``height``)
 
 With ``ctx.resolver`` every rule runs (a library it cannot place is LIB-E2's
-alone). Without one (dir mode) only LIB-E1, LIB-E3 and LIB-E4 run, against
-``ctx.symbols`` (directory, library map or resolver) and the footprints of
-``options["footprints_dir"]``, that map / resolver, or an existing
-``<symbols dir>/../footprints``; a library missing there is an LIB-E3 unless
-LIB-E1 explains it (a symbols directory that does not exist is no source).
-Footprints are read with fp_reader, symbols with symlib (lazily: without
-sexpdata, one warning); each library file is read once per call.
+alone). Without one (dir mode) only LIB-E1, E3 and E4 run, against
+``ctx.symbols`` (an existing directory, a library map or a resolver) and the
+footprints _footprint_backend finds; a library missing there is an LIB-E3
+unless LIB-E1 explains it. Footprints are read with fp_reader, symbols with
+symlib (lazily: without sexpdata, one warning), each file once per call.
 """
 from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType, ModuleType
@@ -44,12 +43,15 @@ from lint_context import LintContext, is_resolver
 ORDER = 10
 
 NO_CONNECT = "no_connect"
+SYMBOL, FOOTPRINT = "symbol", "footprint"
 FOOTPRINT_FILE_SUFFIX = ".kicad_mod"
 FOOTPRINTS_DIR_OPTION = "footprints_dir"      # dir mode: the stock .pretty libraries
 STOCK_FOOTPRINTS_DIRNAME = "footprints"       # <share>/symbols sits beside <share>/footprints
 COURTYARD_LAYERS = ("F.CrtYd", "B.CrtYd")
 HEIGHT_PROPERTY = "height"                    # a footprint property "Height" (any case)
 PROJECT_SOURCES = (libtable.NETLIST, libtable.PROJECT)
+PWR_FLAG_LIB_ID = f"{libtable.POWER_LIBRARY}:PWR_FLAG"   # as sch_build.PWR_FLAG_LIB_ID
+POWER_FLAG_USER, HOLES_KEY = "power flags", "mounting_holes"   # LIB-E3 users of those
 _SUB_UNIT_RE = re.compile(r"_(\d+)_(\d+)$")   # <symbol>_<unit>_<body style>
 _DIGITS_RE = re.compile(r"(\d+)")
 
@@ -109,7 +111,7 @@ def _import_symlib() -> ModuleType:
 def _stacks(sl: ModuleType, flat: list) -> tuple[tuple[str, ...], ...]:
     """Pin numbers sharing one spot of one unit (KiCad's stacked pins). The
     alternate (De Morgan) body style is never placed; unit 0 counts as unit 1."""
-    spots: dict[tuple[int, float, float], list[str]] = {}
+    spots: dict[tuple[int, float, float], dict[str, None]] = {}    # spot -> ordered numbers
     for sub in sl.kids(flat, "symbol"):
         m = _SUB_UNIT_RE.search(str(sub[1]))
         unit, style = (int(m.group(1)), int(m.group(2))) if m else (1, 1)
@@ -120,9 +122,7 @@ def _stacks(sl: ModuleType, flat: list) -> tuple[tuple[str, ...], ...]:
             if num is None or at is None or not str(num[1]):
                 continue
             spot = (unit or 1, round(float(at[1]), 3), round(float(at[2]), 3))
-            numbers = spots.setdefault(spot, [])
-            if str(num[1]) not in numbers:
-                numbers.append(str(num[1]))
+            spots.setdefault(spot, {})[str(num[1])] = None
     return tuple(tuple(n) for n in spots.values() if len(n) > 1)
 
 
@@ -171,34 +171,27 @@ class _Libraries:
             except ImportError as e:
                 self.notes.append(f"LIB symbol checks skipped (cannot import symlib: {e})")
         self._flat_cache: dict = {}
-        self._symbols: dict[tuple[str, str], _Found] = {}
-        self._footprints: dict[tuple[str, str], _Found] = {}
+        self._found: dict[tuple[str, str, str], _Found] = {}
 
     def _missing(self, text: str) -> str:
         """A library missing in dir mode, unless LIB-E1 already explains it."""
         return "" if self._ctx.library_error else text
 
-    @staticmethod
-    def _cached(cache: dict, lib_ref: object, load: Callable[[str, str], _Found]) -> _Found:
+    def find(self, kind: str, lib_ref: object) -> _Found:
+        """``kind`` (SYMBOL / FOOTPRINT) ``lib_ref`` ('Nick:Name'), looked up once."""
         ref = _lib_ref(lib_ref)
-        if ref is None:
+        if ref is None or (kind == SYMBOL and self._sl is None):
             return _Found()
-        if ref not in cache:
-            cache[ref] = load(*ref)
-        return cache[ref]
-
-    def symbol(self, lib_id: object) -> _Found:
-        return _Found() if self._sl is None else \
-            self._cached(self._symbols, lib_id, self._load_symbol)
-
-    def footprint(self, fp_id: object) -> _Found:
-        return self._cached(self._footprints, fp_id, self._load_footprint)
+        if (kind, *ref) not in self._found:
+            load = self._load_symbol if kind == SYMBOL else self._load_footprint
+            self._found[(kind, *ref)] = load(*ref)
+        return self._found[(kind, *ref)]
 
     def _load_symbol(self, nick: str, name: str) -> _Found:
         sl, resolver = self._sl, self._ctx.resolver
         if resolver is not None:
             hit = resolver.resolve(libtable.SYMBOL, nick)
-            if hit is None or not hit.exists:
+            if hit is None or not hit.path.is_file():
                 return _Found()                      # LIB-E2 names it
         try:
             path = sl.lib_path(self._source, nick)
@@ -248,27 +241,37 @@ class _Libraries:
         return None, self._missing(f"footprint library not found: '{nick}': {where}")
 
 
+def _implicit_uses(design: Mapping[str, Any]) -> list[tuple[str, object, str]]:
+    """(kind, lib ref, user) the builds add themselves (as libtable.design_nicknames)."""
+    holes = design.get(HOLES_KEY)
+    spec = holes if isinstance(holes, Mapping) else {}
+    hole = spec.get("footprint", libtable.DEFAULT_MOUNTING_HOLE_FOOTPRINT)
+    return [(SYMBOL, PWR_FLAG_LIB_ID, POWER_FLAG_USER)] + \
+        ([(FOOTPRINT, hole, HOLES_KEY)] if holes else [])
+
+
 def _parts(design: Mapping[str, Any], libs: _Libraries) -> tuple[dict[str, _Part], list[str]]:
     """{ref: _Part} (a duplicated ref keeps its first part) and the LIB-E3
-    errors: one per missing / unreadable symbol or footprint, with its refs."""
+    errors: one per missing / unreadable symbol or footprint, with its users."""
     comps = design.get("components")
     parts: dict[str, _Part] = {}
-    problems: dict[tuple[str, str, str], list[str]] = {}
+    uses: list[tuple[str, object, str]] = []
     for comp in (comps if isinstance(comps, list) else ()):
         if not isinstance(comp, Mapping) or not isinstance(comp.get("ref"), str):
             continue
         ref, lib_id, fp_id = comp["ref"], comp.get("lib_id"), comp.get("footprint")
         wants = not comp.get("board_only")
-        sym = libs.symbol(lib_id) if wants else _Found()
-        fp = libs.footprint(fp_id)
-        for kind, lib_ref, found in (("symbol", lib_id, sym), ("footprint", fp_id, fp)):
-            if found.problem:
-                problems.setdefault((kind, str(lib_ref), found.problem), []).append(ref)
+        sym = libs.find(SYMBOL, lib_id) if wants else _Found()
+        uses += ([(SYMBOL, lib_id, ref)] if wants else []) + [(FOOTPRINT, fp_id, ref)]
         parts.setdefault(ref, _Part(ref, str(lib_id or ""), str(fp_id or ""), sym.item,
-                                    fp.item, wants, comp.get("height") is not None))
-    errors = [f"LIB-E3 {kind} {lib_ref} ({', '.join(refs)}): {problem}"
-              for (kind, lib_ref, problem), refs in problems.items()]
-    return parts, errors
+                                    libs.find(FOOTPRINT, fp_id).item, wants,
+                                    comp.get("height") is not None))
+    problems: dict[tuple[str, str, str], list[str]] = {}
+    for kind, lib_ref, user in uses + _implicit_uses(design):
+        if problem := libs.find(kind, lib_ref).problem:
+            problems.setdefault((kind, str(lib_ref), problem), []).append(user)
+    return parts, [f"LIB-E3 {kind} {lib_ref} ({', '.join(users)}): {problem}"
+                   for (kind, lib_ref, problem), users in problems.items()]
 
 
 def _pad_uses(design: Mapping[str, Any]) -> Iterator[tuple[str | None, str, str]]:
@@ -309,8 +312,7 @@ def _e4_pad_keys(design: Mapping[str, Any], parts: Mapping[str, _Part]) -> list[
         if part is None or part.footprint is None or (net is None, ref, key) in seen:
             continue
         seen.add((net is None, ref, key))
-        problem = _key_problem(part, key, net is None)
-        if problem:
+        if problem := _key_problem(part, key, net is None):
             where = NO_CONNECT if net is None else f"net '{net}'"
             errors.append(f"LIB-E4 {ref}.{key} ({where}) {problem}")
     return errors
@@ -338,9 +340,8 @@ def _e5_stacks(design: Mapping[str, Any], parts: Mapping[str, _Part]) -> list[st
 def _w1_unpadded_pins(parts: Mapping[str, _Part]) -> list[str]:
     groups: dict[tuple[str, str], tuple[list[str], list[_Part]]] = {}
     for part in parts.values():
-        if part.pins is None or part.footprint is None:
-            continue
-        missing = sorted(part.pins.numbers - part.footprint.pads, key=_natural)
+        missing = (sorted(part.pins.numbers - part.footprint.pads, key=_natural)
+                   if part.pins is not None and part.footprint is not None else [])
         if missing:
             groups.setdefault((part.lib_id, part.fp_id), (missing, []))[1].append(part)
     return [f"LIB-W1 {lib_id} on {fp_id} ({_refs(users)}): symbol pin(s) "
@@ -371,13 +372,11 @@ def _w2_w3_project_footprints(design: Mapping[str, Any], parts: Mapping[str, _Pa
             project.setdefault(part.fp_id, (part.footprint, []))[1].append(part)
     w2 = [f"LIB-W2 {fp_id} ({_refs(users)}): project footprint has no F.CrtYd/B.CrtYd "
           f"courtyard" for fp_id, (fp, users) in project.items() if not fp.courtyard]
-    w3: list[str] = []
-    for fp_id, (fp, users) in (project.items() if design.get("height_zones") else ()):
-        bare = [p for p in users if not p.height]
-        if bare and not _has_height(fp):
-            w3.append(f"LIB-W3 {fp_id} ({_refs(bare)}): the design has height_zones but this "
-                      f"project footprint has no height (no 3D model or Height property); "
-                      f"declare \"height\" on the part")
+    zoned = project.items() if design.get("height_zones") else ()
+    w3 = [f"LIB-W3 {fp_id} ({_refs(bare)}): the design has height_zones but this project "
+          f"footprint has no height (no 3D model or Height property); declare \"height\" on "
+          f"the part" for fp_id, (fp, users) in zoned
+          if (bare := [p for p in users if not p.height]) and not _has_height(fp)]
     return w2 + w3
 
 

@@ -10,14 +10,17 @@ can never survive to fabrication.
 
 run() walks STAGES, functions of one shared RunContext that return False to
 stop; rp_context.halt is the single exit and writes <stem>_pipeline_report.json
-next to the netlist on every exit (pass, gate failure or crash).
+and <stem>_review.md next to the netlist on every exit (pass, gate failure,
+crash, or a usage error once the netlist path is known), with the run's
+decisions in the append-only <stem>.decisions.jsonl (ROADMAP D5).
 
 Module map (pipeline/; each is a top-level import, and the rp_ prefix keeps
 the names clear of the modules in server/ and server/tools/):
   run_pipeline.py        STAGES, run(), main() and the aliases run_all.py uses
   rp_paths.py            puts server/ and server/tools/ on sys.path (imported first)
   rp_cli.py              command line: parse_cli, board_dims, UsageError, USAGE
-  rp_context.py          RunContext, Attempt, record_gate, halt, file suffixes
+  rp_context.py          RunContext (+ decide), Attempt, record_gate, halt (report,
+                         review, run-level decisions), file suffixes
   rp_kicad.py            KiCad subprocess wrappers: drc, render, gate_check,
                          board_fix, emc_stitch, courtyard_drc, board_cli
   rp_route_hash.py       the route-cache key registry and route_hash
@@ -25,7 +28,8 @@ the names clear of the modules in server/ and server/tools/):
   rp_stage_place.py      the route cache, G3 placement and the pack_scale ladder
   rp_route.py            Freerouting attempts, near-miss heal, routed snapshots
   rp_stage_layout.py     G4 judge, board-fix loop, EMC stitching
-  rp_stage_fab.py        the cache manifest, G5 fab package and sourcing audit
+  rp_stage_fab.py        the cache manifest, G5 fab package, sourcing audit and safety
+                         warnings
 
 Rules for changing the harness:
   - Stage modules call helpers through module objects (rp_kicad.drc(...),
@@ -44,6 +48,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import Callable
 
 import rp_paths  # first: puts server/ and server/tools/ on sys.path
@@ -82,16 +87,40 @@ def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
     return rp_context.halt(ctx)
 
 
+def usage_report(cli: rp_cli.CliArgs, message: str) -> dict | None:
+    """A usage error found once the command line parsed (an unreadable
+    netlist or placement file, board dims the netlist cannot give): the
+    failing report + review through rp_context.halt (error 'usage: ...',
+    PASS false, the design when the netlist reads as a JSON object, else {}).
+    None, nothing written, when the netlist's folder does not exist."""
+    try:
+        if not Path(cli.netlist).resolve().parent.is_dir():
+            return None
+    except OSError:
+        return None
+    ctx = rp_context.RunContext(netlist=cli.netlist, w=cli.w or 0.0, h=cli.h or 0.0,
+                                placement=cli.placement)
+    try:
+        design = json.loads(Path(cli.netlist).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        design = {}
+    ctx.design = design if isinstance(design, dict) else {}
+    return rp_context.halt(ctx, error=f"usage: {message}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if args and args[0] in ("-h", "--help"):
         print(f"{rp_cli.USAGE}\n{__doc__}")
         return 0
+    cli: rp_cli.CliArgs | None = None
     try:
         cli = rp_cli.parse_cli(args)
         w, h, source = rp_cli.cli_dims(cli)
     except rp_cli.UsageError as e:
         print(f"run_pipeline: error: {e}\n{rp_cli.USAGE}", file=sys.stderr)
+        if cli is not None:                  # the netlist path is known: report + review
+            usage_report(cli, str(e))
         return 2
     print(f"run_pipeline: board {w} x {h} mm ({source})", file=sys.stderr)
     rep = run(cli.netlist, w, h, cli.placement)

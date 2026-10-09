@@ -33,7 +33,12 @@ Every problem is collected and raised at once as FpSpecJsonError (a
 ValueError) whose ``problems`` name the JSON path, e.g. ``sop: params.body:
 unknown key 'hieght' (did you mean 'height'?); allowed: h, height, ...``.
 Template errors (an odd SOP pin count, a bad pad shape) are wrapped the same
-way. The input is only read, never mutated. Stdlib-only and Python 3.11
+way. Size limit: no count that multiplies into pads (run counts, pin counts,
+rows / cols, via and paste grids) and no coordinate run may exceed MAX_PADS,
+and a footprint whose pad entries (copper, paste windows, vias) could exceed
+it is refused before anything is built, so a typo such as ``"count": 1e8``
+cannot stall the server. Pad numbers (``start``, ``first``) are not sizes.
+The input is only read, never mutated. Stdlib-only and Python 3.11
 compatible: KiCad's bundled Python can import it.
 """
 from __future__ import annotations
@@ -51,6 +56,7 @@ TEMPLATES: tuple[str, ...] = ("lga_grid", "qfn", "dfn", "lcc_castellated", "sop"
 NUMBERING_RULES: tuple[str, ...] = ("grid_ref", "linear", "table")
 ORDERS: tuple[str, ...] = ("col_major", "row_major")
 JEDEC_ROW_LETTERS = "ABCDEFGHJKLMNPRTUVWY"     # JEDEC JEP95 / IPC-7351: no I O Q S X Z
+MAX_PADS = 10_000                              # pad entries per footprint (largest BGAs ~3,000)
 
 Problems = list[str]
 Converter = Callable[[Any, str, Problems], Any]
@@ -97,9 +103,9 @@ def _shown(value: Any) -> str:
     kind = _json_type(value)
     if isinstance(value, str):
         return f"{kind} {value!r}"
-    if value is None or isinstance(value, bool) or kind == "number":
+    if isinstance(value, bool) or kind == "number":
         return f"{kind} {json.dumps(value)}"
-    return kind
+    return kind                                  # null, object, array: the type says it all
 
 
 def _fail(problems: Problems, path: str, expected: str, value: Any) -> _Invalid:
@@ -133,6 +139,15 @@ def _count(value: Any, path: str, problems: Problems) -> int | _Invalid:
         problems.append(f"{path}: must be >= 0, got {json.dumps(value)}")
         return _BAD
     return int(value)
+
+
+def _size(value: Any, path: str, problems: Problems) -> int | _Invalid:
+    """A count that multiplies into pads: an integer 0..MAX_PADS."""
+    n = _count(value, path, problems)
+    if n is not _BAD and n > MAX_PADS:
+        problems.append(f"{path}: must be <= {MAX_PADS}, got {n}")
+        return _BAD
+    return n
 
 
 def _string(value: Any, path: str, problems: Problems) -> str | _Invalid:
@@ -229,7 +244,7 @@ def _pad_shape_map(value: Any, path: str, problems: Problems) -> dict | _Invalid
 # ---------------------------------------------------------------------------
 # Coordinate runs
 # ---------------------------------------------------------------------------
-_RUN_FIELDS: dict[str, Field] = {"count": (_count, True), "pitch": (_number, True),
+_RUN_FIELDS: dict[str, Field] = {"count": (_size, True), "pitch": (_number, True),
                                  "start": (_number, False), "centre": (_number, False)}
 
 
@@ -260,6 +275,9 @@ def _run(value: Any, path: str, problems: Problems) -> tuple[float, ...] | _Inva
         part = convert(item, f"{path}[{i}]", problems)
         if part is not _BAD:
             out.extend(part if isinstance(part, tuple) else (part,))
+        if len(out) > MAX_PADS:
+            problems.append(f"{path}: more than {MAX_PADS} coordinates")
+            return _BAD
     return tuple(out) if len(problems) == start else _BAD
 
 
@@ -358,13 +376,13 @@ _body = _built(ft.Body, {"w": (_positive, True), "h": (_positive, True), "x": (_
                          "h_max": (_positive, False), "height": (_positive, False)})
 _model = _built(ft.Model, {"path": (_string, True), "offset": (_vec3, False),
                            "scale": (_vec3, False), "rotate": (_vec3, False)})
-_vias = _built(ft.ThermalVias, {"nx": (_count, True), "ny": (_count, True),
+_vias = _built(ft.ThermalVias, {"nx": (_size, True), "ny": (_size, True),
                                 "pitch": (_positive, True), "drill": (_positive, False),
                                 "size": (_positive, False), "bottom_pad": (_boolean, False)})
 _ep = _built(ft.ExposedPad, {
     "w": (_positive, True), "h": (_positive, True), "number": (_pad_name, False),
     "x": (_number, False), "y": (_number, False),
-    "paste_grid": (lambda v, p, pr: _array(v, p, pr, _count, 2), False),
+    "paste_grid": (lambda v, p, pr: _array(v, p, pr, _size, 2), False),
     "paste_coverage": (_number, False), "vias": (_vias, False)})
 _edge_row = _built(ft.EdgeRow, {
     "side": (_string, True), "at": (_number, True), "positions": (_run, True),
@@ -387,14 +405,14 @@ _SCHEMAS: dict[str, dict[str, Field]] = {
                  "edge_rows": (lambda v, p, pr: _array(v, p, pr, _edge_row), False),
                  "grid": (_grid, False), "numbering": (_numbering, False),
                  "shapes": (_pad_shape_map, False)},
-    "qfn": {**_PACKAGE, "pins_x": (_count, True), "pins_y": (_count, True),
+    "qfn": {**_PACKAGE, "pins_x": (_size, True), "pins_y": (_size, True),
             "span_x": (_positive, True), "span_y": (_positive, True)},
-    "dfn": {**_PACKAGE, "pins_per_side": (_count, True), "span": (_positive, True)},
+    "dfn": {**_PACKAGE, "pins_per_side": (_size, True), "span": (_positive, True)},
     "lcc_castellated": {**_PACKAGE,
-                        "pins": (lambda v, p, pr: _array(v, p, pr, _count, 4), True),
+                        "pins": (lambda v, p, pr: _array(v, p, pr, _size, 4), True),
                         "edge_offset": (_number, False)},
-    "sop": {**_PACKAGE, "pins": (_count, True), "span": (_positive, True)},
-    "pin_header": {"name": (_string, True), "rows": (_count, True), "cols": (_count, False),
+    "sop": {**_PACKAGE, "pins": (_size, True), "span": (_positive, True)},
+    "pin_header": {"name": (_string, True), "rows": (_size, True), "cols": (_size, False),
                    "pitch": (_positive, False), "drill": (_positive, False),
                    "pad": (_positive, False)},
     "lg290p": {},
@@ -432,6 +450,41 @@ _BUILDERS: dict[str, Builder] = {
     "lga_grid": _lga_grid, "qfn": _direct(ft.qfn), "dfn": _direct(ft.dfn),
     "lcc_castellated": _direct(ft.lcc_castellated), "sop": _direct(ft.sop),
     "pin_header": _direct(ft.pin_header), "lg290p": _direct(ft.lg290p)}
+
+
+# ---------------------------------------------------------------------------
+# Size limit (an upper bound of the pad entries, computed before building)
+# ---------------------------------------------------------------------------
+def _grid_cells(grid: ft.PadGrid | None) -> int:
+    return 0 if grid is None else len(grid.xs) * len(grid.ys)
+
+
+_PIN_ENTRIES: dict[str, Callable[[Mapping[str, Any]], int]] = {
+    "lga_grid": lambda kw: (sum(len(row.positions) for row in kw.get("edge_rows", ()))
+                            + _grid_cells(kw.get("grid"))),
+    "qfn": lambda kw: 2 * (kw["pins_x"] + kw["pins_y"]),
+    "dfn": lambda kw: 2 * kw["pins_per_side"],
+    "lcc_castellated": lambda kw: sum(kw["pins"]),
+    "sop": lambda kw: kw["pins"],
+    "pin_header": lambda kw: kw["rows"] * kw.get("cols", 1),
+    "lg290p": lambda kw: 0,                      # fixed geometry, 79 pads
+}
+
+
+def _ep_entries(ep: ft.ExposedPad | None) -> int:
+    """Copper, paste windows, thermal vias and the bottom copy of an exposed pad."""
+    if ep is None:
+        return 0
+    vias = 0 if ep.vias is None else ep.vias.nx * ep.vias.ny + 1
+    return 1 + ep.paste_grid[0] * ep.paste_grid[1] + vias
+
+
+def _check_size(template: str, kwargs: Mapping[str, Any]) -> None:
+    """FpSpecJsonError when the footprint could have more than MAX_PADS pad entries."""
+    n = _PIN_ENTRIES[template](kwargs) + _ep_entries(kwargs.get("ep"))
+    if n > MAX_PADS:
+        raise FpSpecJsonError([f"params describe up to {n} pads (copper, paste windows and "
+                               f"vias); the limit is {MAX_PADS}"])
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +527,7 @@ def spec_from_json(template: str, params: Mapping[str, Any] | str) -> FootprintS
     try:
         if kwargs is _BAD:
             raise FpSpecJsonError(problems)
+        _check_size(template, kwargs)
         return _BUILDERS[template](kwargs, problems)
     except FpSpecJsonError as e:
         raise FpSpecJsonError([f"{template}: {p}" for p in e.problems]) from None

@@ -26,7 +26,7 @@ import tline
 import toolchain as tc
 from tline import stripline as sl
 from tline.elliptic import ellipk
-from tline.types import C0, ETA0, LineGeometry, MaskModel, Ply
+from tline.types import C0, ETA0, LineGeometry, MaskModel, Ply, Verdict
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "server" / "tools"
@@ -323,6 +323,27 @@ def test_ignored_inputs_are_reported() -> None:
 def test_outside_wheeler_validity_is_class_c() -> None:
     out = tline.evaluate(centred(6.0, 0.5, 4.2))                  # W/(b-t) = 12.4 > 10
     assert out.accuracy_class == "C" and any("validity" in w for w in out.warnings)
+
+
+def test_pair_z0_is_one_convention_in_the_closed_form_and_the_fd_tier() -> None:
+    """One pair convention for D7-07's TARGET_ATTR comparisons (D7-05 review 2: the tiers once
+    differed by 20-40 %): z0 = sqrt(z_even z_odd) in pair_line_result and in
+    fieldsolve2d.FdResult (D7-06), so the tiers' z0 and z_diff agree within the closed form's
+    estimate (DSL100_sym at W_FD: FD Zdiff 100 ohm)."""
+    h = (0.5 - T_HALF_OZ) / 2
+    geom = strip(0.12702164431735333, (Ply(h, 4.2),), (Ply(h, 4.2),), pair="edge", gap=0.15)
+    out = tline.evaluate(geom)
+    assert sl.pair_line_result(72.0, 50.0, 3.0, model="m", verdict=Verdict("B", 1.0)).z0 == 60.0
+    fd2d = pytest.importorskip("fieldsolve2d")
+    if fd2d.available() == "none":
+        pytest.skip("fieldsolve2d: no numpy backend")
+    res = fd2d.solve(geom, grid="medium")
+    for r in (out, res):
+        assert r.z0 == pytest.approx(math.sqrt(r.z_even * r.z_odd), rel=1e-12)
+        assert r.z_diff == pytest.approx(2 * r.z_odd, rel=1e-12)
+    assert res.z_diff == pytest.approx(100.0, rel=0.005)
+    assert abs(out.z0 / res.z0 - 1) * 100 <= out.est_error_pct
+    assert abs(out.z_diff / res.z_diff - 1) * 100 <= out.est_error_pct
 
 
 def test_registered_kinds() -> None:

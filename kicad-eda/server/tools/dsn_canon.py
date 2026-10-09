@@ -20,6 +20,12 @@ one trailing newline). seed 0 is the canonical order:
 - structure: each run of consecutive zone entries (plane / keepout kinds)
   sorted by emitted text (KiCad writes zones on the same layers in UUID
   order); every other structure entry keeps its place;
+- duplicated image ids: KiCad names the k-th different image of one
+  footprint name ``<name>::k`` in the order it meets the footprints (a copy
+  at another rotation writes its graphics in another order, so it is another
+  image: T10 polyA has C_0603_1608Metric and C_0603_1608Metric::1). They are
+  renumbered as if the footprints were met in natural reference order, every
+  footprint keeping its image, before anything is sorted;
 - the (pcb <id>) id, which KiCad writes as the absolute DSN path, becomes
   ``name`` (default: the basename of that path), so runs in different
   directories give identical bytes.
@@ -27,10 +33,11 @@ one trailing newline). seed 0 is the canonical order:
 seed k > 0 is a deterministic alternate order for router retries: the
 footprint (reference) order random.Random(k).shuffle(<references in natural
 order>) applied the way KiCad's footprint iteration would write it (component
-groups by first reference, places in footprint order, library images by first
-use, every net's pins by footprint index then the pad's rank in its image,
-nets by their first pin). It starts from the canonical form, so it depends on
-the design and k only. footprint_order(text, seed) returns that order.
+groups by first reference, places in footprint order, duplicated image ids
+numbered and library images placed by first use, every net's pins by
+footprint index then the pad's rank in its image, nets by their first pin).
+It starts from the canonical form, so it depends on the design and k only.
+footprint_order(text, seed) returns that order.
 
 canonicalize_file(path, seed=0, name=None) rewrites the file in place
 (default name: the file's basename) and returns the sha256 of the bytes
@@ -58,6 +65,7 @@ from dsn_sexpr import DsnError
 __all__ = ["DsnError", "canonicalize", "canonicalize_file", "footprint_order", "natural_key"]
 
 _DIGITS = frozenset("0123456789")
+_DUP = "::"                             # KiCad's duplicated image id: <footprint>::<k>
 _ZONES = frozenset({"plane", "keepout", "via_keepout", "wire_keepout", "bend_keepout",
                     "elongate_keepout", "place_keepout"})
 _UNSEEN = 1 << 30                       # sorts after every real footprint index / pad rank
@@ -116,6 +124,70 @@ def _split(items: Iterable, kind: str) -> tuple[list, list]:
 
 
 # ----------------------------------------------------------------------------
+# duplicated image ids: X, X::1, X::2 ... (numbered in footprint order)
+# ----------------------------------------------------------------------------
+def _variant(name: str) -> tuple[str, int]:
+    """(footprint name, k) of an unquoted image id: KiCad names the k-th
+    different image of one footprint name <name>::k (a rotated copy's
+    graphics come out in another order, so it is a different image)."""
+    base, sep, number = name.rpartition(_DUP)
+    if sep and base and number and all(c in _DIGITS for c in number):
+        return base, int(number)
+    return name, 0
+
+
+def _first_use(tree: list, quote: str, rank: Key) -> dict[str, tuple]:
+    """image id token -> the lowest rank(reference) placed with it."""
+    first: dict[str, tuple] = {}
+    for comp in ds.children(_section(tree, "placement"), "component"):
+        keys = [rank(_name(p, quote)) for p in ds.children(comp, "place")]
+        if keys and len(comp) > 1 and isinstance(comp[1], str):
+            best = min(keys)
+            first[comp[1]] = min(best, first.get(comp[1], best))
+    return first
+
+
+def _variant_ids(tree: list, quote: str, rank: Key) -> dict[str, str]:
+    """old -> new image id token: each footprint's images numbered X, X::1,
+    ... by their first footprint in rank order (as KiCad would number them
+    meeting the footprints in that order; an image no footprint uses comes
+    after, by content). The tokens are reused, so quoting stays KiCad's."""
+    first = _first_use(tree, quote, rank)
+    groups: dict[str, list[list]] = {}
+    for image in ds.children(_section(tree, "library"), "image"):
+        if len(image) > 1 and isinstance(image[1], str):
+            groups.setdefault(_variant(ds.unquote(image[1], quote))[0], []).append(image)
+    renames: dict[str, str] = {}
+    for images in groups.values():
+        ids = [im[1] for im in images]
+        if len(set(ids)) < 2 or len(set(ids)) < len(ids):
+            continue
+        body = {im[1]: ds.emit(["image", *im[2:]]) for im in images}
+        ordered = sorted(ids, key=lambda t: (0, first[t], body[t]) if t in first
+                         else (1, (), body[t]))
+        numbered = sorted(ids, key=lambda t: _variant(ds.unquote(t, quote))[1])
+        renames.update(zip(ordered, numbered, strict=True))
+    return renames
+
+
+def _renumbered(tree: list, quote: str, rank: Key) -> list:
+    """`tree` with its duplicated image ids renumbered (see _variant_ids) in
+    the library and the placement."""
+    renames = _variant_ids(tree, quote, rank)
+    if not renames:
+        return tree
+    kinds = {"placement": "component", "library": "image"}
+
+    def fix(item: object, kind: str) -> object:
+        if (isinstance(item, list) and _head(item) == kind and len(item) > 1
+                and isinstance(item[1], str) and item[1] in renames):
+            return [kind, renames[item[1]], *item[2:]]
+        return item
+    return [[x[0], *(fix(y, kinds[x[0]]) for y in x[1:])] if _head(x) in kinds else x
+            for x in tree]
+
+
+# ----------------------------------------------------------------------------
 # seed 0: the canonical order
 # ----------------------------------------------------------------------------
 def _canon_component(comp: list, quote: str) -> list:
@@ -165,6 +237,7 @@ _SECTIONS: dict[str, Callable[[list, str], list]] = {
 
 
 def _canonical(tree: list, quote: str) -> list:
+    tree = _renumbered(tree, quote, natural_key)       # as if met in natural reference order
     return [_SECTIONS[_head(x)](x, quote) if _head(x) in _SECTIONS else x for x in tree]
 
 
@@ -270,6 +343,8 @@ def _permute_network(section: list, model: _Model) -> list:
 def _permuted(tree: list, quote: str, order: Sequence[str]) -> list:
     """The canonical `tree` rewritten in the footprint `order` (stable sorts:
     whatever the order does not decide stays canonical)."""
+    index = {ref: k for k, ref in enumerate(order)}
+    tree = _renumbered(tree, quote, lambda ref: (index.get(ref, _UNSEEN),))
     model = _Model(tree, quote, order)
     placement = _permute_placement(_section(tree, "placement"), model)
     used = {_name(c, quote): k

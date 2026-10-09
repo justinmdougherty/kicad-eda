@@ -1,8 +1,7 @@
-"""Auto-placement fields on arbitrary board outlines (ROADMAP_DECISIONS D2); stdlib only (KiCad's
-Python 3.11 imports it). A field is the axis-aligned rectangle (board frame, mm, Y down) one side's
-auto parts are packed into. legacy_fields: fixed w x h boards, bit-identical to swig_build_board.py
-(6a8f94d). auto_fields: a legacy rect, explicit auto_* (clipped to the board with a warning) or the
-largest inscribed rectangle minus mounting-hole keepouts. snap_to_edge: slide a part to the edge."""
+"""Auto-placement fields on board outlines (ROADMAP_DECISIONS D2); stdlib only (KiCad Python 3.11).
+A field is the axis-aligned rect (board frame, mm, Y down) one side's auto parts pack into:
+legacy_fields (w x h boards, bit-identical to swig_build_board.py at 6a8f94d), auto_fields (legacy,
+explicit auto_* clipped to the board with a warning, or the largest inscribed rect minus holes)."""
 from __future__ import annotations
 
 import dataclasses
@@ -234,6 +233,11 @@ def _cell_free(o: ol.Outline, cell: Rect, clearance: float) -> bool:
 def _clip(o: ol.Outline, rect: Rect, clearance: float) -> Rect | None:
     """Largest rectangle inside `rect` on the board with `clearance`, or None: the best
     block of on-board grid cells, pushed out x sides first and y first (larger wins)."""
+    bb = ol.bbox(o)               # grid only the part of the request the board can reach
+    rect = (max(rect[0], bb[0] + clearance), max(rect[1], bb[1] + clearance),
+            min(rect[2], bb[2] - clearance), min(rect[3], bb[3] - clearance))
+    if rect[0] >= rect[2] or rect[1] >= rect[3]:
+        return None
     xs = _lines(rect[0], rect[2], _edge_lines(o, rect, clearance, 0), _CLIP_CELLS)
     ys = _lines(rect[1], rect[3], _edge_lines(o, rect, clearance, 1), _CLIP_CELLS)
     free = [[_cell_free(o, (xa, ya, xb, yb), clearance) for xa, xb in pairwise(xs)]
@@ -301,17 +305,16 @@ def _inscribed_fields(o: ol.Outline, clearance: float,
 def auto_fields(board_block: Mapping | None, outline: ol.Outline | None,
                 edge_clearance: float, mounting_holes: Sequence = (), *,
                 scale: float = 1.0, has_conn: bool = False) -> tuple[list[Field], list[str]]:
-    """(fields F first then B, warnings) for a board block; see the module doc. `outline`
-    is the resolved outline (None: built from the block; resolve a DXF first);
-    `mounting_holes` = [(x, y[, drill = 3.2])] for case (3); scale / has_conn as legacy."""
+    """([F, B] fields, warnings): (1) a legacy block (whatever `outline` is): legacy_fields;
+    (2) explicit auto_*: kept or clipped to `outline` (None: built from the block; resolve a
+    DXF first); (3) the inscribed rect minus mounting_holes [(x, y[, drill 3.2])] keepouts."""
     block = _block(board_block)
     clearance = _num(edge_clearance, "edge_clearance", lo=0.0)
     holes = [_hole_box(i, hole) for i, hole in enumerate(mounting_holes or ())]
     if is_legacy_block(block):
         if block.get("w") is None or block.get("h") is None:
             return [], []                   # auto-sized board: the builder sizes it to fit
-        return legacy_fields(block, block["w"], block["h"], scale=scale,
-                             has_conn=has_conn), []
+        return legacy_fields(block, block["w"], block["h"], scale=scale, has_conn=has_conn), []
     o = outline if outline is not None else ol.from_board_block(block)
     if any(block.get(k) not in (None, {}) for k in AUTO_KEYS):
         return _explicit_fields(block, o, clearance, scale, has_conn)
@@ -336,11 +339,9 @@ def snap_to_edge(outline: ol.Outline, center: Sequence[float], mouth_dir: object
     the Y-down board frame, or a vector) until its courtyard edge that way (half_extent_along_dir
     from the centre) sits `clearance` inside the first edge the ray from `center` crosses, or
     `overhang` past it if > 0. None if no edge lies ahead (a ray miss; centre off the board)."""
-    c = _point(center, "center")
-    d = _direction(mouth_dir)
+    c, d = _point(center, "center"), _direction(mouth_dir)
     half = _num(half_extent_along_dir, "half_extent_along_dir", lo=0.0)
-    over = _num(overhang, "overhang", lo=0.0)
-    gap = _num(clearance, "clearance", lo=0.0)
+    over, gap = _num(overhang, "overhang", lo=0.0), _num(clearance, "clearance", lo=0.0)
     hit = ol.ray_to_edge(outline, c, d)
     if hit is None or hit.normal[0] * d[0] + hit.normal[1] * d[1] <= 0.0:
         return None

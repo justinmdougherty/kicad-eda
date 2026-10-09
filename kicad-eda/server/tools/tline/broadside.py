@@ -39,7 +39,7 @@ and RO4350B/RO4450F builds); Er contrast over 10 % is class C, as are unequal ou
 Geometry: `above` = plies from the upper strip to its plane (outward); `below` = the face-gap
 plies (summing to `pair_gap`), then the plies from the lower strip to its plane; both strips
 are `width` x `t`. Pair results as in stripline.pair_line_result (z0 = sqrt(z_even z_odd),
-est_error_pct refers to z_diff). Quasi-TEM: no dispersion.
+as fieldsolve2d.FdResult; est_error_pct refers to z_diff). Quasi-TEM: no dispersion.
 Registers ('stripline', 'broadside').
 """
 from __future__ import annotations

@@ -42,7 +42,7 @@ from tline.types import C0, EPS0, LineGeometry
 BACKENDS = ("scipy", "numpy")
 BUDGET_ENV = "KICAD_EDA_FD_BUDGET_S"
 DEFAULT_BUDGET_S = 300.0
-FD_VERSION = "fd2d-2"         # part of the cache key: bump when the numerics change
+FD_VERSION = "fd2d-3"         # part of the cache key: bump when the numerics or results change
 H_SCALE_REF_MM = 0.2104       # the research grids were tuned on 7628 (h 0.2104); thicker
 H_SCALE_CAP_MM = 0.6          # substrates scale the largest cell up to 0.6 / 0.2104 (fd_eval)
 X_TOL_MM = 1e-9
@@ -55,6 +55,7 @@ PAIR_TARGETS = ("zdiff", "zeven", "zodd", "zcomm")
 SOLVE_FOR = ("width", "pair_gap", "ground_gap")
 SLOPE_GUESS = {"width": -0.8, "pair_gap": 0.3, "ground_gap": 0.3}  # dlnZ/dln(x), first step
 FALLING_WITH_PAIR_GAP = ("zeven", "zcomm")   # less coupling lowers the even / common mode Z
+FLAT_IN_PAIR_GAP = ("z0",)    # a pair's sqrt(z_even z_odd) is nearly flat in the gap
 MAX_STEP_LN = math.log(2.0)   # one synthesis step changes the dimension by at most 2x
 VALUE_BOUNDS_MM = (1e-3, 50.0)
 
@@ -86,10 +87,12 @@ GRIDS: Mapping[str, GridSpec] = {"medium": GridSpec(5e-4, 0.02, 1.08),
 
 @dataclass(frozen=True)
 class FdResult:
-    """One FD evaluation. Single lines: z0 / eeff. Pairs, as tline's LineResult
-    (stripline.pair_line_result): z0 = z_odd, eeff = the odd (differential) mode's,
-    z_diff = 2 z_odd, z_comm = z_even / 2 (+ eeff_even / eeff_odd).
-    box_spread: half the Dirichlet-Neumann difference of the reported impedance (0 if closed)."""
+    """One FD evaluation. Single lines: z0 / eeff. Pairs, in the one convention shared with
+    tline's LineResult (stripline.pair_line_result): z0 = sqrt(z_even z_odd) (the coupler Z0
+    of Rogers note 3.2.1), z_diff = 2 z_odd, z_comm = z_even / 2, eeff = the odd
+    (differential) mode's (+ eeff_even / eeff_odd).
+    box_spread (ohm): half the Dirichlet-Neumann difference of z0 for a single line and of
+    z_diff for a pair (the quantity a pair's est_error_pct refers to); 0 for a closed box."""
 
     z0: float
     eeff: float
@@ -425,7 +428,7 @@ def _result(modes: dict, cells: int, seconds: float, backend: str, grid: str) ->
         z, eeff, spread = modes["se"]
         return FdResult(z, eeff, None, None, None, cells, seconds, backend, grid, box_spread=spread)
     (ze, ee, _), (zo, eo, spread) = modes["even"], modes["odd"]
-    return FdResult(zo, eo, ze, zo, 2.0 * zo, cells, seconds, backend, grid,
+    return FdResult(math.sqrt(ze * zo), eo, ze, zo, 2.0 * zo, cells, seconds, backend, grid,
                     z_comm=ze / 2.0, eeff_even=ee, eeff_odd=eo, box_spread=2.0 * spread)
 
 
@@ -462,6 +465,7 @@ def _check_synthesis(geom: LineGeometry, target: float, target_kind: str, solve_
         raise ValueError(f"solve_for must be one of {SOLVE_FOR}, got {solve_for!r}")
     if solve_for == "pair_gap" and geom.pair != "edge":
         raise ValueError("solve_for 'pair_gap' needs an edge-coupled pair")
+    _check_pair_gap_target(solve_for, target_kind)
     if not (isinstance(start, (int, float)) and math.isfinite(start) and start > 0):
         raise ValueError(f"seed for {solve_for} must be > 0 mm, got {start!r}")
     if not (isinstance(max_solves, int) and max_solves >= 1):
@@ -477,10 +481,18 @@ def _bounds_ln(geom: LineGeometry, solve_for: str) -> tuple[float, float]:
     return math.log(lo), math.log(hi)
 
 
+def _check_pair_gap_target(solve_for: str, target_kind: str) -> None:
+    if solve_for == "pair_gap" and target_kind in FLAT_IN_PAIR_GAP:
+        raise ValueError(f"target_kind {target_kind!r} cannot set solve_for 'pair_gap': a pair's "
+                         "z0 = sqrt(z_even z_odd) is nearly flat in the gap and never exceeds "
+                         "the uncoupled line's Z0; target zdiff, zodd, zeven or zcomm")
+
+
 def slope_guess(solve_for: str, target_kind: str) -> float:
     """First-step d ln Z / d ln(dimension), whose sign is also the accepted secant sign: Z falls
-    with the width and rises with a ground gap; with the pair gap it rises for z0 / zodd /
-    zdiff (less coupling) but falls for zeven / zcomm."""
+    with the width and rises with a ground gap; with the pair gap it rises for zodd / zdiff
+    (less coupling) but falls for zeven / zcomm (z0 with the pair gap: ValueError)."""
+    _check_pair_gap_target(solve_for, target_kind)
     guess = SLOPE_GUESS[solve_for]
     if solve_for == "pair_gap" and target_kind in FALLING_WITH_PAIR_GAP:
         return -guess
@@ -522,7 +534,8 @@ def synthesize_fd(geom: LineGeometry, target: float, target_kind: str, solve_for
                   backend: str | None = None) -> tuple[LineGeometry, FdResult | None, dict]:
     """FD synthesis of one dimension (`width`, `pair_gap` or `ground_gap`; a ground gap puts
     same-layer ground beside any kind) for a target impedance (`target_kind` z0 | zdiff |
-    zeven | zodd | zcomm; z0 of a pair = z_odd), seeded by the caller's closed form or fallback
+    zeven | zodd | zcomm; z0 of a pair = sqrt(z_even z_odd) as in tline, refused with
+    `pair_gap` where it is nearly flat), seeded by the caller's closed form or fallback
     (`seed`, default the geometry's current value). Secant in log space; stops when
     |Z / target - 1| <= tol_pct %, after max_solves evaluations, or before one the budget
     cannot cover. The geometry at the seed is validated first (ValueError) even when the

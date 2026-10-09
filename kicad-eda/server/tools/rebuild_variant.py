@@ -31,7 +31,8 @@ caller's `pad_summary` ("Nick:Name" -> summary, None when not found; it may
 raise OSError / ValueError for a file it cannot read). A board-only part whose
 footprint is not found, and any part whose footprint file cannot be read, is
 kept with a note (the note gives the reason). Malformed ``nets`` /
-``no_connect`` raise ValueError (design_paths.check_records).
+``no_connect`` / ``assumptions`` (each an object with an ``id``) / ``variant``
+raise ValueError in both modes (design_paths.check_records).
 
 Pure (returns new dicts, never mutates its input). Stdlib + outline (D2
 geometry); outline_resolve / dxf_io only to check keep_refs against a DXF.
@@ -73,7 +74,8 @@ CONFIDENCE = "med"
 NETLIST_FILE = "netlist.json"
 MOUNTING_HOLE_WORD = "mountinghole"             # KiCad's MountingHole:* naming, any case
 FRAME_KEYS = ("height_zones", "antenna_keepout")   # coordinates in the source board frame
-RECORD_KEYS = ("nets", "no_connect")            # read by shape; the rest is type-guarded
+# read by shape (design_paths.check_records); net_specs / power_flags are type-guarded
+RECORD_KEYS = ("nets", "no_connect", "assumptions", "variant")
 
 PadSummary = Callable[[str], "Mapping[str, Any] | None"]
 Draft = tuple[str, str, str]                    # assumption (topic, value, rationale)

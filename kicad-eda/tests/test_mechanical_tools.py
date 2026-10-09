@@ -62,15 +62,19 @@ END-ISO-10303-21;
 # --- fakes and builders -------------------------------------------------------------------
 class FakeCli:
     """Stands in for toolchain.run: records every call, answers --help with
-    `help_text` and writes the -o file through `write` (None = writes nothing)."""
+    `help_text` (or raises `help_exc`) and writes the -o file through `write`
+    (None = writes nothing)."""
 
     def __init__(self, write=None, help_text: str = DXF_HELP, rc: int = 0,
-                 output: str = "Done.\n") -> None:
+                 output: str = "Done.\n", help_exc: Exception | None = None) -> None:
         self.write, self.help_text, self.rc, self.output = write, help_text, rc, output
+        self.help_exc = help_exc
         self.calls: list[tuple[list[str], dict]] = []
 
     def __call__(self, args: list[str], **kw) -> subprocess.CompletedProcess:
         self.calls.append((list(args), kw))
+        if "--help" in args and self.help_exc is not None:
+            raise self.help_exc
         if "--help" in args:
             return subprocess.CompletedProcess(args, 1, self.help_text, "")
         if self.write is not None:
@@ -567,6 +571,38 @@ def test_dxf_command_never_uses_contours():
     assert args == [CLI, *DXF_CMD, "o.dxf", "b.kicad_pcb"] and warnings == [] and mm is True
     args, warnings, _mm = mx.dxf_command(CLI, "b.kicad_pcb", "o.dxf", "")
     assert args[:-3] == [CLI, *DXF_CMD[:-1]] and warnings      # unreadable help: keep every flag
+    _args, warnings, _mm = mx.dxf_command(CLI, "b.kicad_pcb", "o.dxf", "", "it timed out")
+    assert len(warnings) == 1 and "--help" in warnings[0] and "it timed out" in warnings[0]
+
+
+def _help_runner(result):
+    def run(args: list[str], **kw) -> subprocess.CompletedProcess:
+        if isinstance(result, Exception):
+            raise result
+        return subprocess.CompletedProcess(args, 1, result, "")
+    return run
+
+
+@pytest.mark.parametrize("result, text, why", [
+    ("Usage: dxf\n", "Usage: dxf\n", None),
+    ("", "", "printed nothing"),
+    (subprocess.TimeoutExpired(["kicad-cli"], 60), "", "timed out"),
+    (FileNotFoundError(2, "No such file"), "", "No such file"),
+])
+def test_cli_help_returns_the_text_or_why_it_could_not_run(result, text, why):
+    got_text, got_why = mx.cli_help(_help_runner(result), CLI, ("pcb", "export", "dxf"))
+    assert got_text == text
+    assert got_why is None if why is None else why in got_why
+
+
+def test_export_outline_dxf_warning_says_why_the_help_was_unreadable(monkeypatch, t10_pcb):
+    fake = _cli(monkeypatch, write=_dxf_writer(T10_BOARD),
+                help_exc=subprocess.TimeoutExpired(["kicad-cli"], 60))
+    out = t10_pcb.with_name("edge.dxf")
+    res = mt.export_outline_dxf(str(t10_pcb), str(out))
+    assert res["ok"] is True, res
+    assert fake.jobs == [[CLI, *DXF_CMD, str(out), str(t10_pcb)]]      # every flag kept
+    assert [w for w in res["warnings"] if "--help" in w and "timed out" in w], res["warnings"]
 
 
 def test_hausdorff_is_symmetric_and_exact_on_offsets():
@@ -667,3 +703,57 @@ def test_validate_without_a_board_block_is_ok_with_a_warning(tmp_path):
     res = mt.validate_board_outline(str(netlist))
     assert res["ok"] is True and res["source"] == "none"
     assert _codes(res["warnings"]) == ["no_board_outline"]
+
+
+# --- malformed netlists: every tool still answers {ok, ...} -----------------------------------
+@pytest.mark.parametrize("holes, why", [
+    ({"positions": [1, 2]}, "positions[0]"),
+    ({"positions": [[5, 20], [1, "x"]]}, "positions[1]"),
+    ({"positions": 5}, "positions must be a list"),
+    ({"inset": None}, "inset"),
+    ({"inset": "4", "positions": [[5, 20]]}, "inset"),
+])
+def test_validate_reports_a_malformed_mounting_holes_block(holes, why, tmp_path):
+    netlist = _netlist(tmp_path, {"w": 60, "h": 40}, components=[], mounting_holes=holes)
+    res = mt.validate_board_outline(str(netlist))
+    found = [i for i in res.get("errors", []) if i["code"] == "mounting_holes_spec"]
+    assert res["ok"] is False and len(found) == 1 and why in found[0]["message"], res
+
+
+@pytest.mark.parametrize("tool", ["validate", "import"])
+def test_components_that_are_not_a_list_are_not_ok(tool, tmp_path):
+    _t10_dxf(tmp_path / "t10.dxf")
+    netlist = _netlist(tmp_path, dict(T10_BOARD), components=5)
+    before = netlist.read_bytes()
+    res = (mt.validate_board_outline(str(netlist)) if tool == "validate" else
+           mt.import_outline_dxf(str(netlist), "t10.dxf", parts={"J1": [0, 0, 0]}))
+    assert res["ok"] is False and "components must be a list" in res["reason"], res
+    assert netlist.read_bytes() == before
+
+
+def test_import_without_parts_leaves_the_components_alone(tmp_path):
+    _t10_dxf(tmp_path / "t10.dxf")
+    netlist = _netlist(tmp_path, components=5)
+    res = mt.import_outline_dxf(str(netlist), "t10.dxf")
+    assert res["ok"] is True and _read(netlist)["components"] == 5, res
+
+
+def test_components_with_odd_refs_do_not_break_the_tools(tmp_path):
+    _t10_dxf(tmp_path / "t10.dxf")
+    odd = [{"ref": ["J", 1], "footprint": "a:b", "at": [15, 20, 0]}, "not a component",
+           {"ref": "U1", "lib_id": "a:b", "footprint": "a:b", "at": [15, 20, 0]}]
+    netlist = _netlist(tmp_path, dict(T10_BOARD), components=odd)
+    assert mt.validate_board_outline(str(netlist))["ok"] is True
+    res = mt.import_outline_dxf(str(netlist), "t10.dxf", parts={"U1": [5, 5, 90]})
+    assert res["ok"] is True, res
+    assert _read(netlist)["components"] == [*odd[:2], {**odd[2], "at": [15.0, 25.0, 90.0]}]
+
+
+def test_an_unexpected_type_error_is_still_not_ok(monkeypatch, tmp_path):
+    def boom(*_a, **_k):
+        raise TypeError("'int' object is not iterable")
+
+    monkeypatch.setattr(mx, "part_issues", boom)
+    res = mt.validate_board_outline(str(_netlist(tmp_path, dict(T10_BOARD))))
+    assert res["ok"] is False and res["reason"].startswith("malformed"), res
+    assert "not iterable" in res["reason"]

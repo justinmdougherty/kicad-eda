@@ -21,8 +21,9 @@ over 10 % is C; edge pairs with copper thickness are B (exact Cohn at t = 0 is A
 Dual stripline (critique M1): a signal layer between the trace and a plane is dielectric of its
 adjacent prepreg's Er (dielectric_copper_ply; listed by name in geom.dielectric_copper) under
 the orthogonal-routing assumption; never better than B, and C unless symmetric within 5 %.
-Pair results (as fieldsolve2d.FdResult): z0 = sqrt(z_even z_odd), z_diff = 2 z_odd,
-z_comm = z_even / 2, eeff / delay of the odd mode; est_error_pct refers to z_diff.
+Pair results (pair_line_result; fieldsolve2d.FdResult uses the same): z0 = sqrt(z_even z_odd),
+z_diff = 2 z_odd, z_comm = z_even / 2, eeff / delay of the odd mode; est_error_pct refers to
+z_diff.
 Registers ('stripline' | 'dual_stripline', 'single' | 'edge').
 """
 from __future__ import annotations
@@ -281,9 +282,11 @@ def _model_name(base: str, s: Sides, dual: bool) -> str:
 # ---------------------------------------------------------------- models
 def pair_line_result(z_even: float, z_odd: float, eeff_odd: float, *, model: str,
                      verdict: Verdict, eeff_odd_f: float | None = None) -> LineResult:
-    """LineResult of a coupled pair, in the FD tier's convention (fieldsolve2d.FdResult):
-    z0 = sqrt(z_even z_odd), z_diff = 2 z_odd, z_comm = z_even / 2, eeff / eeff_f / delay of
-    the odd (differential) mode."""
+    """LineResult of a coupled pair: z0 = sqrt(z_even z_odd) (the coupler Z0 of Rogers note
+    3.2.1), z_diff = 2 z_odd, z_comm = z_even / 2, eeff / eeff_f / delay of the odd
+    (differential) mode. fieldsolve2d.FdResult (D7-06) uses the same convention, so a pair's z0
+    means the same in both tiers (tests/test_tline_stripline.py and test_fieldsolve2d.py check
+    it across the tiers)."""
     eeff_f = eeff_odd if eeff_odd_f is None else eeff_odd_f
     return LineResult(z0=math.sqrt(z_even * z_odd), eeff=eeff_odd, eeff_f=eeff_f,
                       z_even=z_even, z_odd=z_odd,

@@ -14,6 +14,9 @@ Skipped without a KiCad install whose bundled Python imports pcbnew.
   order. The test tries a few layouts until the raw footprint order really
   differs (deterministic while the seeding stays; a 23/24 chance per try if
   UUIDs were random again).
+- The same design with C2 at 90 deg: KiCad writes two C_0603 images and
+  names the one it meets second <footprint>::1, so the raw naming follows the
+  UUID order; builds with both namings canonicalise to identical bytes.
 """
 from __future__ import annotations
 
@@ -66,16 +69,18 @@ def test_live_modules_import_and_agree_under_kicad_python(seed: int) -> None:
     assert digest == hashlib.sha256(expected.encode("utf-8")).hexdigest()
 
 
-def _build_and_export(work: Path, kpy: str, indent: int | None) -> tuple[str, Path]:
-    """examples/lm358_buffer built into `work` and exported; (raw DSN, path).
-    indent None copies the example's bytes; an int re-serialises the same
-    design with that JSON indent (other bytes, so other footprint UUIDs)."""
+def _build_and_export(work: Path, kpy: str, indent: int | None,
+                      design: dict | None = None) -> tuple[str, Path]:
+    """`design` (default: examples/lm358_buffer) built into `work` and
+    exported; (raw DSN, path). The example with indent None is copied byte for
+    byte; otherwise the design is serialised with that JSON indent (other
+    bytes, so other footprint UUIDs)."""
     work.mkdir()
     netlist = work / "netlist.json"
-    if indent is None:
+    if design is None and indent is None:
         shutil.copyfile(EXAMPLE, netlist)
     else:
-        design = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        design = design or json.loads(EXAMPLE.read_text(encoding="utf-8"))
         netlist.write_text(json.dumps(design, indent=indent) + "\n", encoding="utf-8")
     pcb = work / "netlist.kicad_pcb"
     built = bpt.build_board_from_netlist(str(netlist), 50, 25, out_pcb=str(pcb))
@@ -101,6 +106,14 @@ def _body(raw: str) -> str:
     return raw.split("\n", 1)[1]
 
 
+def _exported_order(raw: str) -> list[str]:
+    """The references in the order the raw export writes their places (the
+    footprint order KiCad iterated)."""
+    placement = ds.find(ds.parse(raw), "placement") or []
+    return [p[1] for comp in ds.children(placement, "component")
+            for p in ds.children(comp, "place")]
+
+
 def test_live_two_builds_canonicalise_to_identical_bytes(tmp_path: Path) -> None:
     kpy = require_kicad_python()
     raw_a, dsn_a = _build_and_export(tmp_path / "a", kpy, None)
@@ -109,9 +122,11 @@ def test_live_two_builds_canonicalise_to_identical_bytes(tmp_path: Path) -> None
         work = tmp_path / f"b{indent}"
         raw_b, dsn_b = _build_and_export(work, kpy, indent)
         tried.append(indent)
-        if _body(raw_b) != _body(raw_a):
+        if _exported_order(raw_b) != _exported_order(raw_a):
             break
-    assert _body(raw_b) != _body(raw_a), f"every layout {tried} exported the same order"
+    order_a, order_b = _exported_order(raw_a), _exported_order(raw_b)
+    assert order_a != order_b, f"every layout {tried} exported the footprints in one order"
+    assert sorted(order_a) == sorted(order_b) and _body(raw_a) != _body(raw_b)
     uuids_a = _footprint_uuids(tmp_path / "a" / "netlist.kicad_pcb")
     uuids_b = _footprint_uuids(work / "netlist.kicad_pcb")
     assert len(uuids_a) == 4 and set(uuids_a).isdisjoint(uuids_b)   # independent UUIDs
@@ -122,5 +137,38 @@ def test_live_two_builds_canonicalise_to_identical_bytes(tmp_path: Path) -> None
     for seed in (1, 2):
         assert dc.canonicalize(raw_a, seed=seed) == dc.canonicalize(raw_b, seed=seed)
         assert dc.canonicalize(raw_a, seed=seed, name="netlist.dsn") != canon
-    print(json.dumps({"sha256": sha_a, "layouts_tried": tried, "kicad_python": kpy,
-                      "pcbnew": tc.kicad_python()}))
+    print(json.dumps({"sha256": sha_a, "layouts_tried": tried, "raw_orders": [order_a, order_b],
+                      "kicad_python": kpy, "pcbnew": tc.kicad_python()}))
+
+
+def _image_of(raw: str) -> dict[str, str]:
+    """reference -> the image id its placement component names."""
+    placement = ds.find(ds.parse(raw), "placement") or []
+    return {p[1]: comp[1] for comp in ds.children(placement, "component")
+            for p in ds.children(comp, "place")}
+
+
+def test_live_rotated_duplicates_canonicalise_to_identical_bytes(tmp_path: Path) -> None:
+    """C2 at 90 deg: KiCad writes a second C_0603 image and names the one it
+    meets second <footprint>::1, so which capacitor carries the suffix follows
+    the UUID order; the canonical DSN names them by reference (C1 first)."""
+    kpy = require_kicad_python()
+    example = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    design = {**example, "components": [{**c, "rot": 90} if c["ref"] == "C2" else c
+                                        for c in example["components"]]}
+    by_naming: dict[str, Path] = {}
+    for indent in (None, 1, 2, 3, 4, 5, 6, 7, 8):
+        raw, dsn = _build_and_export(tmp_path / f"r{indent}", kpy, indent, design)
+        images = _image_of(raw)
+        assert images["C1"] != images["C2"], images       # two different C_0603 images
+        by_naming.setdefault(images["C1"], dsn)
+        if len(by_naming) == 2:
+            break
+    assert len(by_naming) == 2, f"C1 always used {list(by_naming)}: the order never flipped"
+    first, second = by_naming.values()
+    assert dc.canonicalize_file(first) == dc.canonicalize_file(second)
+    assert first.read_bytes() == second.read_bytes()
+    footprint = next(c["footprint"] for c in example["components"] if c["ref"] == "C1")
+    canon = _image_of(first.read_text(encoding="utf-8"))
+    assert (canon["C1"], canon["C2"]) == (footprint, f"{footprint}::1")
+    print(json.dumps({"raw_C1_images": list(by_naming), "canonical": canon}))

@@ -37,13 +37,17 @@ origin) by the Hausdorff distance of their edges.
 Netlist edits (pure, never mutating their inputs): dxf_board (the board block
 a DXF import writes, with notes on what it replaced), fusion_anchors (Fusion
 part positions -> D3 ``at``) and with_anchors (the new design).
+component_list turns a ``components`` value that is not a list into a
+ValueError; fusion_anchors / with_anchors leave a component without a str
+``ref`` untouched.
 
 Fixed-part checks (outline_audit Issues, board frame): part_issues (an
 ``at`` / x-y anchor inside a cutout or off the board is an error, within
 NEAR_EDGE_MM of an edge a warning, ``overhang`` allows hanging over the outer
 edge) and hole_issues (mounting holes judged by their drill circle through
 outline_audit.mounting_hole_issues; default bbox-corner holes need a
-rectangular board).
+rectangular board; a malformed ``inset`` or position is a
+``mounting_holes_spec`` error, the builder could not place it).
 
 Venv only (kicad_import_pcb needs sexpdata); never imported by KiCad's Python.
 """
@@ -69,10 +73,10 @@ from outline_geom import closest_point  # noqa: E402
 from outline_model import PrimIndex, all_prims  # noqa: E402
 
 __all__ = ["CLI_TIMEOUT_S", "DXF_FLAGS", "HAUSDORFF_TOL_MM", "NEAR_EDGE_MM", "CliFlag",
-           "CliRun", "StepScanError", "board_file_outline", "cli_help", "csv_rows",
-           "dxf_board", "dxf_command", "error_lines", "frame_hausdorff", "fusion_anchors",
-           "hausdorff", "hole_issues", "log_warnings", "part_issues", "pos_command", "run_cli",
-           "step_bbox", "step_command", "with_anchors"]
+           "CliRun", "StepScanError", "board_file_outline", "cli_help", "component_list",
+           "csv_rows", "dxf_board", "dxf_command", "error_lines", "frame_hausdorff",
+           "fusion_anchors", "hausdorff", "hole_issues", "log_warnings", "part_issues",
+           "pos_command", "run_cli", "step_bbox", "step_command", "with_anchors"]
 
 CLI_TIMEOUT_S = 600.0            # one export (a STEP with every 3D model can take minutes)
 HELP_TIMEOUT_S = 60.0
@@ -115,15 +119,19 @@ def _listed(help_text: str, names: Iterable[str]) -> bool:
     return any(re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", help_text) for n in names)
 
 
-def dxf_command(cli: str, pcb: str, out: str, help_text: str) -> tuple[list[str], list[str], bool]:
+def dxf_command(cli: str, pcb: str, out: str, help_text: str,
+                why: str | None = None) -> tuple[list[str], list[str], bool]:
     """(args, warnings, mm): the outline DXF export with every DXF_FLAGS entry
-    the help text lists (an unreadable help keeps them all, with a warning);
-    ``mm`` is False when --ou was dropped (the DXF then has kicad-cli's
-    default unit, inches, and must be read by its header)."""
+    the help text lists (an unreadable help keeps them all, with a warning
+    that gives ``why``, cli_help's reason); ``mm`` is False when --ou was
+    dropped (the DXF then has kicad-cli's default unit, inches, and must be
+    read by its header)."""
     if not help_text.strip():
         args = [a for flag in DXF_FLAGS for a in flag.args]
+        because = f" ({why})" if why else ""
         return ([cli, "pcb", "export", "dxf", *args, "-o", out, pcb],
-                ["could not read 'kicad-cli pcb export dxf --help'; ran with every flag"], True)
+                [f"could not read 'kicad-cli pcb export dxf --help'{because}; ran with every "
+                 "flag"], True)
     args, warnings, mm = [cli, "pcb", "export", "dxf"], [], True
     for flag in DXF_FLAGS:
         if _listed(help_text, flag.names):
@@ -185,11 +193,15 @@ def _call(runner: Runner, command: Sequence[str], timeout: float
 
 
 def cli_help(runner: Runner, cli: str, verb: Sequence[str],
-             timeout: float = HELP_TIMEOUT_S) -> str:
-    """``kicad-cli <verb> --help`` as text ('' when it cannot run; KiCad 9
-    exits 1 after printing the help, so the rc is ignored)."""
-    proc, _reason = _call(runner, [cli, *verb, "--help"], timeout)
-    return "" if proc is None else (proc.stdout or "") + (proc.stderr or "")
+             timeout: float = HELP_TIMEOUT_S) -> tuple[str, str | None]:
+    """(text, why): ``kicad-cli <verb> --help`` as text and None, or '' and
+    why it could not be read (a timeout, a failed start, no output). KiCad 9
+    exits 1 after printing the help, so the rc is ignored."""
+    proc, reason = _call(runner, [cli, *verb, "--help"], timeout)
+    if proc is None:
+        return "", reason
+    text = (proc.stdout or "") + (proc.stderr or "")
+    return (text, None) if text.strip() else ("", f"it printed nothing (rc {proc.returncode})")
 
 
 def _stamp(path: Path) -> tuple[int, int] | None:
@@ -463,6 +475,24 @@ def _r6(v: float) -> float:
     return round(float(v), 6) + 0.0
 
 
+def component_list(value: object) -> list:
+    """A netlist's ``components`` value as a list (None: no components).
+    Raises ValueError for anything else, so a malformed netlist is reported
+    instead of failing somewhere inside a check."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("the netlist's components must be a list of component objects, got "
+                         f"{type(value).__name__} {value!r:.60}")
+    return value
+
+
+def _ref(comp: object) -> str | None:
+    """A component's reference when it is one (a str), else None."""
+    ref = comp.get("ref") if isinstance(comp, Mapping) else None
+    return ref if isinstance(ref, str) else None
+
+
 def dxf_board(board: object, geometry: Mapping[str, Any]) -> tuple[dict, list[str]]:
     """The new board block: `geometry` (a {"outline": {"dxf": ...}} reference
     or a BoardOutline.to_board_block()) plus the old block's other keys
@@ -491,13 +521,17 @@ def _current_rot(comp: Mapping) -> float:
 
 
 def fusion_anchors(parts: Mapping, datum: Sequence[float],
-                   components: Iterable[Any]) -> dict[str, list[float]]:
+                   components: object) -> dict[str, list[float]]:
     """{ref: [x, y, rot]} D3 ``at`` anchors (board frame) from Fusion-frame
     positions {ref: [x, y, rot]} (mm, Y up, origin = the datum): x/y through
     outline.external_to_board, rot unchanged (Fusion CCW-positive in a Y-up
     frame is KiCad's displayed sense); [x, y] keeps the part's current
-    rotation. Raises ValueError for an unknown ref or a malformed entry."""
-    comps = {c.get("ref"): c for c in components if isinstance(c, Mapping)}
+    rotation. ``components`` (the netlist's value) is read only when there
+    are parts. Raises ValueError for an unknown ref, a malformed entry or
+    components that are not a list."""
+    if not parts:
+        return {}
+    comps = {ref: c for c in component_list(components) if (ref := _ref(c)) is not None}
     unknown = sorted(str(r) for r in parts if r not in comps)
     if unknown:
         raise ValueError(f"parts names refs that are not netlist components: {', '.join(unknown)}")
@@ -529,9 +563,9 @@ def with_anchors(design: Mapping, board: dict, anchors: Mapping[str, list[float]
     out = {k: (board if k == "board" else v) for k, v in design.items()}
     out.setdefault("board", board)
     if anchors:
-        out["components"] = [_placed(c, list(anchors[c["ref"]]))
-                             if isinstance(c, Mapping) and c.get("ref") in anchors else c
-                             for c in design.get("components") or []]
+        out["components"] = [_placed(c, list(anchors[ref]))
+                             if (ref := _ref(c)) is not None and ref in anchors else c
+                             for c in component_list(design.get("components"))]
     return out
 
 
@@ -589,21 +623,49 @@ def part_issues(o: ol.Outline, components: Iterable[Any]) -> list[oa.Issue]:
     return out
 
 
+def _spec_issue(message: str) -> oa.Issue:
+    """A malformed ``mounting_holes`` value (the builder could not place it)."""
+    return oa.Issue("mounting_holes_spec", "error", None, f"mounting_holes.{message}")
+
+
+def _is_point(p: object) -> bool:
+    return isinstance(p, (list, tuple)) and len(p) == 2 and all(finite(v) for v in p)
+
+
+def _spec_positions(given: object) -> tuple[list[Point], list[oa.Issue]]:
+    """mounting_holes.positions as points, plus one issue naming every
+    malformed entry (a position is [x, y], finite numbers, board frame)."""
+    if not isinstance(given, (list, tuple)):
+        return [], [_spec_issue(f"positions must be a list of [x, y] points (mm), got "
+                                f"{given!r:.60}")]
+    bad = [f"positions[{k}] = {p!r:.40}" for k, p in enumerate(given) if not _is_point(p)]
+    issues = [_spec_issue(f"{', '.join(bad)}: each position must be [x, y], finite numbers "
+                          f"({oa.FRAME})")] if bad else []
+    return [(float(p[0]), float(p[1])) for p in given if _is_point(p)], issues
+
+
 def _spec_holes(o: ol.Outline, spec: Mapping, source: str
                 ) -> tuple[list[dict], list[oa.Issue]]:
     drill = _hole_drill(spec.get("footprint") or DEFAULT_HOLE_FOOTPRINT) or DEFAULT_HOLE_DRILL_MM
-    positions = spec.get("positions")
-    if not positions and source not in ("rect", "rounded_rect"):
-        return [], [oa.Issue("mounting_holes_positions", "error", None,
-                             "mounting_holes without positions puts four holes at the bbox "
-                             "corners, which assumes a rectangle: give mounting_holes.positions "
-                             f"for this {source} outline ({oa.FRAME})")]
-    if not positions:
+    inset = spec.get("inset", DEFAULT_HOLE_INSET_MM)
+    issues = [] if finite(inset) else [_spec_issue(f"inset must be a number (mm), got "
+                                                   f"{inset!r:.40}")]
+    if spec.get("positions"):
+        positions, more = _spec_positions(spec["positions"])
+        issues = [*issues, *more]
+    elif source not in ("rect", "rounded_rect"):
+        return [], [*issues, oa.Issue(
+            "mounting_holes_positions", "error", None, "mounting_holes without positions puts "
+            "four holes at the bbox corners, which assumes a rectangle: give "
+            f"mounting_holes.positions for this {source} outline ({oa.FRAME})")]
+    elif issues:
+        return [], issues
+    else:
         x0, y0, x1, y1 = ol.bbox(o)
-        i = float(spec.get("inset", DEFAULT_HOLE_INSET_MM))
+        i = float(inset)
         positions = [(x0 + i, y0 + i), (x1 - i, y0 + i), (x1 - i, y1 - i), (x0 + i, y1 - i)]
     return [{"ref": f"H{k}", "center": list(p), "drill": drill}
-            for k, p in enumerate(positions, 1)], []
+            for k, p in enumerate(positions, 1)], issues
 
 
 def hole_issues(o: ol.Outline, design: Mapping, source: str,
@@ -611,14 +673,16 @@ def hole_issues(o: ol.Outline, design: Mapping, source: str,
     """Mounting holes judged by their drill circle (outline_audit
     mounting_hole_issues): mounting-hole footprints placed by at / x-y, and
     ``mounting_holes`` (its positions, else swig_build_board's bbox-corner
-    default, an error on a non-rectangular outline). The drill is read from a
-    'MountingHole_<d>mm' footprint name, else DEFAULT_HOLE_DRILL_MM."""
+    default, an error on a non-rectangular outline; a malformed inset or
+    position is a mounting_holes_spec error). The drill is read from a
+    'MountingHole_<d>mm' footprint name, else DEFAULT_HOLE_DRILL_MM. Raises
+    ValueError when the components are not a list."""
     holes = [{"ref": str(c.get("ref")), "center": list(p), "drill": d}
-             for c in design.get("components") or [] if isinstance(c, Mapping)
+             for c in component_list(design.get("components")) if isinstance(c, Mapping)
              and (d := _hole_drill(c.get("footprint"))) is not None
              and (p := _fixed_point(c)) is not None]
     spec, out = design.get("mounting_holes"), []
     if spec:
         more, out = _spec_holes(o, spec if isinstance(spec, Mapping) else {}, source)
-        holes += more
+        holes = [*holes, *more]
     return out + oa.mounting_hole_issues(o, holes, profile)

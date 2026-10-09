@@ -268,6 +268,23 @@ def test_chained_compose_never_reuses_dropped_refs(dirs: tuple[Path, Path]) -> N
         _compose(dirs, net_map=UART_MAP, drop_refs=["J1"], ref_map={"J1": "J1"})
 
 
+def test_nested_drop_refs_are_not_this_designs_refs(dirs: tuple[Path, Path]) -> None:
+    """A nested entry (GNSS/LNA) keeps the drop_refs of the block's own
+    composition, refs of the block's namespace: they retire nothing here."""
+    block = {**gnss_block(), "blocks": [{"name": "LNA", "ref_map": {"Q1": "L1"},
+                                         "drop_refs": ["Q7"]}]}
+    first = _compose(dirs, block=block, net_map=UART_MAP)
+    assert first.design["blocks"][1] == {"name": "GNSS/LNA", "ref_map": {"Q1": "L1"},
+                                         "net_map": {}, "drop_refs": ["Q7"]}
+    later = {"components": [{"ref": "Q7", "lib_id": "D:Q", "footprint": "A:Q"},
+                            {"ref": "R1", "lib_id": "D:R", "footprint": "A:R"}],
+             "nets": {"B": [["Q7", "1"], ["R1", "1"]]}}
+    second = _compose(dirs, base=first.design, block=later, prefix="AMP")
+    assert second.ref_map == {"Q7": "Q7", "R1": "R12"} and second.problems == ()
+    assert _compose(dirs, base=first.design, block=later, prefix="AMP",
+                    ref_map={"R1": "Q7", "Q7": "Q9"}).ref_map == {"Q7": "Q9", "R1": "Q7"}
+
+
 @pytest.mark.parametrize("key", ["nets", "no_connect"])
 def test_block_pads_must_name_block_parts(dirs: tuple[Path, Path], key: str) -> None:
     block = gnss_block()

@@ -23,8 +23,11 @@ machine, probed once per process) and the rules are:
     newer than the pcbnew install can read: swig_readable(pcb) is the reason.
   * symbol libraries come from the newest install (pick_cli).
 
-Also here: the subprocess helpers and the kicad-cli ERC / DRC report readers
-the schematic, board and pipeline tools all share.
+Also here: the subprocess helpers (UTF-8 child output), the kicad-cli ERC / DRC
+runners the schematic, board and pipeline tools all share (board DRC goes
+through server/tools/drc_guard.run_drc: the last report is deleted first, so a
+run that writes nothing is an error, never the previous round's verdict), and
+the pre-KiCad-11 snapshot / agent-copy file steps of ROADMAP D5.
 """
 
 from __future__ import annotations
@@ -34,10 +37,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
+from types import ModuleType
 
 import kicad_env as env
+import kicad_ipc as ipc
 
 SERVER_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = SERVER_DIR / "tools"
@@ -300,8 +306,12 @@ def run(args: list[str], **kw) -> subprocess.CompletedProcess:
     """subprocess.run with captured output and stdin DETACHED. Inside an MCP
     stdio server the parent's stdin is the protocol pipe (with a read pending);
     a python.exe child that inherits it blocks at start-up until the timeout
-    (kicad_env._run has the details). Callers may still pass stdin= explicitly."""
+    (kicad_env._run has the details). Output is decoded as UTF-8 with
+    replacement (wx.LogStderr writes UTF-8; the locale codec would raise on
+    it). Callers may still pass stdin= / encoding= / errors= explicitly."""
     kw.setdefault("stdin", subprocess.DEVNULL)
+    kw.setdefault("encoding", "utf-8")
+    kw.setdefault("errors", "replace")
     return subprocess.run(args, capture_output=True, text=True, **kw)
 
 
@@ -359,30 +369,42 @@ def erc_json(sch: str, rpt: str, severity_error: bool = True) -> dict:
             "erc_report": rpt, "report": report}
 
 
+def _drc_guard() -> ModuleType:
+    """server/tools/drc_guard (stdlib-only; the harness uses it too), imported
+    on first use so importing toolchain never touches sys.path."""
+    tools = str(TOOLS_DIR)
+    if tools not in sys.path:
+        sys.path.append(tools)
+    import drc_guard
+    return drc_guard
+
+
+def _cli_runner(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
+    """drc_guard's runner through run() (stdin closed, UTF-8, the timeout);
+    run is looked up at call time, so a test's fake toolchain.run stands in."""
+    return run(argv, timeout=timeout)
+
+
 def drc_counts(pcb: str) -> dict:
     """Run kicad-cli DRC (error severity) on a saved board with the kicad-cli
-    of the KiCad that wrote it (board_cli(pcb)) and summarize the JSON report:
-    {errors, unconnected, types: {type: count}, report, kicad_cli}, plus
-    `kicad_cli_note` when that cli is a fallback (board_cli_note). When the
-    report cannot be produced or parsed the dict carries an `error` key
-    (counts -1). Raises RuntimeError when no KiCad is installed."""
+    of the KiCad that wrote it (board_cli(pcb)) and summarize THIS run's JSON
+    report (drc_guard.run_drc deletes <stem>_drc.json first): {errors,
+    unconnected, types: {type: count}, report, kicad_cli[, kicad_cli_note]}.
+    A missing board, an undeletable old report, a non-zero exit, a crash, an
+    `Error:` line or no / an unparseable report gives `error` (counts -1,
+    types {}) with rc and crash. Raises RuntimeError when no KiCad is
+    installed."""
     inst, note = _choose_board_install(pcb)
     if inst is None:
         raise RuntimeError("kicad-cli not found; install KiCad.")
     cli = str(inst.kicad_cli)
-    rpt = str(Path(pcb).with_suffix("")) + "_drc.json"
-    r = run([cli, "pcb", "drc", pcb, "--format", "json", "--severity-error",
-             "-o", rpt], timeout=KICAD_CLI_TIMEOUT_S)
-    base = {"report": rpt, "kicad_cli": cli, **({"kicad_cli_note": note} if note else {})}
-    try:
-        d = json.loads(Path(rpt).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        return {"errors": -1, "unconnected": -1, "types": {}, **base,
-                "error": f"DRC report unreadable ({e}): {(r.stdout + r.stderr)[-600:]}"}
-    violations = d.get("violations", [])
-    return {"errors": len(violations),
-            "unconnected": len(d.get("unconnected_items", [])),
-            "types": dict(Counter(v.get("type", "unknown") for v in violations)),
+    res = _drc_guard().run_drc(pcb, cli, severity="error", timeout=KICAD_CLI_TIMEOUT_S,
+                               runner=_cli_runner)
+    base = {"report": res["report"], "kicad_cli": cli, **({"kicad_cli_note": note} if note else {})}
+    if "error" in res:
+        return {"errors": -1, "unconnected": -1, "types": {}, **base, "error": res["error"],
+                "rc": res["rc"], "crash": res["crash"]}
+    return {"errors": res["errors"], "unconnected": res["unconnected"], "types": res["types"],
             **base}
 
 
@@ -403,10 +425,11 @@ def drc_check(pcb: str, max_items: int) -> dict:
     items: [{description, x, y}]}]: {ok: errors == 0 and unconnected == 0,
     errors, unconnected, types, violations, unconnected_items, kicad_cli,
     report[, kicad_cli_note]}. {ok: False, reason, kicad_cli, report} (no
-    counts) when DRC wrote no readable report. Raises RuntimeError when no
-    KiCad is installed."""
+    counts) when DRC failed (drc_counts' error) or its report cannot be read
+    back. Raises RuntimeError when no KiCad is installed."""
     counts = drc_counts(pcb)
-    base = {key: counts[key] for key in ("kicad_cli", "report", "kicad_cli_note") if counts.get(key)}
+    base = {key: counts[key] for key in ("kicad_cli", "report", "kicad_cli_note")
+            if counts.get(key)}
     if "error" in counts:
         return {**base, "ok": False, "reason": counts["error"]}
     try:
@@ -433,6 +456,8 @@ def drc_check(pcb: str, max_items: int) -> dict:
 # its project, the board loses its net classes and Freerouting lays power copper
 # at the default width while DRC still passes (spike T09). KiCad 11 never
 # writes .kicad_dru; the ~X.kicad_pro.lck lock it leaves behind is never copied.
+# The agent's KiCad 11 set is kept as X.agent.*; an older X.agent.* set is first
+# rotated to X.agent.<n>.* (the first free n), so no agent copy is ever lost.
 K11_SESSION = (10, 99)                  # the KiCad 11 nightly and every release after it
 K10_LAST_FORMAT = 20260206              # KiCad 10.0's board format: the newest pre-11 file
 SNAPSHOT_TAG = ".k9"
@@ -441,8 +466,10 @@ BOARD_EXT = ".kicad_pcb"
 PROJECT_EXT = ".kicad_pro"
 LOCAL_EXT = ".kicad_prl"                # per-user UI state
 RULES_EXT = ".kicad_dru"                # custom DRC rules
+LOCK_PREFIX, LOCK_SUFFIX = "~", ".lck"  # ~X.kicad_pro.lck: KiCad's project lock
 SNAPSHOT_EXTRAS = (PROJECT_EXT, LOCAL_EXT, RULES_EXT)   # copied beside the board when present
 K11_REWRITES = (BOARD_EXT, PROJECT_EXT, LOCAL_EXT)      # what a KiCad 11 save rewrites
+AGENT_SET = (*K11_REWRITES, RULES_EXT)                  # an agent copy: the rewrites + the rules
 STALL_ROUNDS = 3                       # D5: route_check rounds without a new best = a stall
 STALL_NOTE = (f"{STALL_ROUNDS} route_check rounds without fewer errors + unconnected: stop "
               "agent routing and fall back (ROADMAP D5): autoroute_board(pcb, "
@@ -479,8 +506,15 @@ def pre_k11_snapshot_path(pcb: str) -> str:
 
 
 def agent_copy_path(pcb: str) -> str:
-    """X.agent.kicad_pcb: where restore_snapshot moves the KiCad 11 copy."""
+    """X.agent.kicad_pcb: where keep_agent_copy (restore_snapshot, the harness)
+    puts the agent's KiCad 11 copy; older copies are X.agent.<n>.kicad_pcb."""
     return str(_sibling(pcb, AGENT_TAG, BOARD_EXT))
+
+
+def project_lock_path(pcb: str) -> Path:
+    """~X.kicad_pro.lck beside X.kicad_pcb: the project lock KiCad keeps."""
+    board = Path(pcb)
+    return board.with_name(LOCK_PREFIX + board.stem + PROJECT_EXT + LOCK_SUFFIX)
 
 
 def existing_snapshot(pcb: str) -> str | None:
@@ -592,47 +626,163 @@ def _check_restorable(pcb: str) -> Path:
     return snap
 
 
-def _swap_in_snapshot(pcb: str, moved: list[tuple[Path, Path]], restored: list[Path]) -> None:
-    """Move the KiCad 11 files to X.agent.* and copy the snapshot back,
-    recording each step in `moved` / `restored` for the caller's rollback."""
-    for ext in K11_REWRITES:
-        src = _sibling(pcb, "", ext)
-        if src.is_file():
-            dst = _sibling(pcb, AGENT_TAG, ext)
-            os.replace(src, dst)
-            moved.append((src, dst))
+# A file step done so far, for the rollback: (src, dst) = a move, (dst, None) = a new copy.
+Step = tuple[Path, Path | None]
+
+
+def _free(dst: Path) -> None:
+    """Moves and copies land on free names only: never overwrite a file."""
+    if dst.exists():
+        raise FileExistsError(f"{dst} exists; refusing to overwrite it")
+
+
+def _move(src: Path, dst: Path, journal: list[Step]) -> None:
+    _free(dst)
+    os.replace(src, dst)
+    journal.append((src, dst))
+
+
+def _copy(src: Path, dst: Path, journal: list[Step]) -> None:
+    _free(dst)
+    journal.append((dst, None))          # first: a half-written copy is removed too
+    shutil.copy2(src, dst)
+
+
+def _undo(journal: list[Step]) -> None:
+    """Reverse the steps newest first: a move goes back, a new copy is removed."""
+    for first, second in reversed(journal):
+        if second is None:
+            first.unlink(missing_ok=True)
+        else:
+            os.replace(second, first)
+
+
+def _agent_tag(n: int) -> str:
+    """'.agent' for the current agent copy, '.agent.<n>' for an older one."""
+    return AGENT_TAG if n == 0 else f"{AGENT_TAG}.{n}"
+
+
+def _rotate_agent_copy(pcb: str, journal: list[Step]) -> list[str]:
+    """Move an existing X.agent.* set to the first free X.agent.<n>.* (n >= 1:
+    no file of that set exists yet); the paths it now has."""
+    current = [ext for ext in AGENT_SET if _sibling(pcb, AGENT_TAG, ext).is_file()]
+    if not current:
+        return []
+    n = 1
+    while any(_sibling(pcb, _agent_tag(n), ext).exists() for ext in AGENT_SET):
+        n += 1
+    rotated: list[str] = []
+    for ext in current:
+        dst = _sibling(pcb, _agent_tag(n), ext)
+        _move(_sibling(pcb, AGENT_TAG, ext), dst, journal)
+        rotated.append(str(dst))
+    return rotated
+
+
+def _keep_agent_copy(pcb: str, move: bool, journal: list[Step]) -> dict:
+    """keep_agent_copy's steps, recorded in `journal` (the caller undoes them)."""
+    if not Path(pcb).is_file():
+        raise ValueError(f"{pcb} not found; there is no board to keep as an agent copy")
+    rotated = _rotate_agent_copy(pcb, journal)
+    files: list[str] = []
+    for ext in AGENT_SET:
+        src, dst = _sibling(pcb, "", ext), _sibling(pcb, AGENT_TAG, ext)
+        if not src.is_file():
+            continue
+        if move and ext in K11_REWRITES:
+            _move(src, dst, journal)
+        else:
+            _copy(src, dst, journal)
+        files.append(str(dst))
+    previous = next((path for path in rotated if path.endswith(BOARD_EXT)), None)
+    return {"agent_copy": agent_copy_path(pcb), "previous_agent_copy": previous,
+            "files": files, "rotated": rotated}
+
+
+def keep_agent_copy(pcb: str, move: bool) -> dict:
+    """Keep the agent's KiCad 11 work as X.agent.*: an older X.agent.* set is
+    first rotated to the first free X.agent.<n>.* (n = 1, 2, ...), then
+    X.kicad_pcb / .kicad_pro / .kicad_prl are moved there (move=True: the
+    snapshot restore) or copied (move=False: the harness, before a rebuild
+    overwrites them); X.kicad_dru is always copied (KiCad 11 never writes
+    it). Returns {agent_copy, previous_agent_copy (the rotated
+    X.agent.<n>.kicad_pcb, or None), files (the X.agent.* written),
+    rotated}. Raises ValueError when `pcb` is missing, and OSError when a
+    file step fails (every step done so far is undone first)."""
+    journal: list[Step] = []
+    try:
+        return _keep_agent_copy(pcb, move, journal)
+    except OSError:
+        _undo(journal)
+        raise
+
+
+def _lock_holder(pcb: str) -> str | None:
+    """Who may still hold the project lock: a board API session of this
+    process (board_sessions, when it is loaded at all) or a running KiCad
+    editor that has the board or its project open; None when nothing does."""
+    sessions = sys.modules.get("board_sessions")
+    if sessions is not None and sessions.holds(pcb):
+        return ("a board API session of this server holds the board (close_board it, then "
+                "delete the lock if KiCad reports the project as locked)")
+    for path in (pcb, str(_sibling(pcb, "", PROJECT_EXT))):
+        kind = ipc.editor_holding(path)
+        if kind:
+            return f"{Path(path).name} is open in KiCad {ipc.EDITOR_NAMES.get(kind, kind)}"
+    return None
+
+
+def _remove_stale_lock(pcb: str) -> dict:
+    """{lock_removed[, lock_note]}: the ~X.kicad_pro.lck a KiCad 11 headless
+    server leaves behind (a GUI then reports the project as locked) is
+    deleted only when nothing in this process or in a running KiCad holds
+    the board."""
+    lock = project_lock_path(pcb)
+    if not lock.is_file():
+        return {"lock_removed": False}
+    holder = _lock_holder(pcb)
+    if holder:
+        return {"lock_removed": False, "lock_note": f"{lock.name} kept: {holder}"}
+    try:
+        lock.unlink()
+    except OSError as exc:
+        return {"lock_removed": False, "lock_note": f"{lock.name} could not be removed ({exc})"}
+    return {"lock_removed": True}
+
+
+def _copy_back_snapshot(pcb: str, journal: list[Step]) -> list[str]:
+    """Copy X.k9.{kicad_pcb, kicad_pro, kicad_prl} back to X.* (the snapshot stays)."""
+    restored: list[str] = []
     for ext in K11_REWRITES:
         snap = _sibling(pcb, SNAPSHOT_TAG, ext)
         if snap.is_file():
             dst = _sibling(pcb, "", ext)
-            shutil.copy2(snap, dst)
-            restored.append(dst)
+            _copy(snap, dst, journal)
+            restored.append(str(dst))
+    return restored
 
 
 def restore_snapshot(pcb: str) -> dict:
     """The D5 Freerouting fallback's file step on a board KiCad 11 has saved:
-    X.kicad_pcb / .kicad_pro / .kicad_prl move to X.agent.* (the agent's
-    KiCad 11 copy, reopenable with its classes), X.kicad_dru is copied to
-    X.agent.kicad_dru (KiCad 11 never writes it, the canonical one stays),
-    and X.k9.{kicad_pcb, kicad_pro, kicad_prl} are copied back to X.* (the
-    snapshot stays). Release every KiCad session on `pcb` first. Returns
-    {"pcb", "snapshot", "agent_copy", "moved": [...], "restored": [...]}.
-    Raises ValueError when there is no usable snapshot or `pcb` is not a
-    KiCad 11 file, and OSError when a file operation fails (the moves done
-    so far are undone first)."""
+    keep_agent_copy(pcb, move=True) (the KiCad 11 set becomes X.agent.*,
+    reopenable with its classes; an earlier one rotates to X.agent.<n>.*),
+    X.k9.{kicad_pcb, kicad_pro, kicad_prl} are copied back to X.* (the
+    snapshot stays), and a leftover ~X.kicad_pro.lck is removed when no
+    session of this process and no running KiCad editor holds the board.
+    Release every KiCad session on `pcb` first. Returns {pcb, snapshot,
+    agent_copy, previous_agent_copy, rotated, moved, restored,
+    lock_removed[, lock_note]}. Raises ValueError when there is no usable
+    snapshot or `pcb` is not a KiCad 11 file, and OSError when a file step
+    fails (every step done so far is undone first)."""
     snap = _check_restorable(pcb)
-    moved: list[tuple[Path, Path]] = []
-    restored: list[Path] = []
+    journal: list[Step] = []
     try:
-        _swap_in_snapshot(pcb, moved, restored)
-        rules = _sibling(pcb, "", RULES_EXT)
-        if rules.is_file():
-            shutil.copy2(rules, _sibling(pcb, AGENT_TAG, RULES_EXT))
+        kept = _keep_agent_copy(pcb, True, journal)
+        restored = _copy_back_snapshot(pcb, journal)
     except OSError:
-        for path in restored:
-            path.unlink(missing_ok=True)
-        for src, dst in reversed(moved):
-            os.replace(dst, src)
+        _undo(journal)
         raise
-    return {"pcb": pcb, "snapshot": str(snap), "agent_copy": agent_copy_path(pcb),
-            "moved": [str(dst) for _src, dst in moved], "restored": [str(p) for p in restored]}
+    moved = [path for path in kept["files"] if not path.endswith(RULES_EXT)]
+    return {"pcb": pcb, "snapshot": str(snap), "agent_copy": kept["agent_copy"],
+            "previous_agent_copy": kept["previous_agent_copy"], "rotated": kept["rotated"],
+            "moved": moved, "restored": restored, **_remove_stale_lock(pcb)}

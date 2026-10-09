@@ -150,11 +150,14 @@ def _check_block_pads(block: Mapping[str, Any], block_comps: list[Mapping[str, A
 
 
 def _retired(base: Mapping[str, Any]) -> frozenset[str]:
-    """Refs the base dropped earlier (variant.dropped_refs, every
-    blocks[].drop_refs): never given to a block part. Shapes are checked."""
+    """Refs the base dropped earlier (variant.dropped_refs, the drop_refs of
+    its own compositions): never given to a block part. A nested entry
+    ('<prefix>/<name>') keeps refs of the block's namespace: skipped.
+    Shapes are checked (check_records) before this runs."""
     variant = base.get("variant") or {}
+    own = (b for b in base.get("blocks") or [] if "/" not in str(b.get("name")))
     return frozenset([*(variant.get("dropped_refs") or []),
-                      *(r for b in base.get("blocks") or [] for r in b.get("drop_refs") or [])])
+                      *(r for b in own for r in b.get("drop_refs") or [])])
 
 
 def _check_prefix_free(base: Mapping[str, Any], prefix: str) -> None:

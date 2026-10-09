@@ -21,6 +21,7 @@ import ast
 import copy
 import json
 import subprocess
+import time
 from pathlib import Path
 from types import MappingProxyType
 
@@ -323,6 +324,79 @@ def test_unknown_template_suggests_the_closest():
         fj.spec_from_json("qfm", {})
     assert "unknown template 'qfm' (did you mean 'qfn'?); templates: lga_grid, qfn" in str(
         err.value)
+
+
+def test_null_is_named_once():
+    with pytest.raises(fj.FpSpecJsonError) as err:
+        fj.spec_from_json("sop", None)
+    assert str(err.value) == "sop: params: expected an object, got null"
+    with pytest.raises(fj.FpSpecJsonError) as err:
+        fj.spec_from_json("sop", {**soic8_json(), "pitch": None})
+    assert err.value.problems == ("sop: params.pitch: expected a number, got null",)
+
+
+# ---------------------------------------------------------------------------
+# Size limit: an oversized footprint is refused before anything is built
+# ---------------------------------------------------------------------------
+def _square_grid(cols: int, rows: int) -> dict:
+    return {"name": "BGA", "body": {"w": 100, "h": 100},
+            "grid": {"xs": {"count": cols, "pitch": 0.5}, "ys": {"count": rows, "pitch": 0.5},
+                     "w": 0.3, "h": 0.3, "shape": "circle"},
+            "numbering": {"rule": "linear", "order": "row_major"}}
+
+
+def test_a_footprint_at_the_pad_limit_builds_and_one_more_is_refused():
+    assert fj.MAX_PADS == 10_000
+    assert len(fj.spec_from_json("lga_grid", _square_grid(100, 100)).pads) == fj.MAX_PADS
+    with pytest.raises(fj.FpSpecJsonError) as err:
+        fj.spec_from_json("lga_grid", _square_grid(100, 101))
+    assert err.value.problems == (
+        "lga_grid: params describe up to 10100 pads (copper, paste windows and vias); "
+        "the limit is 10000",)
+
+
+_HUGE = 10 ** 8
+_LCC = {"name": "L", "body": {"w": 5, "h": 5}, "pitch": 1, "pad_w": 0.5, "pad_l": 1}
+_DFN = {"name": "D", "body": {"w": 2, "h": 2}, "pitch": 0.5, "span": 1.9, "pad_w": 0.25,
+        "pad_l": 0.6}
+
+
+@pytest.mark.parametrize(("template", "params", "msg"), [
+    # one count beyond the limit
+    ("lga_grid", _square_grid(_HUGE, 1), "params.grid.xs.count: must be <= 10000, got 100000000"),
+    ("sop", {**soic8_json(), "pins": _HUGE}, "params.pins: must be <= 10000, got 100000000"),
+    ("pin_header", {"name": "H", "rows": 2, "cols": _HUGE}, "params.cols: must be <= 10000"),
+    ("qfn", {**qfn16_json(), "ep": {"w": 1.7, "h": 1.7, "paste_grid": [_HUGE, 1]}},
+     "params.ep.paste_grid[0]: must be <= 10000"),
+    ("lga_grid", {**_square_grid(1, 1), "grid": {
+        **_square_grid(1, 1)["grid"], "xs": [{"count": 6000, "pitch": 1}] * 2}},
+     "params.grid.xs: more than 10000 coordinates"),
+    # counts within the limit whose footprint is not
+    ("lga_grid", _square_grid(5000, 5000), "lga_grid: params describe up to 25000000 pads"),
+    ("qfn", {**qfn16_json(), "ep": {"w": 1.7, "h": 1.7, "paste_grid": [200, 200]}},
+     "qfn: params describe up to 40017 pads"),
+    ("lcc_castellated", {**_LCC, "pins": [5000, 5000, 5000, 0]}, "up to 15000 pads"),
+    ("dfn", {**_DFN, "pins_per_side": 6000}, "dfn: params describe up to 12000 pads"),
+    ("sop", {**soic8_json(), "pins": 9998, "ep": {"w": 1, "h": 1, "paste_grid": [2, 2]}},
+     "sop: params describe up to 10003 pads"),                 # 9998 + EP copper + 4 windows
+    ("pin_header", {"name": "H", "rows": 5000, "cols": 5000}, "up to 25000000 pads"),
+])
+def test_oversized_footprints_are_refused_before_they_are_built(template, params, msg):
+    start = time.perf_counter()
+    with pytest.raises(fj.FpSpecJsonError) as err:
+        fj.spec_from_json(template, params)
+    assert msg in str(err.value), str(err.value)
+    assert time.perf_counter() - start < 5.0       # nothing big was allocated (uncapped: minutes)
+
+
+def test_pad_numbers_are_not_sizes():
+    """start / first name pads; they are not capped by the pad limit."""
+    spec = _grid_spec({"rule": "linear", "order": "row_major", "start": 20001}, pin1=20001)
+    assert sorted(p.number for p in spec.pads)[0] == "20001"
+    row = {"side": "L", "at": 0, "positions": [0, 1], "first": 50000, "length": 1, "width": 0.5}
+    spec = fj.spec_from_json("lga_grid", {"name": "E", "body": {"w": 3, "h": 3},
+                                          "edge_rows": [row], "pin1": 50000})
+    assert sorted(p.number for p in spec.pads) == ["50000", "50001"]
 
 
 # ---------------------------------------------------------------------------

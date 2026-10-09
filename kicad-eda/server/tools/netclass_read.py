@@ -20,11 +20,12 @@ A net resolves the way KiCad's NET_SETTINGS::GetEffectiveNetClass does
   definition contribute nothing. File order plays no part, so a Default or
   undefined binding never shadows another match;
 * a pattern matches like KiCad's combined matcher (EDA_COMBINED_MATCHER::
-  StartsWith, CTX_NETCLASS): as a regex anchored with ``^``/``$`` whose match
-  starts at the net's FIRST character (so ``X|Y``, i.e. ``^X`` or ``Y$``,
-  matches XA but not AY), OR as a wildcard where only ``*`` and ``?`` are
-  special and the whole name must match. Matching is case-sensitive. A
-  pattern KiCad cannot compile as a regex is a wildcard only;
+  StartsWith, CTX_NETCLASS): as a regex anchored with ``^``/``$`` (each added
+  unless the pattern already has it) whose match starts at the net's FIRST
+  character (so ``X|Y``, i.e. ``^X`` or ``Y$``, matches XA but not AY), OR as
+  a wildcard where only ``*`` and ``?`` are special and the whole name must
+  match. Matching is case-sensitive. A pattern the regex engine rejects is a
+  wildcard only (never a substring search);
 * the contributing classes are ordered by (priority, name) and the first one
   with a track width supplies it. A class without ``priority`` sorts at -1, as
   KiCad 10 loads it (9.0.4 drops such a class's widths in a v4 file; the
@@ -37,23 +38,41 @@ Wildcards and regexes can only be resolved against real net names, so
 callers pass them (``nets``); the result is keyed by those nets and a net's
 answer never depends on which other nets were asked.
 
-KiCad compiles the regex with wxRegEx's advanced syntax (ARE); Python's ``re``
-stands in for it, with bracket expressions rewritten the way ARE reads them:
-POSIX classes such as ``[[:digit:]]`` become ASCII ranges (KiCad's are ASCII:
-'é' is no ``[:alpha:]``), and an unknown class, a collating element ``[.a.]``
-or an equivalence class ``[=a=]`` makes the regex invalid, as in KiCad. In
-both matchers ``.`` also matches a newline and ``$`` matches at the end of the
-name or just before a final newline (measured; Python's own ``$``).
-Known differences, none of which a netclass_writer
-pattern (an exact net name) runs into:
+KiCad compiles the regex with wxRegEx, which wxWidgets 3.2 builds on PCRE2
+(KiCad 9.0.4 and 10.0.5 both ship pcre2-32): UTF mode, ``.`` also matches a
+newline, no UCP. Python's ``re`` stands in for it once pcre_to_python() has
+rewritten what the two read differently (every rule measured on both):
 
+* bracket expressions: POSIX classes such as ``[[:digit:]]`` become ASCII
+  ranges ('é' is no ``[:alpha:]``); an unknown class, a collating element
+  ``[.a.]`` or an equivalence class ``[=a=]`` rejects the regex; ``[ & | ~``
+  in a set are literals;
+* ``\\d \\w \\s \\b`` and their negations are ASCII-only (no UCP);
+* ``\\Z`` also matches before a final newline, ``\\z`` only at the end;
+  ``\\Q..\\E`` quotes (without ``\\E`` up to the end, the anchoring ``$``
+  included); a stray ``\\E`` is ignored;
+* an inline option setting such as ``(?i)`` or ``(?-s)``, which ``re``
+  rejects after the added ``^``, lasts to the end of its group and carries
+  into the group's later ``|`` branches: it becomes a scoped ``(?i:..)``
+  group, closed with its group and reopened after each ``|``.
+
+``$`` matches at the end of the name or just before a final newline in both.
+Known differences, none of which a netclass_writer pattern (an exact net
+name) runs into (tests/test_netclass_read.py KNOWN_GAPS and KICAD9_MATCHES
+re-measure them):
+
+* PCRE2-only syntax that ``re`` rejects, which leaves only the wildcard
+  reading: ``\\h``, ``\\R``, ``\\p{..}``, ``(?<name>..)``, ``(?|..)``,
+  recursion, backtracking verbs, option letters other than i m s x, and
+  ``\\Q..\\E`` inside a set; ``\\v`` (any vertical space) is a vertical tab
+  only in ``re``;
+* in a set, ``\\D \\W \\S`` keep Python's Unicode reading;
+* the open quantifier ``{,n}``: 9.0.4 and ``re`` read ``{0,n}``, 10.0.5 reads
+  it literally;
 * bus patterns: 10.0.5 expands a pattern that parses as a bus (vector
   ``D[0..3]``, group ``X{A B}``, also ``A{2}``) into its member names first,
   and gives a net named like a bus its members' common class; 9.0.4 and this
-  reader treat the pattern as a regex / wildcard (``A{2}`` matches AA);
-* ARE-only syntax (escapes such as ``\\m``, ``\\y``, ``\\B``; ``***=``) and
-  Python-only syntax (lookbehind, named groups, possessive quantifiers) are
-  judged by ``re``, not by ARE.
+  reader treat the pattern as a regex / wildcard (``A{2}`` matches AA).
 
 Imported by KiCad's bundled Python (9.0.4 ships 3.11): stdlib only.
 """
@@ -72,14 +91,29 @@ UNSET_PRIORITY = -1                 # KiCad 10: a class without "priority" sorts
 
 ClassEntry = tuple[str, float]                   # (class name, track width mm)
 
-# ARE [:name:] classes as Python set ranges (KiCad's are ASCII; measured).
+# PCRE2 [:name:] classes as Python set ranges (KiCad's are ASCII; measured).
 POSIX_CLASSES = {
     "alnum": "0-9A-Za-z", "alpha": "A-Za-z", "blank": " \\t", "cntrl": "\\x00-\\x1f\\x7f",
     "digit": "0-9", "graph": "!-~", "lower": "a-z", "print": " -~",
     "punct": "!-/:-@\\[-`{-~", "space": " \\t\\n\\r\\f\\v", "upper": "A-Z",
     "xdigit": "0-9A-Fa-f",
 }
-_SET_LITERALS = frozenset("[&|~")     # literal in an ARE set; Python warns on [[ && || ~~
+_SET_LITERALS = frozenset("[&|~")     # literal in a PCRE2 set; Python warns on [[ && || ~~
+
+# PCRE2 without UCP: these escapes are ASCII-only; \Z also allows a final
+# newline; a stray \E is ignored (measured on 9.0.4 and 10.0.5).
+_DIGIT, _WORD, _SPACE = "0-9", "0-9A-Za-z_", "\\t\\n\\x0b\\f\\r "
+_W = f"[{_WORD}]"
+ESCAPES = {
+    "d": f"[{_DIGIT}]", "D": f"[^{_DIGIT}]", "w": _W, "W": f"[^{_WORD}]",
+    "s": f"[{_SPACE}]", "S": f"[^{_SPACE}]",
+    "b": f"(?:(?<!{_W})(?={_W})|(?<={_W})(?!{_W}))",
+    "B": f"(?:(?<!{_W})(?!{_W})|(?<={_W})(?={_W}))",
+    "Z": "(?=\\n?\\Z)", "z": "\\Z", "E": "",
+}
+SET_ESCAPES = {"d": _DIGIT, "w": _WORD, "s": _SPACE}
+_OPTION = re.compile(r"\(\?([imsx]*(?:-[imsx]*)?)\)")      # (?i) (?-s) (?im-x)
+Frames = tuple[tuple[str, ...], ...]   # per open group: the scoped option groups it opened
 
 
 class NetClass(NamedTuple):
@@ -98,8 +132,8 @@ class _Rules(NamedTuple):
 # Matching
 # ---------------------------------------------------------------------------
 def _bracket(pattern: str, start: int) -> tuple[str, int] | None:
-    """The ARE bracket expression opening at ``pattern[start]`` as a Python
-    set, and the index after it; None when ARE rejects it (an unknown class,
+    """The PCRE2 bracket expression opening at ``pattern[start]`` as a Python
+    set, and the index after it; None when PCRE2 rejects it (an unknown class,
     a collating or equivalence element, no closing ``]``)."""
     out, i = ["["], start + 1
     if pattern.startswith("^", i):
@@ -122,16 +156,54 @@ def _bracket(pattern: str, start: int) -> tuple[str, int] | None:
             out.append(ranges)
             i = close + 2
             continue
+        escaped = pattern[i + 1:i + 2] if c == "\\" else ""
+        if escaped in SET_ESCAPES:                      # [\d] stays ASCII
+            out.append(SET_ESCAPES[escaped])
+            i += 2
+            continue
         step = 2 if c == "\\" else 1
         out.append("\\" + c if c in _SET_LITERALS else pattern[i:i + step])
         i += step
     return None
 
 
-def are_to_python(pattern: str) -> str | None:
-    """An ARE pattern as Python ``re`` text (only bracket expressions are
-    rewritten), or None when KiCad's regex rejects it."""
-    out, i = [], 0
+def _escape(pattern: str, i: int) -> tuple[str, int]:
+    """The escape at ``pattern[i]`` (a backslash) as Python text, and the
+    index after it; ``\\Q`` quotes up to ``\\E`` or the end of the pattern."""
+    letter = pattern[i + 1:i + 2]
+    if letter != "Q":
+        return ESCAPES.get(letter, pattern[i:i + 2]), i + 2
+    end = pattern.find("\\E", i + 2)
+    stop = len(pattern) if end < 0 else end
+    return re.escape(pattern[i + 2:stop]), (stop if end < 0 else end + 2)
+
+
+def _paren(pattern: str, i: int, frames: Frames) -> tuple[str, int, Frames]:
+    """``(``, ``|`` or ``)`` at ``pattern[i]`` as Python text, the index after
+    it and the new frames. An inline option setting becomes a scoped group
+    that closes with its group and reopens after each ``|`` of that group."""
+    c, active = pattern[i], frames[-1]
+    if c == "|":
+        return ")" * len(active) + "|" + "".join(active), i + 1, frames
+    if c == ")":
+        return ")" * len(active) + ")", i + 1, frames[:-1] if len(frames) > 1 else frames
+    if pattern.startswith("(?#", i):                   # a comment, through its ')'
+        end = pattern.find(")", i)
+        stop = len(pattern) if end < 0 else end + 1
+        return pattern[i:stop], stop, frames
+    option = _OPTION.match(pattern, i)
+    if option is not None:
+        opener = f"(?{option.group(1)}:"
+        return opener, option.end(), frames[:-1] + (active + (opener,),)
+    return "(", i + 1, frames + ((),)
+
+
+def pcre_to_python(pattern: str) -> str | None:
+    """KiCad's (PCRE2) regex text as Python ``re`` text, or None when PCRE2
+    rejects a bracket expression. Rewrites bracket expressions, the ASCII
+    escapes, ``\\Z``/``\\z``, ``\\Q..\\E`` and inline option settings."""
+    out: list[str] = []
+    i, frames = 0, ((),)
     while i < len(pattern):
         c = pattern[i]
         if c == "[":
@@ -139,12 +211,14 @@ def are_to_python(pattern: str) -> str | None:
             if found is None:
                 return None
             text, i = found
-            out.append(text)
-            continue
-        step = 2 if c == "\\" else 1
-        out.append(pattern[i:i + step])
-        i += step
-    return "".join(out)
+        elif c == "\\":
+            text, i = _escape(pattern, i)
+        elif c in "(|)":
+            text, i, frames = _paren(pattern, i, frames)
+        else:
+            text, i = c, i + 1
+        out.append(text)
+    return "".join(out) + ")" * len(frames[-1])
 
 
 @lru_cache(maxsize=4096)
@@ -152,12 +226,12 @@ def _regex(pattern: str) -> re.Pattern | None:
     """KiCad's anchored-regex matcher; None when the pattern is no regex."""
     anchored = ("" if pattern.startswith("^") else "^") + pattern \
         + ("" if pattern.endswith("$") else "$")
-    text = are_to_python(anchored)
+    text = pcre_to_python(anchored)
     if text is None:
         return None
     try:
-        with warnings.catch_warnings():             # '--' in a set: FutureWarning
-            warnings.simplefilter("ignore", FutureWarning)
+        with warnings.catch_warnings():             # '[[', '--' in a set: FutureWarning
+            warnings.simplefilter("ignore")
             return re.compile(text, re.DOTALL)
     except (re.error, OverflowError, RecursionError):
         return None

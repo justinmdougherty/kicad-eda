@@ -5,37 +5,41 @@ The G4 gate's self-feeding loop calls this to APPLY fixes for blockers that
 have an unambiguous board-level remedy, instead of re-placing and re-routing
 the whole board:
 
-  heal   micro-gap healer: a DRC "unconnected items" pair where BOTH items
-         are the same net and sit within ~2 mm is a router/SES artifact, not
-         a routing failure — bridge the nearest same-net attach points with
-         a short track on the items' layer. (Freerouting is deterministic;
-         re-routing the identical board can never clear these.)
-  vias   IPC-2221 via-ampacity fixer: a net whose spec current exceeds the
-         summed barrel ampacity at its layer transition gets parallel vias
-         dropped ON its fat track next to the existing transition via. When
-         the net owns a plane the new barrel shares load through it; on a
-         plane-less net a same-net tie track is added on the via's far layer.
+  heal     micro-gap healer (swig_heal): a DRC "unconnected items" break on
+           one net is a router/SES artifact, not a routing failure — bridge
+           or link the two copper islands at the net's class width (read
+           from <pcb>.kicad_pro by netclass_read), or lay nothing and report
+           it in "open". (Freerouting is deterministic; re-routing the
+           identical board can never clear these.)
+  vias     IPC-2221 via-ampacity fixer: a net whose spec current exceeds the
+           summed barrel ampacity at its layer transition gets parallel vias
+           dropped ON its fat track next to the existing transition via. When
+           the net owns a plane the new barrel shares load through it; on a
+           plane-less net a same-net tie track is added on the via's far layer.
+  ep_vias  thermal via farm under the EP of a dissipating exposed-pad part.
 
-Usage:  kicad-python swig_board_fixes.py <pcb> <netlist.json> <drc.json> <heal|vias|all>
-Emits JSON {"applied": [...]} on stdout; saves the board only when changed.
+Usage:  kicad-python swig_board_fixes.py <pcb> <netlist.json> <drc.json> <heal|vias|ep_vias|all>
+Emits JSON {"applied": [...], "open": [...]} on stdout; saves the board only
+when changed.
 """
 import json
 import math
-import re
 import sys
+from pathlib import Path
 
 import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
 import ipc_rules
+import netclass_read
 import swig_copper
+import swig_heal
 
-MAX_GAP = 2.0          # mm — beyond this it's a real routing failure
 TOL = 0.02             # mm — endpoint coincidence tolerance
 
 
 # The shared SWIG copper helpers live in swig_copper (F5-03); these aliases
-# keep the healer and the via adders below unchanged.
+# keep the via adders below unchanged.
 _to = swig_copper.to
 _mm = swig_copper.mm
 _dist = swig_copper.dist
@@ -51,185 +55,6 @@ _clear_path = swig_copper.clear_path
 _nearest_net_via = swig_copper.nearest_net_via
 _net_vias_near = swig_copper.net_vias_near
 _bfs_path = swig_copper.bfs_path
-
-
-def heal_micro_gaps(board, drc):
-    """Two remedies for a same-net DRC 'unconnected items' pair:
-    - SHORT BRIDGE: nearest attach points <= MAX_GAP apart on a shared layer
-      get a clearance-checked track (router/SES artifact).
-    - ISLAND LINK: connect the two clusters anchor-to-anchor (via centers =
-      any layer, track ends / pads = their layer) — straight, L, then a BFS
-      maze route. On plane nets this repairs what the DSN plane abstraction
-      hid from the router (fill voids/islands)."""
-    applied = []
-    plane_nets = {z.GetNetname() for z in board.Zones()
-                  if not z.GetIsRuleArea()}
-    for item in drc.get("unconnected_items", []):
-        its = item.get("items", [])
-        if len(its) != 2:
-            continue
-        nets = [re.search(r"\[(.+?)\]", i.get("description", "")) for i in its]
-        if not all(nets) or nets[0].group(1) != nets[1].group(1):
-            continue
-        netname = nets[0].group(1)
-        net = board.FindNet(netname)
-        if net is None:
-            continue
-        pos = []
-        for i in its:
-            p = i.get("pos") or {}
-            pos.append((float(p.get("x", 0)), float(p.get("y", 0))))
-
-        nc = net.GetNetCode()
-
-        # --- remedy 1: SHORT BRIDGE between the nearest attach points -----
-        cands = [_attach_points(board, nc, p) for p in pos]
-        if cands[0] and cands[1]:
-            a, b = min(((a, b) for a in cands[0] for b in cands[1]),
-                       key=lambda ab: _dist(ab[0][:2], ab[1][:2]))
-            gap = _dist(a[:2], b[:2])
-            same_layer = (a[2] is None or b[2] is None or a[2] == b[2])
-            if gap <= MAX_GAP and same_layer:
-                layer = next((p[2] for p in (a, b) if p[2] is not None),
-                             pcbnew.F_Cu)
-                width = min((w for w in (a[3], b[3]) if w), default=0.25)
-                if _clear_path(board, nc, a[:2], b[:2],
-                               width / 2 + _min_clearance(board) + 0.05,
-                               layer):
-                    t = pcbnew.PCB_TRACK(board)
-                    t.SetStart(pcbnew.VECTOR2I(_mm(a[0]), _mm(a[1])))
-                    t.SetEnd(pcbnew.VECTOR2I(_mm(b[0]), _mm(b[1])))
-                    t.SetWidth(_mm(width))
-                    t.SetLayer(layer)
-                    t.SetNet(net)
-                    board.Add(t)
-                    applied.append(
-                        f"healed {gap:.2f} mm same-net gap on {netname} "
-                        f"({board.GetLayerName(layer)}, {width:.2f} mm bridge)")
-                    continue
-
-        # --- remedy 2: ISLAND LINK. Lay a same-net track between the two
-        # disconnected clusters. Anchors: same-net via centers near each item
-        # (reach any layer) and track endpoints (their own layer). Try every
-        # compatible (anchor pair, layer) straight/L first; escalate to a
-        # coarse BFS maze route for the nearest pairs — that threads via
-        # fanout fields no fixed shape can. On plane nets this is the
-        # DSN-abstraction fix (router believed the plane connected them). ---
-        zlayers = [z.GetLayer() for z in board.Zones()
-                   if not z.GetIsRuleArea() and z.GetNetname() == netname]
-        anchors = []
-        for p in pos:
-            a_list = [(v, None) for v in _net_vias_near(board, nc, p)]
-            a_list += [((x, y), layer)
-                       for x, y, layer, _w in _attach_points(board, nc, p)
-                       if layer is not None]
-            anchors.append(a_list)
-        if not (anchors[0] and anchors[1]):
-            continue
-
-        def layers_for(la, lb):
-            if la is None and lb is None:
-                return zlayers + [pcbnew.F_Cu, pcbnew.B_Cu]
-            if la is None:
-                return [lb]
-            if lb is None:
-                return [la]
-            return [la] if la == lb else []
-
-        pairs = sorted(((a, b) for a in anchors[0] for b in anchors[1]),
-                       key=lambda ab: _dist(ab[0][0], ab[1][0]))
-        # BFS phase: try the pairs with the most LAYER FREEDOM first (via-via
-        # can route on any layer; track-end pairs are locked to one) — the
-        # nearest pairs are usually layer-locked stubs that already failed.
-        bfs_pairs = sorted(pairs, key=lambda ab: (
-            (ab[0][1] is not None) + (ab[1][1] is not None),
-            _dist(ab[0][0], ab[1][0])))
-        done = False
-        for use_bfs, limit in ((False, 10), (True, 6)):
-            for (pa, la), (pb, lb) in (bfs_pairs if use_bfs else pairs)[:limit]:
-                for layer in layers_for(la, lb):
-                    if _try_link(board, net, pa, pb, layer, bfs=use_bfs):
-                        applied.append(
-                            f"{netname}: linked disconnected clusters "
-                            f"({_dist(pa, pb):.2f} mm apart) on "
-                            f"{board.GetLayerName(layer)}"
-                            + (" via maze route" if use_bfs else "")
-                            + (" — DSN plane abstraction hid the fill void"
-                               if netname in plane_nets else ""))
-                        done = True
-                        break
-                if done:
-                    break
-            if done:
-                break
-
-        # --- remedy 3: NO SHARED LAYER. One cluster lives on a single layer
-        # with no via (e.g. an F.Cu-only stub) and the other side's anchors
-        # are elsewhere — no link is even attemptable. Drop a same-net via on
-        # a track-end anchor to buy layer freedom, then link from it. The
-        # via is removed again if no link lands. ---------------------------
-        if not done:
-            w, drill = _via_template(board, nc)
-            keep_via = _to(w) / 2 + 0.25
-            for side in (0, 1):
-                for pa, la in anchors[side]:
-                    if la is None or not _clear_spot(board, nc, pa, keep_via):
-                        continue
-                    v = _add_via(board, net, pa, w, drill)
-                    for use_bfs in (False, True):
-                        for pb, lb in anchors[1 - side][:6]:
-                            for layer in layers_for(None, lb):
-                                if _try_link(board, net, pa, pb, layer,
-                                             bfs=use_bfs):
-                                    applied.append(
-                                        f"{netname}: stitched a via at "
-                                        f"({pa[0]:.2f},{pa[1]:.2f}) and linked "
-                                        f"clusters on "
-                                        f"{board.GetLayerName(layer)}"
-                                        + (" via maze route" if use_bfs
-                                           else ""))
-                                    done = True
-                                    break
-                            if done:
-                                break
-                        if done:
-                            break
-                    if done:
-                        break
-                    board.Remove(v)        # via bought nothing — take it back
-                if done:
-                    break
-    return applied
-
-
-def _try_link(board, net, a, b, layer, width=0.3, bfs=False):
-    """Lay a same-net link from a to b on layer — straight, L-shaped, or
-    (when bfs=True) maze-routed. Returns True when tracks were added."""
-    nc = net.GetNetCode()
-    keep = width / 2 + _min_clearance(board) + 0.05
-    path = None
-    for cand in ((a, b),
-                 (a, (a[0], b[1]), b),
-                 (a, (b[0], a[1]), b)):
-        if all(_clear_path(board, nc, p, q, keep, layer)
-               for p, q in zip(cand, cand[1:])):
-            path = cand
-            break
-    if path is None and bfs:
-        path = _bfs_path(board, nc, a, b, layer, keep)
-    if path is None:
-        return False
-    for p, q in zip(path, path[1:]):
-        if _dist(p, q) < 1e-3:
-            continue
-        t = pcbnew.PCB_TRACK(board)
-        t.SetStart(pcbnew.VECTOR2I(_mm(p[0]), _mm(p[1])))
-        t.SetEnd(pcbnew.VECTOR2I(_mm(q[0]), _mm(q[1])))
-        t.SetWidth(_mm(width))
-        t.SetLayer(layer)
-        t.SetNet(net)
-        board.Add(t)
-    return True
 
 
 def add_parallel_vias(board, design, open_tasks):
@@ -404,20 +229,45 @@ def add_ep_via_farms(board, design):
     return applied
 
 
+def _read_json(path: str) -> dict:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def board_nets(board: pcbnew.BOARD) -> set[str]:
+    """Every net name carried by the board's tracks, pads and zones."""
+    names = {t.GetNetname() for t in board.GetTracks()}
+    names |= {p.GetNetname() for fp in board.GetFootprints() for p in fp.Pads()}
+    names |= {z.GetNetname() for z in board.Zones()}
+    return names - {""}
+
+
+def heal(board: pcbnew.BOARD, pcb: str, drc: dict) -> tuple[list[str], list[str]]:
+    """swig_heal at the class widths of <pcb>.kicad_pro. An unreadable project
+    heals nothing (no copper without its class width) and says so in open."""
+    pro = Path(pcb).with_suffix(".kicad_pro")
+    try:
+        widths = netclass_read.net_class_widths(pro, board_nets(board))
+    except ValueError as e:
+        return [], [f"heal skipped: net classes unreadable ({e})"]
+    return swig_heal.heal_micro_gaps(board, drc, widths)
+
+
 def main():
     pcb, netlist, drc_path, mode = sys.argv[1:5]
-    board = pcbnew.LoadBoard(pcb)
-    try:
-        design = json.load(open(netlist, encoding="utf-8"))
-    except Exception:
-        design = {}
-    try:
-        drc = json.load(open(drc_path, encoding="utf-8"))
-    except Exception:
-        drc = {}
+    board = pcbnew.LoadBoard(pcb) if Path(pcb).is_file() else None
+    if board is None:
+        print(json.dumps({"applied": [], "open": [f"could not load board {pcb}"]}))
+        sys.exit(1)
+    design, drc = _read_json(netlist), _read_json(drc_path)
     applied, open_tasks = [], []
     if mode in ("heal", "all"):
-        applied += heal_micro_gaps(board, drc)
+        healed, still_open = heal(board, pcb, drc)
+        applied += healed
+        open_tasks += still_open
     if mode in ("vias", "all"):
         applied += add_parallel_vias(board, design, open_tasks)
     if mode in ("ep_vias", "all"):
@@ -426,8 +276,8 @@ def main():
         board.BuildConnectivity()
         try:
             pcbnew.ZONE_FILLER(board).Fill(board.Zones())
-        except Exception:
-            pass
+        except Exception as e:     # pcbnew raises its own wrapped types
+            open_tasks.append(f"zone refill after the fixes failed ({type(e).__name__}: {e})")
         pcbnew.SaveBoard(pcb, board)
     print(json.dumps({"applied": applied, "open": open_tasks}))
 
