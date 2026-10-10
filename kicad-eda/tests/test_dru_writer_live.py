@@ -14,6 +14,9 @@ flags exactly its violation on a real board (ADR D7.8, rules R6 / R7 / R8).
   with all three over a user rules file, by exactly the three, and the user text
   stays byte-identical. Required on 9.0.4 and 10.0.5; also run on 10.99 (the
   KiCad 11 agent path's route_check DRC reads this file).
+- Layer keywords: render() writes '(layer outer)' / '(layer inner)' bare (a quoted
+  keyword is dropped by 9.0.4 / 10.0.5 and refused by 10.99); such rules compile
+  and flag exactly the net's tracks on the outer / inner layers of the probe.
 
 Skips cleanly without the release's kicad-cli or without a KiCad Python that
 imports pcbnew (the probe board cannot be built).
@@ -41,6 +44,7 @@ PROBE = json.loads((FIX / "probe.json").read_text(encoding="utf-8"))
 RELEASES = {"9.0": (9, 0), "10.0": (10, 0), "10.99": (10, 99)}
 FAMILIES = ("R8", "R7", "R6")
 CASES = ("probe", "jlc4l_usb", "six_layer")
+KEYWORDS = ("outer", "inner")
 K10_RECIPE = "RULES.md K10 (kicad-eda:wave1, KiCad 10.0.5)"
 BUILD_TIMEOUT_S = 300
 USER_RULES = ("(version 1)\r\n# user rules kept by kicad-eda\r\n"
@@ -110,14 +114,25 @@ def _drc(board: Path, cli: str) -> tuple[Counter[Key], list[dict]]:
     return Counter(_key(v) for v in report["violations"]), report["violations"]
 
 
-def _expected(family: str) -> Key:
-    want = PROBE["expect"][family]
-    track = next(t for t in PROBE["board"]["tracks"] if t["id"] == want["track"])
+def _track_key(track_id: str, violation_type: str) -> Key:
+    """The DRC key of an error on probe track `track_id` (net, layer, start point)."""
+    track = next(t for t in PROBE["board"]["tracks"] if t["id"] == track_id)
     x, y = (o + d for o, d in zip(PROBE["board"]["origin"], track["from"], strict=True))
     length = abs(track["to"][0] - track["from"][0]) + abs(track["to"][1] - track["from"][1])
     item = (f"Track [{track['net']}] on {track['layer']}, length {length:.4f} mm",
             float(x), float(y))
-    return want["type"], "error", (item,)
+    return violation_type, "error", (item,)
+
+
+def _expected(family: str) -> Key:
+    want = PROBE["expect"][family]
+    return _track_key(want["track"], want["type"])
+
+
+def _keyword_rule(keyword: str) -> dw.Rule:
+    net = dw.net_literal(PROBE["layer_keywords"]["net"])
+    return dw.Rule(f"kicad_eda_probe_{keyword}", keyword, f"A.NetName == {net}",
+                   "disallow track")
 
 
 _BASELINES: dict[str, Counter[Key]] = {}
@@ -153,6 +168,17 @@ def test_generated_files_compile(installs: list[env.KiCadInstall], release: str,
     assert res["canary_added"] is False and res["crash"] is False, res
 
 
+@pytest.mark.parametrize("release", list(RELEASES))
+def test_outer_and_inner_layer_keywords_compile(installs: list[env.KiCadInstall],
+                                                release: str) -> None:
+    cli = _cli(installs, release)
+    text = dw.render([_keyword_rule(k) for k in KEYWORDS])
+    assert all(f"\n  (layer {k})\n" in text for k in KEYWORDS), text
+    res = dg.rules_compile(text, cli)
+    assert res["ok"] is True and res["rc"] == 0 and res["fired"] >= 1, res
+    assert res["canary_added"] is False and res["crash"] is False, res
+
+
 # ---------------------------------------------------------------- families
 @pytest.mark.parametrize("family", FAMILIES)
 @pytest.mark.parametrize("release", list(RELEASES))
@@ -177,3 +203,14 @@ def test_all_families_over_user_rules(installs: list[env.KiCadInstall], probe_bo
     assert new == Counter({_expected(f): 1 for f in FAMILIES}), new
     text = dru.read_bytes().decode("utf-8")
     assert text.startswith(USER_RULES) and text == USER_RULES + dw.render_block(_rules("probe"))
+
+
+@pytest.mark.parametrize("keyword", KEYWORDS)
+@pytest.mark.parametrize("release", list(RELEASES))
+def test_layer_keywords_restrict_the_rule_to_their_layers(
+        installs: list[env.KiCadInstall], probe_board: Path, release: str, keyword: str,
+        tmp_path: Path) -> None:
+    cli = _cli(installs, release)
+    spec = PROBE["layer_keywords"]
+    new, _, _ = _new_violations(probe_board, cli, [_keyword_rule(keyword)], tmp_path)
+    assert new == Counter({_track_key(t, spec["type"]): 1 for t in spec[keyword]}), new

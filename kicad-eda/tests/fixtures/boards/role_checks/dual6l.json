@@ -1,0 +1,19 @@
+{
+  "name": "dual6l",
+  "title": "D7-18a layer-role fixture: 6L JLC06161H-2116 roles, a dual stripline on In2",
+  "copper_layers": 6,
+  "planes": {"In1.Cu": "GND", "In4.Cu": "+3V3"},
+  "components": [],
+  "nets": {
+    "GND": [],
+    "+3V3": [],
+    "ZS": [],
+    "AUX": [],
+    "SHORT": [],
+    "XING": [],
+    "OFFSIDE": []
+  },
+  "net_specs": {
+    "ZS": {"impedance": 50, "layers": ["In2.Cu"]}
+  }
+}

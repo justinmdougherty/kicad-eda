@@ -1,0 +1,19 @@
+{
+  "name": "role4l",
+  "title": "D7-18a layer-role fixture: 4L, In1 GND plane, In2 +3V3 plane",
+  "copper_layers": 4,
+  "planes": {"In1.Cu": "GND", "In2.Cu": "+3V3"},
+  "components": [
+    {"ref": "C1", "lib_id": "Device:C", "value": "100nF",
+     "footprint": "Capacitor_SMD:C_0603_1608Metric"}
+  ],
+  "nets": {
+    "GND": [["C1", "2"]],
+    "+3V3": [["C1", "1"]],
+    "SIG_A": [],
+    "Z50": []
+  },
+  "net_specs": {
+    "Z50": {"impedance": 50}
+  }
+}

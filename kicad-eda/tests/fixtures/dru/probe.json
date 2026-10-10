@@ -30,5 +30,12 @@
     "R8": {"track": "foreign_on_plane", "type": "items_not_allowed"},
     "R7": {"track": "impedance_off_layer", "type": "items_not_allowed"},
     "R6": {"track": "narrow_impedance", "type": "track_width"}
+  },
+  "layer_keywords": {
+    "description": "A '(layer outer)' / '(layer inner)' rule 'A.NetName == net' -> 'disallow track' must flag exactly the net's tracks on those layers (rendered as bare keywords: quoted, KiCad drops or refuses the file).",
+    "net": "SIG",
+    "type": "items_not_allowed",
+    "outer": ["signal_on_b", "signal_on_f"],
+    "inner": ["foreign_on_plane"]
   }
 }

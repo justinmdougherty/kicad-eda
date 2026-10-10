@@ -54,6 +54,9 @@ REMEDY_RATIONALE = "standard remedy for an auto task (gates.py)"
 # directly to freerouting (the harness without a handoff, as napkin defaults to False)
 ROUTE_AUTO, ROUTE_FREEROUTING, ROUTE_AGENT = "auto", "freerouting", "agent"
 ROUTE_MODES: tuple[str, ...] = (ROUTE_AUTO, ROUTE_FREEROUTING, ROUTE_AGENT)
+# --resume (ROADMAP D5; rp_route_modes): continue a run that handed routing to the agent
+RESUME_ROUTED, RESUME_STALLED = "routed", "stalled"
+RESUME_MODES: tuple[str, ...] = (RESUME_ROUTED, RESUME_STALLED)
 STATUS_HANDOFF = "handoff"       # report['status'] of a run that handed routing to the agent
 # report['routing'] of a harness run (review_report renders method / requested / why)
 ROUTING_REQUESTED = ROUTE_AUTO
@@ -87,13 +90,17 @@ class RunContext:
     attempts of the ladder), best_attempt + best_board + best_placed (auto:
     the one with the fewest unrouted nets, its routed and placed boards) and
     handoff_pending (agent: placed, not routed); provider_routed says a
-    feature's route_provider routed the last attempt."""
+    feature's route_provider routed the last attempt. `resume` is --resume
+    (RESUME_MODES, '' = a fresh run): such a run continues the handoff in
+    `handoff_doc` (rp_route_modes.load_resume) and never hands off again."""
     netlist: str
     w: float
     h: float
     placement: str = ""
     napkin: bool = False
     route: str = ROUTE_FREEROUTING
+    resume: str = ""                                  # --resume routed | stalled
+    handoff_doc: dict = field(default_factory=dict)   # the handoff a resumed run continues
     no_cache: bool = field(default_factory=lambda: bool(os.environ.get("PIPELINE_NO_CACHE")))
     design: dict = field(default_factory=dict)
     syms: str = ""

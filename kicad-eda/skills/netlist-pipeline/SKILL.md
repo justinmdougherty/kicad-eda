@@ -1,13 +1,16 @@
 ---
 name: netlist-pipeline
 description: >-
-  Headless concept-to-Gerbers PCB flow: author a pad-level netlist.json, then
-  drive it through five self-remediating review gates (lint -> schematic+ERC
-  -> SWIG placement -> routing+DRC (agent routing through the KiCad board
-  API by default, Freerouting as the fallback) -> fab package). Use this for any board
-  that should be produced WITHOUT the KiCad GUI — including fixed-outline,
-  two-sided, and high-current designs. For the GUI-assisted 10-stage flow use
-  the pcb-design skill instead.
+  Headless reference for the netlist-first flow: authoring a pad-level
+  netlist.json (nets by pad number, net_specs, preroutes, the board block)
+  and running the gated harness run_pipeline.py (G1 lint -> G2 schematic +
+  ERC -> G3 placement -> G4 routing, Freerouting with a handoff to the router
+  subagent -> G5 fab zip) with its flags, exit codes and artifacts, or the
+  same steps one MCP tool at a time. Use for a supervised headless build
+  where the user stays in the loop and makes the calls, including
+  fixed-outline, two-sided and high-current designs. Not for hands-off,
+  no-questions or unattended builds (use napkin-mode), and not for the
+  interactive, GUI-assisted 10-stage flow (use pcb-design).
 ---
 
 # Headless netlist-first pipeline
@@ -21,8 +24,30 @@ The complete run-book lives at `${CLAUDE_PLUGIN_ROOT}/docs/PIPELINE.md` —
 netlist.json -> G1 lint -> G2 schematic+ERC -> G3 placement -> G4 routing -> G5 fab zip
 ```
 
-Run: `<venv-python> ${CLAUDE_PLUGIN_ROOT}/pipeline/run_pipeline.py <netlist.json> <w> <h>`
+Run: `<venv-python> ${CLAUDE_PLUGIN_ROOT}/pipeline/run_pipeline.py <netlist.json> [<w> <h>] [placement.json] [--strict] [--route auto|freerouting|agent] [--resume routed|stalled]`
 Regression: `<venv-python> ${CLAUDE_PLUGIN_ROOT}/pipeline/run_all.py` (examples/)
+
+- Board dims are optional: the netlist `board` block, else the board is
+  auto-sized to its parts (a design whose every part is fixed needs the
+  block or the dims).
+- Napkin behaviour is the default (ROADMAP D5): the harness turns floating
+  IC output / I/O / passive / NC pins, connectors facing the board interior,
+  fractured planes and short EP via farms into automatic remedies, one
+  decision each (floating inputs stay designer tasks); `--strict` turns
+  these policies off (a netlist `"mode": "napkin"` always means napkin). A
+  hands-off run follows the napkin-mode skill.
+- Exit codes: `0` PASS, `1` FAIL (also a resumed run that cannot continue:
+  the report's `error`), `2` usage error, `3` routing handoff (G4 below).
+- Artifacts beside the netlist (`<stem>` = its file name without `.json`),
+  written on every exit: `<stem>_pipeline_report.json` (gate verdicts,
+  remediations, routing, fab package, `error`), `<stem>_review.md` (the human
+  review; `review_report(netlist)` re-renders it) and the append-only
+  decision log `<stem>.decisions.jsonl` (yours go in with `record_decision`);
+  on exit 3 also `<stem>_route_handoff.json`. Then `<stem>.kicad_sch` /
+  `<stem>.kicad_pcb` (`<stem>.napkin.*` siblings while the canonical files are
+  open in a KiCad editor), the renders `<stem>_final_top.png` /
+  `<stem>_final_bottom.png`, the fab zip `<stem>_<FAB_PROFILE>.zip`, and after
+  agent routing the pre-KiCad-11 snapshot `<stem>.k9.kicad_pcb`.
 
 Gates self-feed: missing bypass caps are auto-added (G2), courtyard overlap
 re-places at a looser pack scale (G3), same-net micro-gaps and plane islands
@@ -35,8 +60,21 @@ G4 has two implementations. **Agent routing is the default when you drive
 the board yourself:** after G3 you route it net by net through the KiCad
 board API (`agent-routing` skill, `router` subagent) — `route_check` gives
 you every DRC violation with coordinates and `route_status` is the routed
-gate. `run_pipeline.py` (unattended) still runs Freerouting with the healers
-above; `autoroute_board` remains as the fallback for a KiCad 9 format board.
+gate. **The harness** routes with Freerouting and the healers above, and
+`--route` decides what happens around it: `auto` (default) hands the board
+to the agent when G4 fails — it writes `<stem>_route_handoff.json` (`pcb`,
+`why`, `unconnected_items`, `net_classes`, `instructions`, `resume`) and
+exits 3; `freerouting` makes a G4 failure final (exit 1); `agent` hands the
+placed board off without trying Freerouting. Route a handoff with the
+`router` subagent and its `instructions`, `close_board(pcb, save=True)`,
+then run the handoff's `resume` line: `--resume routed` judges the agent's
+board (G3 carried from the handoff, G4 judges the agent's copper);
+`--resume stalled`, after `route_check` reported `stalled`, runs Freerouting
+from the pre-KiCad-11 snapshot, then a higher pack_scale, then stops. A
+resumed run never hands off again, and a netlist changed since the handoff
+needs a fresh run. A pipeline feature may refuse the handoff: G4 then fails
+with "routing handoff refused: ...". `autoroute_board` remains the
+conversational fallback for a KiCad 9 format board.
 
 ## MCP tools for the headless flow
 
@@ -69,9 +107,12 @@ the API backend needs KiCad 11 to open; pass `backend="file"` for a KiCad
 KiCad 11 file** (`version 20260901`): KiCad 9/10, their kicad-cli and pcbnew
 Python cannot read it, so `autoroute_board` / `check_design_gates` (placement)
 / `add_ground_stitching` refuse it with the reason, while `drc_pcb`,
-`export_fab_package`, `render_pcb` keep working through kicad-cli 11. Copy the
-KiCad 9 file before the first `route_check` if Freerouting must stay an
-option. A nightly that has never been opened has no library tables
+`export_fab_package`, `render_pcb` keep working through kicad-cli 11. The
+first save snapshots the pre-KiCad-11 board automatically as
+`X.k9.kicad_pcb` + `X.k9.kicad_pro` (+ `.kicad_prl` / `.kicad_dru`; the
+responses carry `pre_k11_snapshot`), and `autoroute_board(pcb, from_snapshot=True)`
+restores it (the KiCad 11 copy moves to `X.agent.kicad_pcb`) and routes it
+with Freerouting. A nightly that has never been opened has no library tables
 (`symbol Device:R not found`) — open it once or copy `sym-lib-table` /
 `fp-lib-table` from its `share/kicad/template`.
 
@@ -79,7 +120,10 @@ option. A nightly that has never been opened has no library tables
 
 1. **Pad-correct nets.** Exposed pads have their own pad number (QFN-24 EP =
    pin 25). `Device:LED` pin 1 = cathode. Verify real pin maps against the
-   datasheet, not the symbol name.
+   datasheet, not the symbol name. A generated part's `pin_groups` go on
+   their nets pad by pad: every number of `pin_groups["GND"]` (and of any
+   other group of one net) on that net — the stacked copies are hidden on
+   the symbol and float otherwise; a RESERVED group goes to `no_connect`.
 2. **Design intent in `net_specs`**: `{"5V": {"voltage":5, "current":4}}`
    drives IPC-2221/2141A track widths, via sizes, and the G4 ampacity gate.
    Spec CONTINUOUS current — bursts ride the bulk caps (IPC-2152).

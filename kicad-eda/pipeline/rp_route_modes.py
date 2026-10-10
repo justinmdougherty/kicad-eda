@@ -22,11 +22,33 @@ A handoff writes <stem>_route_handoff.json (handoff_document: what the agent and
 resumed run need), sets report['status'] = 'handoff', report['handoff'] (its path),
 report['handoff_resume'] (the two resume command lines) and report['routing'] {method
 'agent (handoff)', requested, why, handoff}, and records a routing decision; PASS is
-false (rp_context.halt) and run_pipeline.main exits 3 (rp_cli.exit_code). Resuming
-(--resume routed|stalled) is a later harness feature; the commands are recorded now.
-A handoff describes the board the run left, so the next run that reaches routing
-(retire_handoff: a route-cache miss re-places the board, a hit re-judges it)
-removes it (report['superseded_handoff']); only a new handoff writes one again.
+false (rp_context.halt) and run_pipeline.main exits 3 (rp_cli.exit_code).
+A handoff describes the board the run left, so the next fresh run that reaches
+routing (retire_handoff: a route-cache miss re-places the board, a hit re-judges
+it) removes it (report['superseded_handoff']); only a new handoff writes one again.
+
+--resume routed|stalled (run(..., resume=...); RunContext.resume) continues the
+handoff. load_resume (before G1) reads <stem>_route_handoff.json and refuses
+(ResumeError: report 'error', PASS false, exit 1) a missing or malformed one, a
+board other than the one it names (a KiCad editor holding it sends a napkin run
+to the siblings) and a design whose route hash changed since; resume_after_g2
+(in place of the route cache) refuses a G2 remediation (the routed board would
+be stale) and checks the hash again. A resumed run never hands off again
+(after_g4_failure, agent_takes_over, note_attempt step aside).
+  routed   agent_board: the route record of the agent's board (tracks counted
+           from its text), report['routing'] {method 'agent', why: the router
+           subagent routed it through the KiCad 11 board API} and its decision;
+           G3 = the handoff's verdict + a courtyard DRC (rp_stage_place), G4
+           judges it (rp_stage_layout: the API routed gate on a KiCad 11 board).
+           The handoff stays (the agent may fix the board and resume again).
+  stalled  rp_stage_place.stall_chain: Freerouting on the pre-KiCad-11 snapshot
+           (rp_route.route_from_snapshot, near-miss alternates / heal included),
+           then the pack_scale ladder from the handoff's pack_scale + 1, then
+           stop. stall_step records each step in report['stall_chain'] {snapshot,
+           agent_copy, steps, outcome} with one routing decision; end_stall_chain
+           sets report['routing'] (why 'stall chain exhausted: ...' when nothing
+           finished the board, plus a 'stop' decision) and retires the consumed
+           handoff (the board is no longer the one it describes).
 """
 from __future__ import annotations
 
@@ -39,6 +61,7 @@ import sys
 from pathlib import Path
 
 import rp_paths  # noqa: F401  first: puts server/ and server/tools/ on sys.path
+import board_text_copper as btc
 import drc_guard
 import netclass_read
 import rp_context
@@ -58,8 +81,25 @@ PROVIDER_METHOD = rp_context.PROVIDER_METHOD
 UNCONNECTED_LIMIT = 40          # unconnected items copied from <stem>_drc.json
 REFUSED = "routing handoff refused: "
 SOURCE = "run_pipeline route modes"
-RESUME_MODES = ("routed", "stalled")
+RESUME_MODES = rp_context.RESUME_MODES
 RUN_PIPELINE = Path(__file__).resolve().parent / "run_pipeline.py"
+# --resume (module doc)
+CARRIED_WARNING = "placement checks carried from the handoff run"
+AGENT_METHOD = "agent"
+AGENT_ROUTED_WHY = "the router subagent routed it through the KiCad 11 board API"
+AGENT_K9_WHY = ("the router subagent routed it through the KiCad board API in a KiCad 9/10 "
+                "session (the board stays readable by pcbnew)")
+STALL_METHOD = "freerouting (stall fallback)"
+STALL_EXHAUSTED = "stall chain exhausted"
+STALL_RULE = ("ROADMAP D5 stall fallback order: Freerouting from the pre-KiCad-11 snapshot (the "
+              "agent's KiCad 11 board kept as <stem>.agent.*) with the near-miss alternates and "
+              "verified heal, then a higher pack_scale, then stop with a report; a resumed run "
+              "never hands the board back to the agent")
+
+
+class ResumeError(RuntimeError):
+    """A --resume run that cannot continue the handoff: run() records it as
+    the report's error (PASS false, exit 1), never as a crash."""
 AGENT_WHY = ("--route agent: the router subagent routes the placed board through the KiCad "
              "board API (no Freerouting attempt)")
 PROVIDER_WHY = ("--route agent, but a pipeline feature supplies the router (route_provider): "
@@ -120,8 +160,8 @@ def start_ladder(ctx: rp_context.RunContext) -> None:
 def agent_takes_over(ctx: rp_context.RunContext) -> bool:
     """At a passing G3 in agent mode: True = stop the ladder and hand the
     placed board off. An active route_provider routes instead (recorded once:
-    routing record + decision)."""
-    if ctx.route != rp_context.ROUTE_AGENT:
+    routing record + decision). Never in a resumed run (no handoff loop)."""
+    if ctx.route != rp_context.ROUTE_AGENT or ctx.resume:
         return False
     if rp_hooks.first("route_provider", ctx) is None:
         return True
@@ -155,8 +195,8 @@ def note_attempt(ctx: rp_context.RunContext, attempt: int, scale: float) -> None
     """Auto mode, after each routed attempt (never under a route_provider):
     record it in ctx.route_attempts and keep its routed and placed boards'
     bytes when it is the best so far (fewest unrouted; a later attempt wins a
-    tie)."""
-    if ctx.route != rp_context.ROUTE_AUTO or ctx.provider_routed:
+    tie). Not in a resumed run: nothing is handed off, G4 judges the last one."""
+    if ctx.route != rp_context.ROUTE_AUTO or ctx.provider_routed or ctx.resume:
         return
     rep = ctx.route_rep
     placed = Path(ctx.pcb + rp_route.PLACED_SUFFIX)
@@ -238,9 +278,11 @@ def hand_off_placed(ctx: rp_context.RunContext) -> bool:
 def after_g4_failure(ctx: rp_context.RunContext) -> None:
     """Auto mode, G4 recorded as failed on a board this run routed with
     Freerouting: hand it off (or fail on a veto, the blocker added to G4).
-    Nothing for freerouting / agent mode, a route-cache hit or a
-    route_provider's board."""
-    if ctx.route != rp_context.ROUTE_AUTO or ctx.use_cache or ctx.provider_routed:
+    Nothing for freerouting / agent mode, a route-cache hit, a
+    route_provider's board or a resumed run (no handoff loop: its G4 FAIL
+    stands)."""
+    if (ctx.route != rp_context.ROUTE_AUTO or ctx.use_cache or ctx.provider_routed
+            or ctx.resume):
         return
     why = freerouting_why(ctx)
     veto = rp_hooks.first("handoff_veto", ctx)
@@ -323,10 +365,11 @@ def handoff_document(ctx: rp_context.RunContext, why: str, placed_sha256: str | 
                      freerouting: dict | None) -> dict:
     """The JSON the agent and a resumed run read: the board and its project,
     why it was handed off, the placement it carries (pack_scale, route hash of
-    the design, placed board sha256, G3 verdict), what Freerouting did, what
-    is still unrouted, the net-class widths, the instructions and the resume
-    command lines. A DRC report or project file that cannot be read is named
-    in unconnected_items_error / net_classes_error, never raised."""
+    the design, placed board sha256, G3 verdict, the board build summary
+    'board' a resumed G3 reuses), what Freerouting did, what is still
+    unrouted, the net-class widths, the instructions and the resume command
+    lines. A DRC report or project file that cannot be read is named in
+    unconnected_items_error / net_classes_error, never raised."""
     items, items_error = unconnected_items(ctx.pcb)
     classes, classes_error = net_classes(ctx)
     doc = {"kind": HANDOFF_KIND, "version": HANDOFF_VERSION,
@@ -336,7 +379,8 @@ def handoff_document(ctx: rp_context.RunContext, why: str, placed_sha256: str | 
            "route_hash": rp_route_hash.route_hash(ctx.design, ctx.netlist_dir),
            "placed_sha256": placed_sha256, "board_file": tc.board_file_info(ctx.pcb),
            "freerouting": freerouting, "unconnected_items": items, "net_classes": classes,
-           "g3": ctx.g3, "instructions": list(INSTRUCTIONS), "resume": resume_commands(ctx)}
+           "g3": ctx.g3, "board": ctx.board_rep, "instructions": list(INSTRUCTIONS),
+           "resume": resume_commands(ctx)}
     errors = {"unconnected_items_error": items_error, "net_classes_error": classes_error}
     return {**doc, **{key: value for key, value in errors.items() if value}}
 
@@ -431,3 +475,226 @@ def _mm(value: float) -> str:
 def _command(args: list[str]) -> str:
     """One shell line: Windows quoting on Windows, POSIX quoting elsewhere."""
     return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+
+
+# --- --resume: what a resumed run needs ----------------------------------------------------
+
+def check_resume(resume: str, placement: str) -> str:
+    """`resume` when it is '' or a --resume mode, else ValueError; a resume
+    with a placement override is a ValueError too (the run continues the
+    board the handoff describes)."""
+    if resume and resume not in RESUME_MODES:
+        raise ValueError(f"resume must be one of {', '.join(RESUME_MODES)} (or ''), "
+                         f"got {resume!r}")
+    if resume and placement:
+        raise ValueError(f"resume cannot be combined with a placement override ({placement})")
+    return resume
+
+
+def load_resume(ctx: rp_context.RunContext) -> None:
+    """Before G1 of a resumed run: the handoff, the board it names and the
+    design it was made from (module doc); ResumeError when any is missing or
+    differs. Nothing for a fresh run or one stage_load already halted."""
+    if not ctx.resume or ctx.halted_by:
+        return
+    path = handoff_path(ctx.netlist)
+    doc = read_handoff(path)
+    _check_board(ctx, doc)
+    check_route_hash(ctx, doc)
+    ctx.handoff_doc = doc
+    ctx.report["resume"] = {"mode": ctx.resume, "handoff": str(path),
+                            "requested": doc.get("requested"), "pack_scale": doc["pack_scale"]}
+
+
+def read_handoff(path: Path) -> dict:
+    """The handoff document at `path`, or ResumeError naming what is wrong."""
+    if not path.is_file():
+        raise ResumeError(f"no routing handoff {path.name} beside the netlist: --resume "
+                          f"continues a run that handed routing to the agent (exit 3); run "
+                          f"without --resume")
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ResumeError(f"the routing handoff {path.name} cannot be read: {e}") from e
+    if (not isinstance(doc, dict) or doc.get("kind") != HANDOFF_KIND
+            or doc.get("version") != HANDOFF_VERSION):
+        raise ResumeError(f"{path.name} is not a version {HANDOFF_VERSION} '{HANDOFF_KIND}' "
+                          f"document")
+    scale = doc.get("pack_scale")
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not scale > 0:
+        raise ResumeError(f"{path.name} records no usable pack_scale ({scale!r})")
+    return doc
+
+
+def _check_board(ctx: rp_context.RunContext, doc: dict) -> None:
+    """The board this run judges must be the one the handoff names, on disk."""
+    named, board = Path(str(doc.get("pcb") or "")), Path(ctx.pcb)
+    if named.resolve() != board.resolve():
+        held = ("; a KiCad editor holds the board (the D5 hard stop moved this run to the "
+                "napkin siblings): close it in KiCad, then resume again"
+                if ctx.report.get("hard_stop") else "")
+        raise ResumeError(f"the handoff names the board {named}, but this run's board is "
+                          f"{board}{held}")
+    if not board.is_file():
+        raise ResumeError(f"the handed-off board {board} is missing")
+
+
+def check_route_hash(ctx: rp_context.RunContext, doc: dict) -> str:
+    """The design's route hash when it equals the handoff's, else ResumeError."""
+    current = rp_route_hash.route_hash(ctx.design, ctx.netlist_dir)
+    if doc.get("route_hash") != current:
+        raise ResumeError(f"the netlist changed since the handoff (route hash {current[:12]}, "
+                          f"the handoff's {str(doc.get('route_hash'))[:12]}): the handed-off "
+                          f"board no longer matches the design; rerun without --resume")
+    return current
+
+
+def resume_after_g2(ctx: rp_context.RunContext) -> None:
+    """In place of the route cache in a resumed run: a G2 remediation that
+    changed the netlist is a ResumeError (the routed board would be stale),
+    then the route hash is checked again on the design G1/G2 left."""
+    fixes = [str(item) for entry in ctx.remediation if entry["gate"] == "G2"
+             for item in entry["applied"]
+             if not str(item).lstrip().startswith(rp_context.OPEN_PREFIX)]
+    if fixes:
+        raise ResumeError(f"G2 remediated the netlist in this resumed run ({'; '.join(fixes)}): "
+                          f"the routed board would be stale; rerun without --resume to place "
+                          f"and route the remediated design")
+    ctx.rhash = check_route_hash(ctx, ctx.handoff_doc)
+    ctx.use_cache = False
+
+
+# --- --resume routed ------------------------------------------------------------------------
+
+def count_tracks(pcb: str) -> int | None:
+    """Tracks + arcs of a board read from its text (any KiCad 5..11 format);
+    None when the text cannot be read."""
+    try:
+        items = btc.read_copper_file(pcb).items
+    except (OSError, ValueError):
+        return None
+    return sum(1 for item in items if item.get("kind") in ("track", "arc"))
+
+
+def agent_board(ctx: rp_context.RunContext) -> None:
+    """--resume routed, before G3: the route record of the agent's board (G4
+    measures its unconnected count), report['routing'] and the decision."""
+    doc, path = ctx.handoff_doc, ctx.report["resume"]["handoff"]
+    ctx.route_rep = {"attempt": AGENT_METHOD, "pack_scale": doc.get("pack_scale"),
+                     "tracks": count_tracks(ctx.pcb), "unconnected": None}
+    why = AGENT_ROUTED_WHY if tc.swig_readable(ctx.pcb) else AGENT_K9_WHY
+    ctx.report["routing"] = {"method": AGENT_METHOD, "requested": doc.get("requested"),
+                             "why": why, "handoff": path}
+    ctx.decide("routing", "How is the board routed?",
+               f"the router subagent's board (--resume routed after the handoff {path}): G3 "
+               f"carries the handoff's placement checks, G4 judges the agent's copper", why,
+               source=SOURCE, alternatives=("--resume stalled: Freerouting on the "
+                                            "pre-KiCad-11 snapshot, then a higher pack_scale",))
+
+
+# --- --resume stalled -----------------------------------------------------------------------
+
+def _outcome(rep: dict) -> str:
+    unconnected = rep.get("unconnected")
+    if unconnected is None:
+        return f"the router failed ({_flat(rep.get('error') or 'no result')})"
+    return ("every net routed" if unconnected == 0 else f"{unconnected} unrouted") + _recovery(rep)
+
+
+def _recovery(rep: dict) -> str:
+    """What the near-miss recovery (rp_route: alternate DSN orders, then the
+    verified heal) did to an attempt, '' when it did not run."""
+    alts = [a for a in rep.get("alternates") or [] if isinstance(a, dict)]
+    if not alts:
+        return ""
+    kept = next((a for a in alts if a.get("seed") == rep.get("dsn_seed")), {})
+    if rep.get("unconnected"):
+        how = "neither the alternate DSN orders nor the verified heal finished it"
+    elif kept.get("unconnected"):
+        how = f"the verified micro-gap heal finished dsn_seed {rep.get('dsn_seed')}"
+    else:
+        how = f"alternate DSN order dsn_seed {rep.get('dsn_seed')} finished it"
+    first = alts[0].get("unconnected")
+    return f" (near miss: {first} unrouted with the canonical DSN order; {how})"
+
+
+def _scales(scales: tuple[float, ...]) -> str:
+    return ", ".join(str(s) for s in scales)
+
+
+def stall_step(ctx: rp_context.RunContext, step: str, scales: tuple[float, ...] = ()) -> None:
+    """One step of the stall chain ('snapshot' or 'ladder', on ctx.route_rep
+    as the step left it): an entry of report['stall_chain'] and its routing
+    decision."""
+    rep = ctx.route_rep
+    chain = ctx.report.get("stall_chain") or {
+        "snapshot": rep.get("pre_k11_snapshot") or tc.existing_snapshot(ctx.pcb),
+        "agent_copy": rep.get("agent_copy") or ctx.report.get("agent_board_preserved"),
+        "steps": []}
+    entry = {"step": step, "attempt": rep.get("attempt"), "pack_scale": rep.get("pack_scale"),
+             "tracks": rep.get("tracks"), "unconnected": rep.get("unconnected"),
+             **({"error": rep["error"]} if rep.get("error") else {}),
+             **({"fallback_from_snapshot": bool(rep.get("fallback_from_snapshot"))}
+                if step == "snapshot" else {"pack_scales": list(scales)})}
+    ctx.report["stall_chain"] = {**chain, "steps": [*chain["steps"], entry]}
+    if step == "snapshot":
+        _decide_snapshot(ctx, chain)
+    else:
+        ctx.decide("routing", "The snapshot route did not finish the board: re-place at a "
+                              "higher pack_scale?",
+                   f"re-placed along the pack_scale ladder {_scales(scales)} (from the "
+                   f"handoff's {ctx.handoff_doc.get('pack_scale')} + 1) and routed with "
+                   f"Freerouting: {_outcome(rep)} at pack_scale {rep.get('pack_scale')}",
+                   STALL_RULE,
+                   source=SOURCE, alternatives=("stop with a report",))
+
+
+def _decide_snapshot(ctx: rp_context.RunContext, chain: dict) -> None:
+    rep = ctx.route_rep
+    if rep.get("fallback_from_snapshot"):
+        what = (f"Freerouting on the pre-KiCad-11 snapshot {chain['snapshot']} (the agent's "
+                f"KiCad 11 board kept as {chain['agent_copy']}): {_outcome(rep)}")
+    elif rep.get("unconnected") is None:
+        what = (f"Freerouting on the pre-KiCad-11 snapshot failed: {_outcome(rep)}; the board "
+                f"stays as the agent left it")
+    else:
+        what = (f"Freerouting on the board as it is ({rep.get('fallback_note') or 'no snapshot'}"
+                f"): {_outcome(rep)}")
+    ctx.decide("routing", "Agent routing stalled (--resume stalled): how is the board routed "
+                          "now?", what, STALL_RULE, source=SOURCE,
+               alternatives=("re-place at the next pack_scale and route with Freerouting",
+                             "stop with a report"))
+
+
+def end_stall_chain(ctx: rp_context.RunContext, finished: bool,
+                    scales: tuple[float, ...]) -> None:
+    """The chain's outcome: report['routing'] (why 'stall chain exhausted:
+    ...' and a 'stop' decision when nothing finished the board) and the
+    consumed handoff retired."""
+    rep, steps = ctx.route_rep, ctx.report["stall_chain"]["steps"]
+    first = ("Freerouting on the pre-KiCad-11 snapshot" if steps[0].get("fallback_from_snapshot")
+             else "Freerouting on the board as the agent left it")
+    if finished:
+        how = (first if len(steps) == 1 else
+               f"Freerouting at pack_scale {rep.get('pack_scale')} (the pack_scale ladder)")
+        why = f"agent routing stalled (--resume stalled); the D5 fallback chain finished it: {how}"
+    else:
+        ladder = (f"the pack_scale ladder ({_scales(scales)}) ended with {_outcome(rep)} at "
+                  f"pack_scale {rep.get('pack_scale')}" if len(steps) > 1 else
+                  f"no pack_scale above {ctx.handoff_doc.get('pack_scale')} is left")
+        g3 = ("" if ctx.g3.get("passed") else
+              f"; G3 failed ({'; '.join(str(b) for b in ctx.g3.get('blockers') or [])})")
+        why = (f"{STALL_EXHAUSTED}: {first} left {_outcome(steps[0])}; {ladder}{g3}; the run "
+               f"fails and no new handoff is written")
+        ctx.decide("routing", "The stall fallback chain is exhausted: what now?",
+                   "stop: the last attempt is judged and fails; no new handoff (a resumed run "
+                   "never hands the board back to the agent)", f"{STALL_RULE}. {why}",
+                   source=SOURCE, alternatives=("hand the board to the router subagent again",))
+    ctx.report["stall_chain"] = {**ctx.report["stall_chain"],
+                                 "outcome": "routed" if finished else "exhausted"}
+    ctx.report["routing"] = {"method": STALL_METHOD, "requested": ctx.handoff_doc.get("requested"),
+                             "why": why, "handoff": ctx.report["resume"]["handoff"]}
+    consumed = handoff_path(ctx.netlist)
+    if consumed.is_file():
+        consumed.unlink()
+        ctx.report["superseded_handoff"] = str(consumed)

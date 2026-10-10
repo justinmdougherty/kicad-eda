@@ -18,7 +18,18 @@ rp_napkin.G3_POLICY_ROUNDS policy rounds at the SAME pack_scale (the netlist
 rewritten, the route-cache key refreshed, the board rebuilt and re-judged)
 before the ladder decides; a policy task left open stops the ladder like any
 design-intent task. A board SWIG cannot read was kept at load
-(rp_stage_schematic.preserve_unreadable_board) before G3 rebuilds over it."""
+(rp_stage_schematic.preserve_unreadable_board) before G3 rebuilds over it.
+
+--resume (rp_route_modes): the route cache is neither read nor retired
+(resume_after_g2 checks the design instead). routed: nothing is placed or
+routed; resume_g3 judges the agent's board (the handoff's G3 verdict carried,
+with a warning, plus a courtyard DRC of the board, through the g3_inputs /
+g3_verdict hooks). stalled: stall_chain -- Freerouting on the pre-KiCad-11
+snapshot (rp_route.route_from_snapshot, near-miss recovery included) judged by
+resume_g3, then, while the board is not finished, the pack_scale ladder from
+the handoff's pack_scale + 1 (rebuild + Freerouting, the snapshot route as the
+attempt a looser retry that no longer fits restores), then stop. No
+on_exhausted re-run and no handoff in a resumed run."""
 from __future__ import annotations
 
 import json
@@ -49,7 +60,11 @@ def stage_route_cache(ctx: rp_context.RunContext) -> bool:
     correctly invalidates. PIPELINE_NO_CACHE=1 bypasses. Never stops the run.
     An earlier run's routing handoff is superseded here: either way this run
     decides the board's state (rp_route_modes.retire_handoff). A miss also
-    removes the stale manifest (retire_manifest)."""
+    removes the stale manifest (retire_manifest). A resumed run continues the
+    handoff instead: rp_route_modes.resume_after_g2 (no cache, no retire)."""
+    if ctx.resume:
+        rp_route_modes.resume_after_g2(ctx)
+        return True
     rp_route_modes.retire_handoff(ctx)
     ctx.rhash = rp_route_hash.route_hash(ctx.design, ctx.netlist_dir)
     try:
@@ -107,8 +122,14 @@ def stage_place_route(ctx: rp_context.RunContext) -> bool:
     re-judge the cached routed board. Returns the G3 verdict. A board that
     passed G3 with 0 unconnected goes to the after_route hook before G4. In
     agent mode a placed board that passed G3 is handed off here (False: the
-    run stops; a veto fails G4 instead)."""
-    if ctx.use_cache:
+    run stops; a veto fails G4 instead). A resumed run judges the agent's
+    board (routed) or runs the stall chain (stalled)."""
+    if ctx.resume == rp_context.RESUME_ROUTED:
+        rp_route_modes.agent_board(ctx)
+        resume_g3(ctx)
+    elif ctx.resume == rp_context.RESUME_STALLED:
+        stall_chain(ctx)
+    elif ctx.use_cache:
         revalidate_cached_board(ctx)
     else:
         if place_and_route(ctx) and rp_hooks.first("on_exhausted", ctx):
@@ -150,21 +171,82 @@ def revalidate_cached_board(ctx: rp_context.RunContext) -> None:
                      "unconnected": ctx.cached.get("unconnected", 0)}
 
 
-def place_and_route(ctx: rp_context.RunContext) -> bool:
-    """The G3 -> route scale loop. A G3 failure whose tasks are all auto
+def resume_g3(ctx: rp_context.RunContext) -> None:
+    """G3 of a resumed run on the board as it is (the agent's, or the
+    snapshot Freerouting just routed): the handoff's G3 verdict carried (its
+    blockers re-judged as placement issues, its warnings plus
+    rp_route_modes.CARRIED_WARNING) and rp_kicad.courtyard_drc of the board
+    (kicad-cli of the KiCad that wrote it: a KiCad 11 board works), through
+    the g3_inputs / g3_verdict hooks; the handoff's board summary is the
+    build report."""
+    doc = ctx.handoff_doc
+    carried = doc.get("g3") if isinstance(doc.get("g3"), dict) else {}
+    ctx.board_rep = dict(doc.get("board") or {"ok": True})
+    cy = rp_kicad.courtyard_drc(ctx.pcb)
+    pl = {"issues": list(carried.get("blockers") or []),
+          "warnings": [*(carried.get("warnings") or []), rp_route_modes.CARRIED_WARNING]}
+    cy, pl = rp_hooks.chain("g3_inputs", ctx, (cy, pl))
+    verdict = rp_hooks.chain("g3_verdict", ctx,
+                             gates.g3_placement(ctx.board_rep, cy, pl["issues"], pl["warnings"],
+                                                napkin=ctx.napkin))
+    ctx.g3 = {**verdict, "warnings": list(dict.fromkeys(verdict["warnings"]))}
+
+
+def stall_chain(ctx: rp_context.RunContext) -> None:
+    """--resume stalled (ROADMAP D5): Freerouting on the pre-KiCad-11 snapshot
+    at the handoff's pack_scale (attempt 1, judged by resume_g3); while the
+    board is not finished (G3 passed and nothing unrouted), the pack_scale
+    ladder from the handoff's pack_scale + 1 (attempts 2..); then the outcome
+    (rp_route_modes.end_stall_chain). One routing decision per step."""
+    scale = float(ctx.handoff_doc["pack_scale"])
+    rp_route.route_from_snapshot(ctx, 1, scale)
+    resume_g3(ctx)
+    rp_route_modes.stall_step(ctx, "snapshot")
+    scales = remaining_scales(ctx, scale)
+    if not stall_finished(ctx) and scales:
+        routed = ctx.route_rep.get("unconnected") is not None
+        good = rp_context.Attempt(scale, ctx.g3, ctx.board_rep, ctx.route_rep) if routed else None
+        place_and_route(ctx, scales, first=2, last_good=good)
+        rp_route_modes.stall_step(ctx, "ladder", scales)
+    rp_route_modes.end_stall_chain(ctx, stall_finished(ctx), scales)
+
+
+def stall_finished(ctx: rp_context.RunContext) -> bool:
+    return bool(ctx.g3.get("passed")) and ctx.route_rep.get("unconnected") == 0
+
+
+def ladder_scales(ctx: rp_context.RunContext) -> tuple[float, ...]:
+    """The pack_scale ladder: one try at 1.0 with a placement override, else
+    the pack_scales hook's ladder or PACK_SCALES."""
+    return (1.0,) if ctx.placement else tuple(
+        rp_hooks.first("pack_scales", ctx, PACK_SCALES) or PACK_SCALES)
+
+
+def remaining_scales(ctx: rp_context.RunContext, scale: float) -> tuple[float, ...]:
+    """The ladder after `scale` (the handoff's pack_scale + 1 onward)."""
+    ladder = ladder_scales(ctx)
+    if scale in ladder:
+        return ladder[ladder.index(scale) + 1:]
+    return tuple(s for s in ladder if s > scale)
+
+
+def place_and_route(ctx: rp_context.RunContext, scales: tuple[float, ...] | None = None,
+                    first: int = 1, last_good: rp_context.Attempt | None = None) -> bool:
+    """The G3 -> route scale loop over `scales` (default ladder_scales),
+    numbering attempts from `first`. A G3 failure whose tasks are all auto
     ("loosen placement") re-places at the next pack_scale and re-tests; a
     routing shortfall does the same (the deterministic-router escape).
     Manual blockers (inward connector, missing keepout, bad pad ref) stop the
     loop — scale cannot fix design intent (napkin: policy_rounds first).
     True = the ladder is EXHAUSTED: every scale was tried, or a looser retry
-    no longer fits, without a finished route (the on_exhausted case). Agent
-    mode stops at the first scale that passes G3 without routing
-    (rp_route_modes.hold_for_agent); auto mode notes every routed attempt."""
-    scales = (1.0,) if ctx.placement else tuple(
-        rp_hooks.first("pack_scales", ctx, PACK_SCALES) or PACK_SCALES)
+    no longer fits (`last_good`, the last routed attempt, is restored), without
+    a finished route (the on_exhausted case). Agent mode stops at the first
+    scale that passes G3 without routing (rp_route_modes.hold_for_agent);
+    auto mode notes every routed attempt."""
+    scales = ladder_scales(ctx) if scales is None else scales
     rp_route_modes.start_ladder(ctx)
-    last_good: rp_context.Attempt | None = None
-    for attempt, scale in enumerate(scales, 1):
+    for i, scale in enumerate(scales):
+        attempt, after = first + i, (scales[i + 1] if i + 1 < len(scales) else None)
         rb = build_board(ctx, scale)
         if not rb.get("ok") and last_good is not None:
             restore_attempt(ctx, last_good, attempt, scale)
@@ -175,9 +257,9 @@ def place_and_route(ctx: rp_context.RunContext) -> bool:
         if not ctx.g3["passed"]:
             if not scale_can_fix(ctx.g3):
                 return False            # design intent: no scale can fix it
-            if attempt == len(scales):
+            if after is None:
                 return True
-            ctx.log_remediation("G3", attempt, [f"re-placed at pack_scale {scales[attempt]}"])
+            ctx.log_remediation("G3", attempt, [f"re-placed at pack_scale {after}"])
             continue
         if rp_route_modes.agent_takes_over(ctx):
             rp_route_modes.hold_for_agent(ctx, attempt, scale)
@@ -187,10 +269,10 @@ def place_and_route(ctx: rp_context.RunContext) -> bool:
         last_good = rp_context.Attempt(scale, ctx.g3, ctx.board_rep, ctx.route_rep)
         if done:
             return False
-        if attempt < len(scales):
+        if after is not None:
             ctx.log_remediation("G4", attempt, [
                 f"{ctx.route_rep['unconnected']} unrouted -> re-placed at "
-                f"pack_scale {scales[attempt]} and re-routed"])
+                f"pack_scale {after} and re-routed"])
     return True
 
 

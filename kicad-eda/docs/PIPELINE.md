@@ -31,15 +31,11 @@ tasks stop the run, with the open task list attached.
 | **KiCad 10** (9 works) | bundled `pcbnew` Python (SWIG board build), `kicad-cli` (ERC/DRC/Gerbers), stock symbol+footprint libs | `winget install KiCad.KiCad` / `brew install --cask kicad` / distro package |
 | **KiCad 11 nightly** (optional) | `kicad-cli api-server`: the schematic is built through KiCad's own IPC API instead of hand-written S-expressions (§8) | <https://downloads.kicad.org/kicad/windows/explore/nightlies> — installs beside 10 as `Program Files\KiCad\10.99` |
 | **Python 3.10+** | MCP server + harness venv | python.org / OS package |
-| **Java 17–21 JRE** | Freerouting 1.9.0 (bundled at `server/tools/freerouting-1.9.0.jar`) | `winget install EclipseAdoptium.Temurin.21.JRE` / `brew install temurin@21` |
+| **Java 17+ JRE** | Freerouting 1.9.0 (bundled at `server/tools/freerouting-1.9.0.jar`; identical routes on Java 21 and 24) | `winget install EclipseAdoptium.Temurin.21.JRE` / `brew install temurin@21` |
 
-Run `scripts/install-deps.ps1` (Windows) or `scripts/install-deps.sh`
-(macOS/Linux) to check and install the three required tools (the nightly is
-reported, never installed). The server discovers **every** KiCad on the
-machine (`server/kicad_env.py`; `KICAD_PATH` adds a root or bin dir), Java
-(`JAVA_HOME`, then a bundled `server/tools/jre*`), and the Freerouting jar
-(`FREEROUTING_JAR` overrides — **do not use Freerouting 2.x: it phones home
-and hangs headless; 1.9.0 is the pinned router**).
+Run `scripts/install-deps.ps1` (Windows) or `scripts/install-deps.sh` (macOS/Linux) to check and install the three required tools (the nightly is reported, never installed). The server discovers **every** KiCad on the machine (`server/kicad_env.py`; `KICAD_PATH` adds a root or bin dir), Java (a bundled `server/tools/jre*` first, then `PATH`, then `JAVA_HOME`) and the Freerouting jar (`FREEROUTING_JAR` overrides).
+
+**Freerouting 1.9.0 is the pinned router.** Measured against 2.x on the ten example boards: 2.1.x is not reproducible (it reshuffles its work list with an unseeded random on every pass); 2.4.x is reproducible but needs Java 25 and routes worse on 4 of the 10 boards; 1.9.0 writes byte-identical SES files for one DSN on Windows and Linux. Every version phones home (1.9: Segment analytics and a GitHub version check that no flag turns off), so the server runs each Freerouting child offline and out of sight (§7, trap 4).
 
 ## 2. Author the netlist (`netlist.json`)
 
@@ -494,24 +490,51 @@ double-assigned pads, net/no_connect overlap, undriven `power_in` rails.
 
 ## 4. Run the gated pipeline
 
-```powershell
-<venv>\python pipeline\run_pipeline.py path\to\netlist.json <board_w> <board_h>
-# fixed-outline boards take w/h from the netlist "board" block; the CLI dims
-# are hints/fallback for auto-sized boards
+```text
+<venv>\python pipeline\run_pipeline.py <netlist.json> [<board_w> <board_h>] [placement.json]
+              [--strict] [--route auto|freerouting|agent] [--resume routed|stalled]
 ```
+
+- **Board size.** `<board_w> <board_h>` (mm) are optional, both or neither: without them the netlist `board` w/h, else a feature's `board_dims` hook (a drawn outline), else the builder fits an auto-placed board to its parts. A design whose every part is fixed and that has no board block is a usage error (nothing to size the board from). `placement.json` (`{ref: [x, y, rot]}`, `-` = none) overrides positions and gets one try at pack_scale 1.0.
+- **Mode.** Napkin behaviour (§4b) is the default; `--strict` turns its policies off (a netlist `"mode": "napkin"` still means napkin).
+- **Routing.** `--route auto` (default): Freerouting first, the router subagent when G4 then fails; `--route freerouting`: a G4 failure is final; `--route agent`: the placed board goes to the agent as soon as it passes G3, without Freerouting. The modes act on a route-cache miss (a hit is re-judged as usual); the handoff is §4a.
+- **Resume.** `--resume routed|stalled` continues a run that handed routing off (§4a). It takes no placement file and no `--route`, and never hands off again.
+
+| Exit | Meaning |
+|---|---|
+| `0` | PASS: every gate passed |
+| `1` | FAIL: a gate failed, a resumed run could not continue, or the run crashed |
+| `2` | usage error: bad arguments, an unreadable netlist or placement file, no board size to start from |
+| `3` | handoff: routing went to the agent (`<stem>_route_handoff.json`, §4a); never a PASS |
+
+**Artifacts**, beside the netlist (`<stem>` = its path without `.json`). On **every** exit — pass, gate failure, handoff, crash, or a usage error found once the command line parsed (when the netlist's folder exists) — the run writes `<stem>_pipeline_report.json` and `<stem>_review.md` (a finished run also prints the report on stdout and the gate summary on stderr), and its decisions are in `<stem>.decisions.jsonl` (§4b). Along the way: `<stem>.kicad_sch` / `.kicad_pcb` / `.kicad_pro`, `<stem>_drc.json`, renders `<stem>_place_{top,bottom}.png` (G3) and `<stem>_final_{top,bottom}.png` (G5), the fab zip `<stem>_<fab profile>.zip`, the route-cache manifest `<stem>.cache.json`, `<stem>_route_handoff.json` (exit 3), `<stem>.k9.*` and `<stem>.agent[.<n>].*` (§4a), `<stem>.napkin.*` (§4b) and the git-ignored near-miss copies `<stem>.kicad_pcb.placed` / `.alt<seed>` / `.preheal` / `.attempt`.
 
 What happens, gate by gate:
 
 | Gate | Stage | Auto-remediation on failure |
 |---|---|---|
-| **G1** Requirements | `lint_netlist` + intent check | — (designer fixes the netlist) |
-| **G2** Schematic | `build_schematic_from_netlist` → `.kicad_sch` (KiCad 11 API backend when a nightly is installed, else `sch_build` — §8; the report's `schematic.backend` says which), `kicad-cli sch erc` (newest kicad-cli), design-intent review (`design_report`: decoupling coverage, floating pins, pulls, test points), **thermal review** (`thermal_check`: shunt I²R vs 50%-derated rating, FET conduction loss, linear-reg (Vin−Vout)·I, switcher loss estimate; Tj = Tamb + P·θJA ≤ 80% Tj_max) | missing bypass → 100 nF auto-added at the IC, netlist rewritten, stage re-runs. Thermal: declared numbers (`p_diss`, `rds_mohm`, value "3W") block; estimates warn. Overrides per part: `"thermal": {"p_diss", "theta_ja", "tj_max", "i_max"}` (`i_max` for topology-capped parts, e.g. a bypassed sleep shunt); board-level: `"thermal": {"t_ambient", "tj_margin", "ep_vias_min"}` |
-| **G3** Placement | `swig_build_board` (KiCad bundled python) → outline, mixed/two-sided placement, zones (In1=GND, In2=first power rail), preroutes, silk; courtyard DRC must be **0**; connector mouths must face off-board at the edge; dissipating exposed-pad parts must have ≥4 thermal vias under the EP (IPC-7093 — footprint `...ThermalVias` variants count); **plane integrity**: a power plane whose pad population is split across separate fill islands is a BLOCKER (the DSN export hides voids — the router will return the net broken); corridors under 1.8 mm between pad groups (one router via from sealing) are a warning. GND is exempt (post-route pours + stitching unify it) | courtyard overlap → re-place at next `pack_scale` (1.0→1.5→2.0→2.6→3.2); a retry that no longer fits restores the last good ROUTED snapshot (`.attempt` file); **EP via farm**: a dissipating EP part whose footprint has no `...ThermalVias` variant (e.g. TO-263) gets an IPC-7093 via farm auto-dropped under the tab (0.3 mm drill, ~1.2 mm pitch, pad's net) before the review runs |
-| **G4** Layout | **Agent routing** (§4a, the default when Claude drives the board): the agent lays every track and via through the KiCad board API, `route_check` = zone refill + kicad-cli DRC, `route_status` = connectivity + routed-width + via-ampacity gate. **Harness** (`run_pipeline.py`, unattended): DSN export → **Freerouting 1.9** → SES import → DRC + routed-width check + via-ampacity check (`swig_gate_checks`) | Agent: the repair loop is the agent's (`remove_routing` + re-route per violation). Harness: 1–4 unconnected → **heal in place** (`swig_board_fixes`): ≤2 mm same-net gaps bridged; plane-net orphans get island-link tracks (straight-or-L, plane layer preferred); under-ampacity transitions get parallel vias. 2-round fix→re-DRC→re-gate loop. Scale escalation only for real congestion. |
-| **G5** Fab package | `kicad-cli` Gerbers + drill + pos; BOM.csv + CPL.csv (JLCPCB format) zipped | — |
+| **G1** Requirements | `lint_netlist` + intent check + the `assumptions` block (§4b) | — (designer fixes the netlist) |
+| **G2** Schematic | `build_schematic_from_netlist` → `.kicad_sch` (KiCad 11 API backend when a nightly is installed, else `sch_build` — §8; the report's `schematic.backend` says which), `kicad-cli sch erc` (newest kicad-cli), design-intent review (`design_report`: decoupling coverage, floating pins, pulls, test points), **thermal review** (`thermal_check`: shunt I²R vs 50%-derated rating, FET conduction loss, linear-reg (Vin−Vout)·I, switcher loss estimate; Tj = Tamb + P·θJA ≤ 80% Tj_max) | missing bypass → 100 nF auto-added at the IC, netlist rewritten, stage re-runs; napkin: the floating-pin policy (§4b). Thermal: declared numbers (`p_diss`, `rds_mohm`, value "3W") block; estimates warn. Overrides per part: `"thermal": {"p_diss", "theta_ja", "tj_max", "i_max"}` (`i_max` for topology-capped parts, e.g. a bypassed sleep shunt); board-level: `"thermal": {"t_ambient", "tj_margin", "ep_vias_min"}` |
+| **G3** Placement | `swig_build_board` (KiCad bundled python) → outline, mixed/two-sided placement, zones (In1=GND, In2=first power rail), preroutes, silk; courtyard DRC must be **0**; connector mouths must face off-board at the edge; dissipating exposed-pad parts must have ≥4 thermal vias under the EP (IPC-7093 — footprint `...ThermalVias` variants count); **plane integrity**: a power plane whose pad population is split across separate fill islands is a BLOCKER (the DSN export hides voids — the router will return the net broken); corridors under 1.8 mm between pad groups (one router via from sealing) are a warning. GND is exempt (post-route pours + stitching unify it) | courtyard overlap → re-place at next `pack_scale` (1.0→1.5→2.0→2.6→3.2); a retry that no longer fits restores the last good ROUTED snapshot (`.attempt` file); napkin: connector face-out / thermal-footprint policy rounds at the same pack_scale (§4b); **EP via farm**: a dissipating EP part whose footprint has no `...ThermalVias` variant (e.g. TO-263) gets an IPC-7093 via farm auto-dropped under the tab (0.3 mm drill, ~1.2 mm pitch, pad's net) before the review runs |
+| **G4** Layout | **Agent routing** (§4a, the default when Claude drives the board): the agent lays every track and via through the KiCad board API, `route_check` = zone refill + kicad-cli DRC, `route_status` = connectivity + routed-width + via-ampacity gate. **Harness** (`run_pipeline.py`, unattended): DSN export → canonical DSN order (`dsn_canon`) → **Freerouting 1.9** → SES import → DRC + routed-width check + via-ampacity check (`swig_gate_checks`) | Agent: the repair loop is the agent's (`remove_routing` + re-route per violation; a stall falls back, §4a). Harness: a near miss (1–4 unrouted) is recovered on the same placement — alternate DSN orders (`dsn_seed` 1, 2), then the verified heal (`swig_heal`: ≤2 mm same-net gaps bridged, plane-net islands linked, at the net-class width; kept only when DRC unconnected is 0 with no new DRC error or routed-check issue, else restored byte for byte); then a 2-round fix→re-DRC→re-gate loop (heal + parallel vias for under-ampacity transitions); real congestion re-places at the next pack_scale; still failing: `--route auto` hands the board off (§4a). EMC stitching is a transaction: a stitch that breaks G4 is undone. |
+| **G5** Fab package | `kicad-cli` Gerbers + drill + pos; BOM.csv + CPL.csv (JLCPCB format) zipped; BOM sourcing audit; the D5 safety warning (§4b) | — |
 
-Exit 0 = every gate passed; the JSON report (stdout) and gate summary
-(stderr) name every blocker and every remediation applied.
+**Report keys** (top level of `<stem>_pipeline_report.json`):
+
+| Report key | What it holds |
+|---|---|
+| `PASS`, `status`, `error`, `gates`, `gate_summary` | the verdict and each gate's `{gate, passed, blockers, warnings, tasks}`; `status` is `handoff` on exit 3 (never a PASS); `error` = a crash, a usage error or a resume that could not continue |
+| `mode`, `hard_stop`, `feature_halt` | napkin or strict and why; a file held by a KiCad editor (§4b); the feature hook that stopped the run |
+| `lint`, `schematic`, `design_report`, `thermal`, `remediation` | G1 lint; the G2 build (`backend`, its `fallback`, `libraries`), design and thermal review; every corrective-action round |
+| `route_cache`, `route_cache_reason`, `route_cache_error` | hit or miss, why it missed, a manifest that could not be written |
+| `board`, `autoroute`, `routing`, `drc`, `emc` | the G3 build; the route (`pack_scale`, `tracks`, `unconnected`, `dsn_sha256`, `dsn_seed`, `alternates`); `{method, requested, why[, handoff]}`; the last DRC; the EMC pass |
+| `handoff`, `handoff_resume`, `superseded_handoff`, `resume`, `stall_chain` | the handoff and its two resume command lines; an old handoff this run retired; a resumed run (§4a) |
+| `agent_board_preserved`, `agent_board_previous`, `board_file`, `pre_k11_snapshot` | the agent's KiCad 11 board kept as `X.agent.*` at load (and the copy it rotated); the board's path, format and writer (`toolchain.board_file_info`); the `X.k9` snapshot |
+| `fab`, `sourcing`, `renders_placement`, `renders_final` | the G5 package, the BOM sourcing audit, the PNGs |
+| `decisions_log`, `decision_log_errors`, `review`, `review_error`, `library_sources_error` | the decision log and why an entry could not be written; the review, why it could not be rendered or written, and why its parts table has no library sources — none of them stops a run |
+| `pipeline_report`, `pipeline_report_error` | this report's own path, or why it could not be written (also on stderr and in the review) |
+
+**Route cache.** A run that passes G4 writes `<stem>.cache.json` with the route hash (`pipeline/rp_route_hash.py`: each component's position, footprint, side and packer hints, plus the design keys that move copper — `nets`, `net_specs`, `preroutes`, `board`, `planes`, `stackup`, `copper_layers`, `emc`, ...; a feature declares its own). A re-run with the same hash reuses the routed board and skips build and route, but G3 (the `placement_routed` variant: no plane-integrity prediction on a routed board) and G4 **still re-run**: the cache skips work, never judgement. Values, sourcing, thermal annotations, assumptions and the mode do not move copper. A miss says why in `route_cache_reason` and deletes the stale manifest; **a board saved by KiCad 11 is never reused** (the SWIG gate scripts cannot read it). `PIPELINE_NO_CACHE=1` bypasses the cache.
 
 Useful environment variables:
 
@@ -522,85 +545,73 @@ Useful environment variables:
 | `FREEROUTING_JAR` | pin a specific router jar (keep 1.9.0) |
 | `KICAD_PATH` | an extra KiCad root (or bin dir) to probe when auto-detect misses it; every install found is still used per job (§8) |
 | `PIPELINE_NO_CACHE=1` | bypass the route cache (always rebuild + re-route) |
+| `KICAD_EDA_PIPELINE_FEATURES` | `none` or a comma list of feature names: restrict the pipeline features that run (default: all) |
 
-**Route cache:** after a successful run, `<netlist>.cache.json` records a hash
-of everything that moves copper (geometry, nets, net_specs, preroutes, board,
-emc). A re-run with only value/sourcing/thermal edits reuses the routed board
-— the G3/G4 **gates still re-run** against it (the cache skips work, never
-judgement) — and goes straight to silk/checks/fab. The G3 re-validation uses
-the `placement_routed` check variant: plane integrity is skipped (it is a
-PRE-route prediction; on a routed board the plane is legitimately carved by
-via antipads and any stranded islands are already tied by healed tracks —
-G4's DRC re-run proves the connectivity it exists to predict). Any net,
-footprint, position, or preroute change invalidates automatically, as does a
-G2 netlist remediation.
+**Feature hooks.** A feature acts inside the run through one module `pipeline/rp_feature_<name>.py` — `ORDER` (default 100), functions named after the hooks below and its `ROUTE_HASH_*` key tuples — never by editing the stage modules; its state lives in `ctx.ext[<name>]`. A hook raises `rp_hooks.Halt(gate, message)` to fail that gate, and one that cannot judge a resumed KiCad 11 board returns a blocker naming why (never a crash or a skip). With no feature the run and its report are exactly the harness's. Kinds and contracts are in the `rp_hooks` docstring. Rule for features: a board with a D7 stackup or RF nets is never handed off (its G4 checks need a KiCad 9/10 board), so its feature answers the `handoff_veto` hook.
+
+| Stage | Hooks, in call order |
+|---|---|
+| load, G1 | `on_load`, `g1_prepare`, `lint_kwargs`, `g1_verdict` |
+| G2 | `g2_policy`, `analysis_kwargs`, `g2_verdict`, `after_g2` |
+| route cache, G3 | `route_hash_extra`, `pack_scales`, `g3_inputs`, `g3_verdict` |
+| routing | `route_provider` (a router used instead of Freerouting: its board is never handed off, its failure is a G4 FAIL), `after_route`, `on_exhausted` (re-run once from `after_g2`), `handoff_veto` (a reason turns a would-be handoff into a G4 FAIL) |
+| G4, G5, command line | `g4_inputs`, `g4_verdict`, `emc_args`, `g5_verdict`, `board_dims` |
 
 ## 4a. G4 — agent routing (KiCad board API)
 
-The default G4 when Claude drives a board (the `agent-routing` skill, the
-`router` subagent): no autorouter — the agent reads the board, lays copper
-net by net, and KiCad's connectivity plus kicad-cli DRC verify it. The
-backend is KiCad's IPC board API through the vendored kipy
-(`server/backends/pcb_session.py` / `pcb_items.py` / `pcb_api.py`), the
-geometry is pure Python (`server/route_planner.py`), the MCP surface is
-`server/board_route_tools.py`.
+The default G4 when Claude drives a board (the `agent-routing` skill, the `router` subagent) and the target of the harness's routing handoff: no autorouter — the agent reads the board, lays copper net by net, and KiCad's connectivity plus kicad-cli DRC verify it. Backend: KiCad's IPC board API through the vendored kipy (`server/backends/pcb_session.py` / `pcb_items.py` / `pcb_api.py`); geometry: `server/route_planner.py` (pure Python); sessions and their D5 policies: `server/board_sessions.py`; MCP tools: `server/board_route_tools.py`.
 
-**Session modes.** `mode="auto"` joins a running KiCad 9/10/11 PCB editor
-that has the file open (API server enabled; edits land in the live document
-and a save keeps that KiCad's format), else it launches a private headless
-`kicad-cli api-server` from the KiCad 11 nightly with the board preloaded
-(`server_status().board_api`, else `board_api_reason`). One headless board at
-a time: another path drops an idle (saved) board — `released_boards` in the
-response — and refuses while it has unsaved edits. KiCad's
-`GetConnectedItems` (≥ 10.0.1) supplies real connectivity including filled
-zones; a KiCad 9 GUI session reports `connectivity_available: false` and
-`unrouted_connections` cannot count clusters there.
+**Session modes.** `mode="auto"` joins a running KiCad 9/10/11 PCB editor that has the file open (API server enabled; edits land in the live document and a save keeps that KiCad's format), else it launches a private headless `kicad-cli api-server` from the KiCad 11 nightly with the board preloaded (`server_status().board_api`, else `board_api_reason`). One headless board at a time: another path drops an idle (saved) board (`released_boards`) and refuses while it has unsaved edits. KiCad's `GetConnectedItems` (≥ 10.0.1) supplies real connectivity including filled zones; a KiCad 9 GUI session reports `connectivity_available: false`, where `unrouted_connections` cannot count clusters.
 
-**Tools** (every one takes `pcb` first; responses carry `ok`, `backend: "api"`, `mode`; a user error is `{ok: false, reason}`):
+**Tools** (all but `list_open_boards` take `pcb` first; each answers `{ok, backend: "api", mode, ...}` or `{ok: false, reason}`; signatures and the routing rules: [skills/agent-routing/SKILL.md](../skills/agent-routing/SKILL.md)): `open_board`; `board_overview` (layers, which inner layer carries which plane, rules, net classes, counts); `board_pads`; `unrouted_connections` (N clusters of a net → N−1 closest-pair links, with the foreign copper near each line); `route_net` (tracks and vias, validated against the board rules and the net class first); `add_vias`; `remove_routing`; `route_check` (zone refill, save, kicad-cli DRC at error severity with the writer's kicad-cli, the stall verdict); `route_status` (the routed gate: connectivity, class widths, via ampacity; `check_design_gates(stage="routed")` answers with it on a board SWIG cannot read); `save_board`; `close_board`; `list_open_boards`. **Loop:** `board_overview` → `unrouted_connections` → route 3–6 nets (decoupling and clocks first, then signals, then power; plane nets by a stub + via) → `route_check` → fix each violation (`remove_routing` + re-route) → repeat until `ok` with nothing unconnected → `route_status(pcb, netlist).passed` → `export_fab_package`. With the defaults `route_check` refills the zones, which counts as a change, so even an untouched board is saved (headless: as a KiCad 11 file); only `refill=False` leaves an unmodified board as it is.
 
-| Tool | Returns |
-|---|---|
-| `open_board(pcb, mode="auto")` | overview + `{opened, mode, kicad_version, connectivity_available}` |
-| `board_overview(pcb)` | `{copper_layers, outline, rules, netclasses, planes, footprints, counts, unrouted}` — layers, which inner layer carries which plane (`In1.Cu` GND, `In2.Cu` first power rail on the G3 build), board minimums, per-net class sizes |
-| `board_pads(pcb, net="", ref="")` | `{pads: [{id, ref, pad, net, x, y, layers, through_hole, shape, w, h, rotation, drill}]}` |
-| `unrouted_connections(pcb, net="", with_obstacles=True, clearance=0)` | `{unrouted, connections: [{net, from, to, length, obstacles: {"F.Cu": [...], "B.Cu": [...]}}], connectivity_available}` — N clusters of a net → N−1 closest-pair links; obstacles = foreign copper within clearance + width/2 of the straight line, with `distance` (centreline to copper edge) and `t` |
-| `route_net(pcb, net, path, width=0, allow_narrow=False, via_diameter=0, via_drill=0)` | `{created: {tracks, vias}, ids, length, warnings}` — `path` = `[{layer, points: [[x, y], ...], width?}, {via: [x, y], diameter?, drill?}, ...]` in mm; validated (via exactly at the join, sizes ≥ board rules and class unless `allow_narrow`; non-45° bends, acute turns and same-layer vias warn) then created |
-| `add_vias(pcb, net, points, diameter=0, drill=0)` / `remove_routing(pcb, net="", ids=[])` | `{created, ids}` / `{removed: {tracks, vias}}` |
-| `route_check(pcb, refill=True, save=True, max_items=40)` | refill zones, save if the board has unsaved changes (an untouched board is never rewritten), kicad-cli DRC at error severity with the writer's kicad-cli → `{ok, errors, unconnected, types, violations: [{type, severity, description, items: [{description, x, y}]}], unconnected_items, kicad_cli, report, saved, save_note?, zones_refilled}` |
-| `route_status(pcb, netlist="")` | `{nets: {net: {pads, clusters, complete, tracks, vias, length, min_width, class_width, width_ok}}, unrouted, complete, width_issues, via_ampacity_issues, passed}` — the routed gate; `check_design_gates(stage="routed")` answers with it on a board the SWIG checks cannot read |
-| `save_board(pcb)` / `close_board(pcb, save=True)` / `list_open_boards()` | `{saved, path}` / `{closed, saved, discarded_changes}` / `{boards: [{path, mode, unsaved_changes}]}` |
+**File format and the automatic snapshot.** A board saved through a KiCad ≥ 10.99 session (the headless server or a KiCad 11 GUI) is a KiCad 11 file (`(version 20260901)`, `(generator_version "10.99")`): KiCad 9/10, their kicad-cli and their pcbnew cannot load it, so the SWIG tools (`autoroute_board`, `check_design_gates(stage="placement")`, `add_ground_stitching`) refuse it (`toolchain.swig_readable` names `route_check` / `route_status` instead) and DRC, Gerbers and renders use the kicad-cli of the KiCad that wrote it (`toolchain.board_cli`, §8). Right **before the first such save** (and at `open_board` for a KiCad 11 GUI session) the pre-11 set is copied to `X.k9.kicad_pcb` + `X.k9.kicad_pro` (+ `.kicad_prl` / `.kicad_dru` when present; never the `~X.kicad_pro.lck` lock), and again whenever that snapshot is older than the file; a failed copy refuses the save. Board and project travel together: restored without its project, a board loses its net classes and Freerouting lays power nets at the default width while DRC still passes. Never copy board files by hand; the board tools report `pre_k11_snapshot`. A KiCad 9/10 GUI session keeps the editor's format.
 
-**Loop.** `board_overview` → `unrouted_connections` → route 3–6 nets with
-`route_net` (decoupling and clocks first, then signals, then power; plane
-nets by a short stub + via) → `route_check` → fix every violation by
-`remove_routing` + re-route → repeat until `ok` and `unrouted` 0 →
-`route_status(netlist).passed` → `export_fab_package`. The skill holds the
-engineering rules (exit direction, 45° geometry, clearance math on the
-obstacle list, via placement, plane stubs, rip-up limits, when to stop).
+**Stall rule.** `route_check` scores each judged round as DRC errors + unconnected. The first round is the baseline; a round improves when it beats every earlier score; **3 rounds in a row without a new best** on a board that is not clean is `stalled` (with `stall_note`), on the fourth call at the earliest, and the agent stops. A round that judged a stale disk copy (`save=False` with unsaved copper) or whose DRC failed (the old report is deleted first, never re-read) is not counted (`progress_note`), but the verdict so far is still returned. The history is per board path, survives a session release and reopen, and restarts when Freerouting or a rebuild rewrites the board (`release_for_rewrite`).
 
-**File format — the rule that bites.** A board saved through the headless
-KiCad 11 session is a KiCad 11 file (`(version 20260901)`,
-`(generator_version "10.99")`). KiCad 9/10, their `kicad-cli` and their pcbnew
-Python cannot load it (`Failed to load board`). So: `autoroute_board`,
-`check_design_gates(stage="placement")` and `add_ground_stitching` refuse it
-(`toolchain.swig_readable`, the reason names `route_check` / `route_status`),
-DRC / Gerbers / render run through kicad-cli 11 because `toolchain.board_cli(pcb)`
-picks the writer's kicad-cli from the header (§8), and the file opens in
-KiCad 11 only. Freerouting is therefore a fallback for a KiCad 9 format board
-only — copy the `.kicad_pcb` + `.kicad_pro` before the first `route_check` if
-that fallback must stay available. A GUI session keeps the editor's format.
+**Handoff** (`--route auto` after a failed G4, `--route agent` once G3 passed; exit 3). `<stem>_route_handoff.json` (`kind` "kicad-eda route handoff", `version` 1) holds what the agent and a resumed run need: `netlist`, `pcb`, `project`, `requested` (the route mode), `why`, `pack_scale`, `route_hash` (of the design), `placed_sha256`, `board_file`, `freerouting` (every attempt of the ladder and the handed one; null in agent mode), `unconnected_items` (the first 40 of `<stem>_drc.json`), `net_classes` (`{net: [class, track width]}` from the `.kicad_pro`), `g3`, `board` (the build summary), `instructions` and `resume` (the two command lines below). The agent routes the board with the `router` subagent through the board API, never runs `autoroute_board` or a rebuild itself, closes the board (`close_board`), then runs one of:
+
+- `--resume routed` (once `route_status` passed): G1 and G2 re-run (a G2 remediation is an error: the routed board would be stale); G3 carries the handoff's verdict with a warning plus a courtyard DRC of the board; G4 judges the agent's board (a KiCad 11 board through the board API's routed gate instead of the SWIG check, with the SWIG fix loop and EMC stitching skipped, a warning each); G5 as usual. The handoff stays, so the agent may fix the board and resume again.
+- `--resume stalled` (after a stall): Freerouting on the snapshot (`autoroute_board(pcb, from_snapshot=True)` moves the agent's KiCad 11 set to `X.agent.*`, an older one rotating to `X.agent.<n>.*` with the first free n, copies `X.k9.*` back and routes it, near-miss recovery included), then the pack_scale ladder from the handoff's pack_scale + 1, then stop. Each step is an entry of the report's `stall_chain` with a routing decision; the consumed handoff is retired.
+
+Both refuse (exit 1, the report's `error`) a missing or malformed handoff, a board other than the one it names, and a netlist whose route hash changed since. Every fresh run that reaches routing retires an old handoff (report `superseded_handoff`). At load, a board SWIG cannot read (the agent's KiCad 11 board, which always misses the route cache) is kept as `X.agent.*` before G2 rewrites the project (report `agent_board_preserved`, and `agent_board_previous` for a rotated copy); a copy that cannot be made stops the run before anything is built.
+
+## 4b. Napkin mode (hands-off)
+
+Napkin mode builds a board from a concept without asking anyone: every open question is decided by a policy, and every decision is recorded for a human to review afterwards (ROADMAP D5). `/kicad-eda:napkin` runs the whole flow (requirements and their assumptions, parts, the netlist, this harness and its routing handoff, the review) through the [napkin-mode skill](../skills/napkin-mode/SKILL.md), which also holds the policy table for every gate task; the GUI flow (`/kicad-eda:new-board`) stays interactive.
+
+**Switch.** The harness runs napkin by default; `--strict` turns the policies off (every policy task stays a designer task, and a file open in a KiCad editor halts the run); a netlist `"mode": "napkin"` always means napkin. The report's `mode` says which and why, and a napkin run records it as a G1 decision.
+
+**Assumptions.** Requirement-level guesses live in the netlist (§2): `"assumptions": [{"id", "topic", "value", "rationale", "confidence": "high|med|low", "override"}]`, where `override` names the netlist path a human edits to overrule one. G1 blocks a malformed block (blank text, a duplicate id) in every mode and warns when a napkin netlist has none; the review lists them first, low confidence first.
+
+**Decision log.** `<stem>.decisions.jsonl` beside the netlist, append-only, one JSON object per line: `{id, ts, stage, question, decision, rationale, alternatives, confidence, source, reversible, override}` with `id` "dec-" + 12 hex digits, `ts` ISO 8601 UTC, `stage` one of requirements | parts | G1..G5 | routing, and `override` the netlist path that changes it. The harness records the mode, every applied remedy (with its own confidence and alternatives), a hard stop, the schematic fallback, the routing method and the G5 sourcing and safety calls; agents record theirs with the `record_decision` MCP tool. Each append is a single write of one line of pure ASCII (non-ASCII text is JSON-escaped, so a U+2028 pasted from a datasheet cannot split a line), a torn last line is closed before the next entry, and writers are serialised by an exclusive `<log>.lock` (one older than 60 s belongs to a dead writer and is broken). A decision that cannot be written never stops a run: report `decision_log_errors`.
+
+**Review.** `<stem>_review.md` is written on every exit (the `review_report` MCP tool re-renders it from the files), with the sections of `review_report.SECTIONS`: **Summary**, **Assumptions**, **Decisions** (grouped by stage, low confidence first), **Parts** (library source stock | project | generated | unknown), **Gate verdicts**, **Auto-remediations**, **Accepted risks and warnings**, **Routing** (method and why), **Board file** (format and the `X.k9` snapshot), **Renders**, **Fab package** and **Open items**. A review that cannot be rendered or written is report `review_error`; the JSON report is still written.
+
+**Safety.** A design that runs on mains or > 50 V, or charges Li-ion cells, is still built hands-off but flagged **HUMAN REVIEW REQUIRED** at the top of the review, with a G5 warning per kind and a G5 decision. The heuristics (net voltages and names, AC-DC parts, mains-rated fuses and varistors, charger ICs, battery and charge nets, the assumptions) are documented rule by rule in the docstring of `safety_screen.detect_safety`, the source of truth.
+
+**Policies** (`server/tools/napkin_policy.py`; `gates.py` turns what they allow into auto tasks, and each applied remedy is a decision):
+
+- G2 floating pins: `declare_no_connect` only for output, bidirectional, passive or NC-named pins on ICs and modules; `net_same_name_pin` joins a stacked supply-named pin to the netted pin of the same name on that part; `input` / `power_in` pins, other supply-named pins and a pin named like another netted pin of the part (an unused op-amp unit's input) stay designer tasks, which the agent nets with a recorded rationale.
+- G3, up to 2 policy rounds at the same pack_scale (netlist rewritten, board rebuilt and re-judged): `face_connector_out` turns a connector that faces the interior or sits off its edge outward (geometry from `swig_connector_probe.py`), `swap_thermal_footprint` gives an exposed-pad part short of thermal vias its `...ThermalVias` footprint when one resolves (the D1 library order), and a fractured plane becomes `loosen_placement` (the next pack_scale). A policy task that cannot be applied stays open and stops the ladder.
+
+**Hard stops** in napkin mode: installing software, spending money or ordering (the agent stops and says so), and overwriting a file open in a KiCad editor: the harness then writes `<stem>.napkin.kicad_sch` / `<stem>.napkin.kicad_pcb` instead (their project and cache manifest follow the board; the report, review and log stay at the netlist stem) and records a G1 decision (report `hard_stop`); `--strict`, or a sibling that is open too, halts at G1.
+
+**G2 schematic fallback.** When the KiCad 11 nightly has no global library tables (one never opened), the `auto` schematic backend builds G2 with the file backend and records that as a G2 decision (report `schematic`: `fallback` = {from, to, reason, decision}); the user's KiCad configuration is never edited.
 
 ## 5. Regression suite
 
-```powershell
-<venv>\python pipeline\run_all.py
+```text
+<venv>\python pipeline\run_all.py [--list] [boards_dir]
+<venv>\python pipeline\determinism_check.py <netlist.json> --runs N [--jobs J] [--keep DIR]
+              [--verdict-only] [--timeout S] [-- <run_pipeline args>]
 ```
-Runs every board in `pipeline_tests/` (QFN, LQFP, multi-unit op-amps, buck
-converter, RF coupon + LNA, ESP32 node with antenna overhang, the fixed-size
-two-sided HAT pattern) **plus a negative fixture**: a buck with its input
-decoupling deliberately stripped, which must FAIL G2, auto-remediate, and
-then pass — proving the self-feeding loop on every run. Green = safe to ship
-a tool change.
+
+**run_all.py** runs, in order: the static boards of `examples/` (cp2102n_uart, stm32f103_dev, lm358_buffer, usb_afe, lm324_quad, buck_5v3a, rf_coupon_50r, rf_lna_gainblock, esp32c3_env_node, and negative_gate_test: the buck rebuilt each run with its input decoupling stripped, which must FAIL G2, auto-remediate and pass); every `examples/<name>/run_all.json` marker, by name (how a new board joins without editing run_all.py); and three fixtures derived each run: negative_g3 (strict G3 must DETECT an inward connector and a plane pinch), napkin_g3 (the same netlist in napkin mode must turn the connector out, with a G3 `face_connector_out` decision) and negative_g4_heal (a track cut on this run's routed lm358 board must be healed). Every board routes in the freerouting route mode unless its marker's `"args"` say otherwise (CI never hands routing to an agent), and a fixture without its source or KiCad's Python is a SKIP. A FAIL row prints the run's gate summary under it, the last line is a JSON summary with each report path, and `decisions=<n>` counts the decisions each run appended. Exit 0 = ALL PASS (no FAIL or MISSING row, at least one row ran), 1 = a row failed, 2 = usage. Green = safe to ship a tool change.
+
+**Marker** `examples/<name>/run_all.json` (beside its `netlist.json`; every key optional): `"w"` + `"h"` (mm, both or neither: neither = the harness's own size rule), `"expect": "PASS" | "FAIL"` (default PASS), `"gate"` + `"blocker_contains"` (expect FAIL only, and required there: the gate that must fail and a text one of its blockers holds), `"args"` (extra harness arguments such as `["--strict", "--route", "agent", "place.json"]`; a placement file is relative to the marker; no `--resume`: every board starts fresh), `"post_checks": [{"script": "pipeline/<x>.py", "python": "venv" | "kicad", "args": ["{pcb}", "{netlist}", "{dir}", "{report}"]}]` (run once the board met its expectation, stdin closed; a non-zero exit fails the row; a `kicad` script imports `kicad_quiet` before `pcbnew`). A marker that does not validate is a FAIL row naming every problem; `run_all.py --list` prints the matrix without running it.
+
+**determinism_check.py** runs the harness N times (J at a time) on fresh copies of one netlist's inputs (`PIPELINE_NO_CACHE=1`, stdin closed) and compares the exit code, PASS, gate summary, remediation, `pack_scale`, `dsn_sha256`, `dsn_seed`, `alternates`, the DSN and SES file hashes and the board fingerprint (`server/tools/board_fingerprint.py`: copper and placement normalised, UUIDs and item order ignored); `--verdict-only` compares the exit code, gate summary and remediation only, and `--keep DIR` keeps the run folders. It prints a table, the differing fields with a board diff, and one JSON line; exit 0 = every run agrees, 1 = a field differs or a run left no readable report or board, 2 = usage.
 
 ## 6. Post-route fixers (standalone)
 
@@ -617,53 +628,22 @@ safe on a finished board, then re-run DRC and re-export:
 
 ## 7. Known traps (cost real hours — read before debugging)
 
-1. **Freerouting is deterministic per-DSN.** Re-running an identical board
-   never clears a stuck item. Perturb placement (`pack_scale`) or fix the
-   actual cause.
-2. **Freerouting 1.9 cannot neck down.** Wide width-class into a small pad =
-   unroutable. Preroute fat copper; exempt those nets from width classes
-   (the harness does this automatically for preroute/plane nets).
-3. **DSN plane abstraction lies.** KiCad exports zones as full-rect polygons;
-   Freerouting cannot see fill voids, so plane-connected nets can come back
-   with orphan islands. Division of labor: G3 statically catches planes that
-   are ALREADY fractured (blocker) or pinched below 1.8 mm (warning) — but
-   the worst case (HAT VBUS_PD) was created by the ROUTER's own via antipads
-   sealing a healthy ≥3 mm corridor, which no static pre-route check can
-   see. That class belongs to the G4 healer (bridge / island-link / BFS maze
-   route), which the `negative_g4_heal` fixture proves on every regression
-   run. For chronic nets, author a corridor preroute.
-4. **Freerouting 2.x is broken headless** (phones home, never routes; also
-   re-splits CLI paths on spaces). The server routes from a temp dir and pins
-   1.9.0.
-5. **KiCad 10 SWIG padstack traps:** `PCB_VIA.GetWidth()` without a layer arg
-   asserts and **wedges the process** on Windows — pass `pcbnew.F_Cu`.
-   Headless `ZONE_FILLER` segfaults on an in-memory `CreateEmptyBoard` board —
-   save, `LoadBoard` fresh, then fill. `fp.Flip()` before `board.Add()`
-   segfaults (flip after adding).
-6. **`.kicad_pro` overrides board rules in `kicad-cli` DRC** — the project
-   file must carry the fab profile limits or a clean board still fails.
+1. **Freerouting is deterministic only on a canonical DSN.** KiCad writes footprints, vias and zones in random-UUID order and Freerouting 1.9 is order-sensitive: before canonicalisation 5 of 20 runs of the same buck board failed G4. `board_autoroute` rewrites every DSN in `dsn_canon`'s canonical order (`dsn_seed` 0) through `dsn_sexpr` (never regexes on DSN text: a quoted `Net-(D1-A)` breaks them), so one placement routes the same way on every run and machine. Re-running an identical board never clears a stuck item: a near miss tries alternate orders (`dsn_seed` 1, 2) and the verified heal, real congestion needs a new placement (`pack_scale`); otherwise fix the actual cause.
+2. **Freerouting 1.9 cannot neck down.** Wide width-class into a small pad = unroutable. Preroute fat copper; exempt those nets from width classes (the harness does this automatically for preroute/plane nets).
+3. **DSN plane abstraction lies.** KiCad exports zones as full-rect polygons; Freerouting cannot see fill voids, so plane-connected nets can come back with orphan islands. G3 statically catches planes that are ALREADY fractured (blocker) or pinched below 1.8 mm (warning), but the worst case (HAT VBUS_PD) was created by the ROUTER's own via antipads sealing a healthy ≥3 mm corridor, which no pre-route check can see: that class belongs to the G4 healer (bridge / island-link / maze route), which the `negative_g4_heal` fixture proves on every regression run. For chronic nets, author a corridor preroute.
+4. **Freerouting phones home and opens windows.** Every version contacts the network (1.9: Segment analytics plus a GitHub version check no flag disables), and a stale `freerouting-<crc>.frb` in a shared temp dir pops a modal dialog that hangs a headless run. So every Freerouting child starts in a fresh temp dir (cwd, `java.io.tmpdir`, `user.home`) with JVM proxy settings on a dead local port (127.0.0.1:9: no outbound connection, the same SES), `-da` (no analytics) and `-dct 0` (no countdown dialog), under `xvfb-run` on a display-less Linux and on a private desktop on Windows (1.9 always opens Swing windows; `-Djava.awt.headless=true` makes it fail). Keep 2.x jars out of `server/tools`: the jar picker takes the highest-sorting `freerouting*.jar`, and a renamed 2.x jar runs as 1.x in GUI mode; pin `FREEROUTING_JAR` instead.
+5. **KiCad 10 SWIG padstack traps:** `PCB_VIA.GetWidth()` without a layer arg asserts and **wedges the process** on Windows — pass `pcbnew.F_Cu`. Headless `ZONE_FILLER` segfaults on an in-memory `CreateEmptyBoard` board — save, `LoadBoard` fresh, then fill. `fp.Flip()` before `board.Add()` segfaults (flip after adding).
+6. **`.kicad_pro` overrides board rules in `kicad-cli` DRC** — the project file must carry the fab profile limits or a clean board still fails.
 7. **kicad-cli `-o "dir\"`** (quoted trailing backslash) mangles the path.
-8. **Via ampacity (IPC-2221):** one 0.3 mm-drill via ≈ 0.9 A, 0.9 mm ≈ 2 A at
-   ΔT 10 °C. High-current layer transitions need parallel barrels — THT
-   component legs on the net count too.
-9. **Two-sided placement:** PTH obstacles (THT pads, thermal-via farms) exist
-   on BOTH faces — carve `auto_b` away from them or G3 reports
-   "PTH inside courtyard".
-10. **No headless teardrops.** KiCad 10's teardrop generator is not exposed
-    to SWIG at all — `"emc": {"teardrops": true}` can only remind you to
-    generate them in the GUI (Edit → Edit Teardrops) before fab.
-11. **HAT/fixed-board pattern:** fixed connector coordinates + `auto_x/y/w/h`
-    free field + hand-placed power chain + preroutes is the proven recipe for
-    a dense fixed-outline board.
-12. **A schematic written by KiCad 11 is a KiCad 11 file.** KiCad 9/10 and
-    their `kicad-cli` cannot open it (§8). And a KiCad 11 that has never been
-    opened has no library tables: the headless server then reports
-    `symbol Device:R not found` (§8, first-run gotcha).
-13. **A board saved by the headless KiCad 11 board session is a KiCad 11
-    file** (§4a). Freerouting, `check_design_gates(stage="placement")`,
-    `add_ground_stitching` and KiCad 9/10 cannot read it afterwards; DRC and
-    Gerbers still work (kicad-cli 11 via `board_cli`). Copy the KiCad 9 file
-    before the first `route_check` if the Freerouting fallback must survive.
+8. **Via ampacity (IPC-2221):** one 0.3 mm-drill via ≈ 0.9 A, 0.9 mm ≈ 2 A at ΔT 10 °C. High-current layer transitions need parallel barrels — THT component legs on the net count too.
+9. **Two-sided placement:** PTH obstacles (THT pads, thermal-via farms) exist on BOTH faces — carve `auto_b` away from them or G3 reports "PTH inside courtyard".
+10. **No headless teardrops.** KiCad 10's teardrop generator is not exposed to SWIG at all — `"emc": {"teardrops": true}` can only remind you to generate them in the GUI (Edit → Edit Teardrops) before fab.
+11. **HAT/fixed-board pattern:** fixed connector coordinates + `auto_x/y/w/h` free field + hand-placed power chain + preroutes is the proven recipe for a dense fixed-outline board.
+12. **A schematic written by KiCad 11 is a KiCad 11 file.** KiCad 9/10 and their `kicad-cli` cannot open it (§8). And a KiCad 11 that has never been opened has no library tables: the headless server then reports `symbol Device:R not found` (§8, first-run gotcha; the pipeline falls back to the file backend, §4b).
+13. **A board saved through a KiCad 11 session is a KiCad 11 file** (§4a): Freerouting, `check_design_gates(stage="placement")`, `add_ground_stitching` and KiCad 9/10 cannot read it; DRC and Gerbers still work (kicad-cli 11 via `board_cli`). The `X.k9.*` snapshot taken before the first such save keeps the Freerouting fallback open (`autoroute_board(pcb, from_snapshot=True)`); never copy board files by hand.
+14. **kicad-cli 10.99 `sch erc` rewrites `<stem>.kicad_prl` into KiCad 11 form** and leaves the board and `.kicad_pro` alone, so a KiCad 11 `.kicad_prl` can sit beside a pre-11 board that no KiCad 11 session ever saved. A board's format is judged by its `.kicad_pcb` header only, and the `.kicad_prl` is optional in the snapshot.
+15. **The G4 healer works at the net-class width and lays nothing otherwise.** `swig_heal` reads each net's class width from `<pcb>.kicad_pro` (`netclass_read`: pcbnew's `GetNetClass()` is unusable on KiCad 10 SWIG) and bridges or links a classed net at max(attach width, class width); with no clear path at that width it lays no copper and leaves the open entry `<net>: no clear path at the <w> mm class width`, so the heal is rolled back and pack_scale escalates. Islands and anchors are ordered by geometry, never by board or DRC listing order, so a replay heals the same way.
+16. **No modal dialogs from KiCad's Python.** A wx assert or wxLogError in a KiCad-python child opens a dialog nobody can close and the run hangs: every SWIG script imports `kicad_quiet` before `pcbnew` (`tests/test_kicad_quiet.py` walks `server/tools`), and every KiCad, kicad-cli or Java child gets stdin closed, UTF-8 decoding with replacement and a timeout. kicad-cli output is scanned for `Error:` lines: rc 0 alone is not success.
 
 ## 8. Schematic backends
 
@@ -744,32 +724,45 @@ vendor — `server/vendor/README.md` records the origin and the recipe).
 ## 9. Where things live
 
 ```
-server/kicad_server.py        MCP server + schematic session registry (also importable:
-                              run_pipeline uses it as a library)
+server/kicad_server.py        MCP server, schematic session registry, TOOL_MODULES (run_pipeline imports it)
+server/tool_registry.py       registers TOOL_MODULES: a tool is a plain function appended to its module's
+                              TOOLS tuple (kicad_server, board_route_tools, feature modules such as
+                              review_tools and physics_tools); only a NEW module joins TOOL_MODULES
 server/kicad_env.py           discovers every KiCad install; pick_cli / pick_swig / pick_api
-server/toolchain.py           per-job picks (kicad-cli by job and by board-file writer,
-                              pcbnew Python, libraries, Java, jar); board_file_info,
-                              swig_readable (the SWIG refusal for KiCad 11 boards)
-server/kicad_ipc.py           GUI connection + open-document guard
-server/backends/              KiCad 11 API schematic backend (sch_api, sch_session,
-                              sch_netlist_build, sch_geometry, sch_items, sch_erc) and the
-                              board API backend (pcb_session, pcb_items, pcb_api; errors)
-server/route_planner.py       pure routing geometry: connections, obstacles, validate_path,
-                              width_compliance, via_ampacity (no kipy)
-server/board_route_tools.py   agent-routing MCP tools (open_board ... route_status, §4a)
+server/toolchain.py           per-job picks (kicad-cli by job and by board-file writer, pcbnew Python,
+                              libraries, Java, jar); board_file_info, swig_readable; the X.k9 snapshot,
+                              the X.agent.* copies, route_progress (the stall rule)
+server/kicad_ipc.py           GUI connection + open-document guard;  pcb_ipc_tools.py: live PCB tools
+server/backends/              KiCad 11 API backends: schematic (sch_api, sch_session, sch_netlist_build,
+                              sch_geometry, sch_items, sch_erc), board (pcb_session, pcb_items, pcb_api)
+server/route_planner.py       pure routing geometry: connections, obstacles, validate_path, via_ampacity
+server/board_route_tools.py   agent-routing MCP tools (§4a); board_sessions.py: sessions, snapshot, stalls
+server/board_pipeline_tools.py  G3-G5 MCP tools; board_autoroute.py: DSN, canonical order, Freerouting
+server/review_tools.py        record_decision + review_report MCP tools (§4b)
 server/sch_file_model.py      file-model fallback for the interactive schematic tools
 server/vendor/kipy/           vendored kicad-python (see server/vendor/README.md)
-server/pcb_ipc_tools.py       live PCB tools over IPC;  server/board_pipeline_tools.py: G3-G5 shell-outs
-server/tools/                 sch_build, swig_build_board, gates, remediate,
-                              swig_gate_checks, swig_board_fixes, silk_place,
-                              netclass_writer, ipc_rules (IPC-2221/2141A math),
-                              lint_netlist, design_report, emc_stitch, update_kipy,
-                              freerouting-1.9.0.jar
+server/tools/                 sch_build, swig_build_board, gates, remediate, swig_gate_checks,
+                              swig_board_fixes, silk_place, netclass_writer, ipc_rules, lint_netlist,
+                              design_report, emc_stitch, update_kipy, freerouting-1.9.0.jar
+server/tools/kicad_quiet.py   imported before pcbnew by every SWIG script (no modal dialogs)
+server/tools/dsn_sexpr.py     the one DSN/SES parser + printer; dsn_canon.py: the canonical DSN order
+server/tools/swig_heal.py     G4 healer at the class width; swig_copper.py: copper geometry;
+                              netclass_read.py: net-class widths from the .kicad_pro
+server/tools/decisions.py     decision log + assumptions; review_report.py, review_sources.py: the
+                              review; safety_screen.py: the safety screen; napkin_policy.py: policies
+server/tools/board_fingerprint.py  board hash (determinism); swig_connector_probe.py: connector geometry
 server/pins/                  pin sidecars (file-backend wiring coordinates)
-pipeline/run_pipeline.py      the gated harness (single board, Freerouting at G4)
-pipeline/run_all.py           regression suite + negative fixture
-skills/agent-routing/         the routing method the agent follows (§4a);  agents/router.md: the
-                              routing subagent
+pipeline/run_pipeline.py      the gated harness: STAGES, run(), main() (module map in its docstring)
+pipeline/rp_cli.py            command line + exit codes; rp_context.py: RunContext, report, review and
+                              run decisions; rp_hooks.py: feature hooks; rp_route_hash.py: cache key
+pipeline/rp_stage_schematic.py  load, G1, G2; rp_stage_place.py: route cache, G3, ladder, stall chain;
+                              rp_stage_layout.py: G4; rp_stage_fab.py: G5
+pipeline/rp_route.py          Freerouting + near-miss recovery; rp_route_modes.py: modes, handoff, resume
+pipeline/rp_napkin.py         napkin mode; rp_kicad.py: KiCad subprocesses; rp_paths.py: sys.path setup
+pipeline/rp_feature_<name>.py one pipeline feature (its hooks, §4)
+pipeline/run_all.py           regression suite + fixtures (§5); determinism_check.py: N-run comparison
+skills/agent-routing/         the routing method (§4a); agents/router.md: the routing subagent
+skills/napkin-mode/           the hands-off flow and its policy table (§4b); commands/napkin.md
 tests/                        pytest tier (pure + live API tests, skipped without KiCad 11)
 docs/PIPELINE.md              this file
 ```

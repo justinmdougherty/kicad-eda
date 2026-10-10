@@ -1,0 +1,547 @@
+{
+  "name": "cp2102n_uart",
+  "title": "CP2102N USB-C to UART Bridge",
+  "components": [
+    {
+      "ref": "U1",
+      "lib_id": "Interface_USB:CP2102N-Axx-xQFN24",
+      "value": "CP2102N-A02-QFN24",
+      "footprint": "Package_DFN_QFN:QFN-24-1EP_4x4mm_P0.5mm_EP2.65x2.65mm"
+    },
+    {
+      "ref": "U2",
+      "lib_id": "Power_Protection:USBLC6-2SC6",
+      "value": "USBLC6-2SC6",
+      "footprint": "Package_TO_SOT_SMD:SOT-23-6"
+    },
+    {
+      "ref": "J1",
+      "lib_id": "Connector:USB_C_Receptacle",
+      "value": "USB-C",
+      "footprint": "Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12"
+    },
+    {
+      "ref": "J2",
+      "lib_id": "Connector_Generic:Conn_01x06",
+      "value": "UART",
+      "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x06_P2.54mm_Vertical"
+    },
+    {
+      "ref": "F1",
+      "lib_id": "Device:Polyfuse",
+      "value": "500mA",
+      "footprint": "Fuse:Fuse_1206_3216Metric"
+    },
+    {
+      "ref": "FB1",
+      "lib_id": "Device:FerriteBead",
+      "value": "600R@100MHz",
+      "footprint": "Inductor_SMD:L_0805_2012Metric"
+    },
+    {
+      "ref": "D1",
+      "lib_id": "Device:LED",
+      "value": "PWR_GRN",
+      "footprint": "LED_SMD:LED_0603_1608Metric"
+    },
+    {
+      "ref": "D2",
+      "lib_id": "Device:LED",
+      "value": "TX_YEL",
+      "footprint": "LED_SMD:LED_0603_1608Metric"
+    },
+    {
+      "ref": "D3",
+      "lib_id": "Device:LED",
+      "value": "RX_GRN",
+      "footprint": "LED_SMD:LED_0603_1608Metric"
+    },
+    {
+      "ref": "R1",
+      "lib_id": "Device:R",
+      "value": "5.1k",
+      "footprint": "Resistor_SMD:R_0603_1608Metric"
+    },
+    {
+      "ref": "R2",
+      "lib_id": "Device:R",
+      "value": "5.1k",
+      "footprint": "Resistor_SMD:R_0603_1608Metric"
+    },
+    {
+      "ref": "R3",
+      "lib_id": "Device:R",
+      "value": "1k",
+      "footprint": "Resistor_SMD:R_0603_1608Metric"
+    },
+    {
+      "ref": "R4",
+      "lib_id": "Device:R",
+      "value": "1k",
+      "footprint": "Resistor_SMD:R_0603_1608Metric"
+    },
+    {
+      "ref": "R5",
+      "lib_id": "Device:R",
+      "value": "1k",
+      "footprint": "Resistor_SMD:R_0603_1608Metric"
+    },
+    {
+      "ref": "R6",
+      "lib_id": "Device:R",
+      "value": "10k",
+      "footprint": "Resistor_SMD:R_0603_1608Metric"
+    },
+    {
+      "ref": "C1",
+      "lib_id": "Device:C",
+      "value": "4.7uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric"
+    },
+    {
+      "ref": "C2",
+      "lib_id": "Device:C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0603_1608Metric"
+    },
+    {
+      "ref": "C3",
+      "lib_id": "Device:C",
+      "value": "100nF",
+      "footprint": "Capacitor_SMD:C_0603_1608Metric"
+    },
+    {
+      "ref": "C4",
+      "lib_id": "Device:C",
+      "value": "100nF",
+      "footprint": "Capacitor_SMD:C_0603_1608Metric"
+    },
+    {
+      "ref": "C5",
+      "lib_id": "Device:C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0603_1608Metric"
+    }
+  ],
+  "nets": {
+    "GND": [
+      [
+        "U1",
+        "2"
+      ],
+      [
+        "U1",
+        "25"
+      ],
+      [
+        "U2",
+        "2"
+      ],
+      [
+        "J1",
+        "A1"
+      ],
+      [
+        "J1",
+        "A12"
+      ],
+      [
+        "J1",
+        "B1"
+      ],
+      [
+        "J1",
+        "B12"
+      ],
+      [
+        "J2",
+        "6"
+      ],
+      [
+        "D1",
+        "1"
+      ],
+      [
+        "R1",
+        "2"
+      ],
+      [
+        "R2",
+        "2"
+      ],
+      [
+        "C1",
+        "2"
+      ],
+      [
+        "C2",
+        "2"
+      ],
+      [
+        "C3",
+        "2"
+      ],
+      [
+        "C4",
+        "2"
+      ],
+      [
+        "C5",
+        "2"
+      ]
+    ],
+    "VBUS": [
+      [
+        "J1",
+        "A4"
+      ],
+      [
+        "J1",
+        "B4"
+      ],
+      [
+        "J1",
+        "A9"
+      ],
+      [
+        "J1",
+        "B9"
+      ],
+      [
+        "F1",
+        "1"
+      ],
+      [
+        "U2",
+        "5"
+      ]
+    ],
+    "VBUS_F": [
+      [
+        "F1",
+        "2"
+      ],
+      [
+        "FB1",
+        "1"
+      ]
+    ],
+    "VBUS_IN": [
+      [
+        "FB1",
+        "2"
+      ],
+      [
+        "U1",
+        "7"
+      ],
+      [
+        "U1",
+        "8"
+      ],
+      [
+        "C1",
+        "1"
+      ],
+      [
+        "J2",
+        "1"
+      ]
+    ],
+    "+3V3": [
+      [
+        "U1",
+        "5"
+      ],
+      [
+        "U1",
+        "6"
+      ],
+      [
+        "C2",
+        "1"
+      ],
+      [
+        "C3",
+        "1"
+      ],
+      [
+        "C4",
+        "1"
+      ],
+      [
+        "R3",
+        "1"
+      ],
+      [
+        "R4",
+        "1"
+      ],
+      [
+        "R5",
+        "1"
+      ],
+      [
+        "R6",
+        "1"
+      ],
+      [
+        "J2",
+        "2"
+      ]
+    ],
+    "USB_DP": [
+      [
+        "J1",
+        "A6"
+      ],
+      [
+        "J1",
+        "B6"
+      ],
+      [
+        "U2",
+        "1"
+      ],
+      [
+        "U2",
+        "6"
+      ],
+      [
+        "U1",
+        "3"
+      ]
+    ],
+    "USB_DM": [
+      [
+        "J1",
+        "A7"
+      ],
+      [
+        "J1",
+        "B7"
+      ],
+      [
+        "U2",
+        "3"
+      ],
+      [
+        "U2",
+        "4"
+      ],
+      [
+        "U1",
+        "4"
+      ]
+    ],
+    "CC1": [
+      [
+        "J1",
+        "A5"
+      ],
+      [
+        "R1",
+        "1"
+      ]
+    ],
+    "CC2": [
+      [
+        "J1",
+        "B5"
+      ],
+      [
+        "R2",
+        "1"
+      ]
+    ],
+    "RST": [
+      [
+        "U1",
+        "9"
+      ],
+      [
+        "R6",
+        "2"
+      ],
+      [
+        "C5",
+        "1"
+      ]
+    ],
+    "TXD": [
+      [
+        "U1",
+        "21"
+      ],
+      [
+        "J2",
+        "3"
+      ]
+    ],
+    "RXD": [
+      [
+        "U1",
+        "20"
+      ],
+      [
+        "J2",
+        "4"
+      ]
+    ],
+    "RTS": [
+      [
+        "U1",
+        "19"
+      ],
+      [
+        "J2",
+        "5"
+      ]
+    ],
+    "TXT_N": [
+      [
+        "U1",
+        "14"
+      ],
+      [
+        "D2",
+        "1"
+      ]
+    ],
+    "RXT_N": [
+      [
+        "U1",
+        "13"
+      ],
+      [
+        "D3",
+        "1"
+      ]
+    ],
+    "PWR_LED_A": [
+      [
+        "R3",
+        "2"
+      ],
+      [
+        "D1",
+        "2"
+      ]
+    ],
+    "TX_LED_A": [
+      [
+        "R4",
+        "2"
+      ],
+      [
+        "D2",
+        "2"
+      ]
+    ],
+    "RX_LED_A": [
+      [
+        "R5",
+        "2"
+      ],
+      [
+        "D3",
+        "2"
+      ]
+    ]
+  },
+  "no_connect": [
+    [
+      "U1",
+      "1"
+    ],
+    [
+      "U1",
+      "10"
+    ],
+    [
+      "U1",
+      "11"
+    ],
+    [
+      "U1",
+      "12"
+    ],
+    [
+      "U1",
+      "15"
+    ],
+    [
+      "U1",
+      "16"
+    ],
+    [
+      "U1",
+      "17"
+    ],
+    [
+      "U1",
+      "18"
+    ],
+    [
+      "U1",
+      "22"
+    ],
+    [
+      "U1",
+      "23"
+    ],
+    [
+      "U1",
+      "24"
+    ],
+    [
+      "J1",
+      "A2"
+    ],
+    [
+      "J1",
+      "A3"
+    ],
+    [
+      "J1",
+      "A8"
+    ],
+    [
+      "J1",
+      "A10"
+    ],
+    [
+      "J1",
+      "A11"
+    ],
+    [
+      "J1",
+      "B2"
+    ],
+    [
+      "J1",
+      "B3"
+    ],
+    [
+      "J1",
+      "B8"
+    ],
+    [
+      "J1",
+      "B10"
+    ],
+    [
+      "J1",
+      "B11"
+    ],
+    [
+      "J1",
+      "SH"
+    ]
+  ],
+  "net_specs": {
+    "USB_DP": {
+      "diff_pair": "USB_DM"
+    }
+  }
+}

@@ -12,10 +12,23 @@ Pure functions, no KiCad needed. Verify against the standard:
 
 This is intentionally conservative (the >3050 m and coated columns are stricter);
 callers pass the column that matches the board's coating/altitude.
+
+Stackups (ADR D7, task D7-21): layer_widths() sizes a current on every routable copper
+layer of a resolved stackup (the physical-design artifact's stackup.copper list), outer
+layers at k 0.048 and inner layers at k 0.024, each at its own copper weight (the table
+below, else 1.37 mil/oz). layer_warnings() turns an inner layer that needs more than the
+net's class width into a WARNING only: e.g. 2 A needs 0.786 mm on 1 oz outer copper but
+4.119 mm on 0.5 oz inner copper. IPC-2152 (2009) superseded the IPC-2221 charts and the
+2221 internal curve is a blanket derating (critique E15), so the class width stays the
+outer one and nothing restricts the net to the outer layers.
+
+Stdlib only and Python 3.11-compatible: KiCad's bundled Python imports this module
+(swig_board_fixes, swig_routed_checks).
 """
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable, Mapping, Sequence
 
 # --- IPC-2221B Table 6-1: minimum conductor spacing (mm) by peak working voltage.
 # Each row: (V_upper_inclusive, B1_internal, B2_external_uncoated, B4_external_coated)
@@ -34,8 +47,13 @@ _CLEARANCE_TABLE = [
 _CLEARANCE_OVER_500 = {"B1": (0.25, 0.0025), "B2": (2.50, 0.005), "B4": (0.80, 0.00305)}
 _COL = {"B1": 1, "B2": 2, "B4": 3}
 
-# copper foil thickness (mils) by weight (oz/ft^2)
+# copper foil thickness (mils) by weight (oz/ft^2); other weights scale at 1.37 mil/oz
 _COPPER_MILS = {0.5: 0.68, 1.0: 1.37, 2.0: 2.74, 3.0: 4.11}
+MILS_PER_OZ = 1.37
+MM_PER_OZ = 0.035          # stackup copper thickness per oz (ADR D7.2.2 default)
+K_EXTERNAL, K_INTERNAL = 0.048, 0.024
+OUTER_LAYERS = ("F.Cu", "B.Cu")
+ROUTABLE_ROLES = ("signal", "mixed")   # stackup roles a track may use (plane / unused never)
 
 # IPC-2221 / IPC-6012 reliability-class floors (mm). Class 3 = high-reliability
 # (defense/aerospace/medical): larger annular ring, tighter process tolerance.
@@ -64,16 +82,28 @@ def clearance_mm(voltage_peak: float, column: str = "B2") -> float:
     return round(base + (v - 500) * slope, 4)
 
 
+def _positive(value: object) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+
+def copper_mils(copper_oz: float) -> float:
+    """Foil thickness (mils) of a copper weight: the table for 0.5 / 1 / 2 / 3 oz, else
+    1.37 mil per oz. ValueError for a weight that is not a number > 0."""
+    if not _positive(copper_oz):
+        raise ValueError(f"copper weight must be a number > 0 oz, got {copper_oz!r}")
+    return _COPPER_MILS.get(copper_oz, copper_oz * MILS_PER_OZ)
+
+
 def trace_width_mm(current_a: float, temp_rise_c: float = 10.0,
                    copper_oz: float = 1.0, layer: str = "external") -> float:
     """Minimum conductor width to carry `current_a` at `temp_rise_c` (deg C rise),
     per the IPC-2221 chart. Internal layers derate (k halved)."""
     if current_a <= 0:
         return 0.0
-    k = 0.048 if layer == "external" else 0.024
+    k = K_EXTERNAL if layer == "external" else K_INTERNAL
     area_mils2 = (current_a / (k * (temp_rise_c ** 0.44))) ** (1.0 / 0.725)
-    thickness_mils = _COPPER_MILS.get(copper_oz, 1.37)
-    width_mils = area_mils2 / thickness_mils
+    width_mils = area_mils2 / copper_mils(copper_oz)
     return round(width_mils * 0.0254, 4)  # mils -> mm
 
 
@@ -131,6 +161,100 @@ def resolve_netclasses(design: dict, cls: int = 2, copper_oz: float = 1.0,
         s = specs.get(net, {})
         out[net] = net_rule(s.get("voltage", 3.3), s.get("current", 0.0),
                             cls, copper_oz=copper_oz, temp_rise_c=temp_rise_c)
+    return out
+
+
+# --- stackup layers (ADR D7, D7-21) ----------------------------------------------
+def _layer(entry: object) -> tuple[str, float, str]:
+    """(name, oz, role) of a stackup copper entry {name, oz | thickness, role}; the weight
+    comes from `oz`, else from `thickness` at 0.035 mm per oz. ValueError when unusable."""
+    if not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str):
+        raise ValueError(f"a stackup copper entry needs a name, got {entry!r}")
+    oz = entry.get("oz")
+    if not _positive(oz) and _positive(entry.get("thickness")):
+        oz = round(entry["thickness"] / MM_PER_OZ, 6)
+    if not _positive(oz):
+        raise ValueError(f"{entry['name']}: copper weight must be a number > 0 oz "
+                         f"(or a thickness > 0 mm), got {entry!r}")
+    return entry["name"], oz, str(entry.get("role", "signal"))
+
+
+def _routable(copper: Iterable[object]) -> list[tuple[str, float, bool]]:
+    """(name, oz, outer) of every copper layer a track may use, top to bottom."""
+    layers = [_layer(c) for c in copper]
+    return [(name, oz, name in OUTER_LAYERS) for name, oz, role in layers
+            if role in ROUTABLE_ROLES]
+
+
+def _outer_oz(layers: Sequence[tuple[str, float, bool]]) -> float | None:
+    weights = [oz for _, oz, outer in layers if outer]
+    return min(weights) if weights else None
+
+
+def outer_copper_oz(copper: Iterable[object]) -> float | None:
+    """The thinnest copper weight of the routable outer layers (None when there is none):
+    the weight a net class width is sized on."""
+    return _outer_oz(_routable(copper))
+
+
+def layer_widths(current_a: float, copper: Iterable[object],
+                 temp_rise_c: float = 10.0) -> dict[str, float]:
+    """{layer: IPC-2221 width (mm)} for `current_a` on every routable copper layer of a
+    stackup: outer layers external (k 0.048), inner layers internal (k 0.024), each at its
+    own copper weight."""
+    return {name: trace_width_mm(current_a, temp_rise_c, oz,
+                                 "external" if outer else "internal")
+            for name, oz, outer in _routable(copper)}
+
+
+def _inner_groups(current_a: float, inner: Sequence[tuple[str, float, bool]],
+                  temp_rise_c: float, class_width: float) -> list[tuple[float, float, list[str]]]:
+    """[(oz, width, layers)] of the inner weights whose IPC-2221 width exceeds the class."""
+    groups: dict[float, list[str]] = {}
+    for name, oz, _ in inner:
+        groups.setdefault(oz, []).append(name)
+    out = []
+    for oz, names in groups.items():
+        width = trace_width_mm(current_a, temp_rise_c, oz, "internal")
+        if width > class_width + 1e-9:
+            out.append((oz, width, names))
+    return out
+
+
+def _layer_warning(net: str, current: float, outer: tuple[float, float] | None,
+                   groups: Sequence[tuple[float, float, list[str]]], class_width: float) -> str:
+    inner = " and ".join(f"{w:.3f} mm on {'/'.join(names)} ({oz:g} oz)"
+                         for oz, w, names in groups)
+    need = (f"{outer[1]:.3f} mm on the outer {outer[0]:g} oz copper but {inner}"
+            if outer else inner)
+    return (f"{net}: {current:g} A needs {need} by the IPC-2221 internal chart (k 0.024); "
+            f"its class width {class_width:.3f} mm is sized for the outer layers - keep "
+            f"{net} on the outer layers or widen it where it runs inside (a warning, not a "
+            "rule: IPC-2152 superseded the IPC-2221 charts)")
+
+
+def layer_warnings(rules: Mapping[str, Mapping], copper: Iterable[object],
+                   temp_rise_c: float = 10.0, plane_nets: Iterable[str] = ()) -> list[str]:
+    """One warning per net (resolve_netclasses order) whose current needs more than its
+    class width (rules[net]['track_width']) on a routable inner layer of the stackup.
+    Plane nets and nets without a current are skipped; nothing is forced (module doc)."""
+    layers = _routable(copper)
+    inner = [layer for layer in layers if not layer[2]]
+    if not inner:
+        return []
+    out_oz = _outer_oz(layers)
+    skip = set(plane_nets)
+    out = []
+    for net, rule in rules.items():
+        current = rule.get("current", 0.0) if isinstance(rule, Mapping) else 0.0
+        if net.startswith("_") or net in skip or not _positive(current):
+            continue
+        class_width = float(rule.get("track_width", 0.0))
+        groups = _inner_groups(current, inner, temp_rise_c, class_width)
+        if groups:
+            outer = (None if out_oz is None else
+                     (out_oz, trace_width_mm(current, temp_rise_c, out_oz, "external")))
+            out.append(_layer_warning(net, current, outer, groups, class_width))
     return out
 
 

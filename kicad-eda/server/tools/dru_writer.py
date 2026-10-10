@@ -29,8 +29,13 @@ every route_check DRC runs these rules.
         intersectsArea crashes 9.0.4, is dropped by 10.0.5, rc 3 on 10.99), a
         'disallow zone' (10.99 flags zone outlines), a 'deg' unit, a layer clause on
         an assertion (ignored by KiCad), a layer outside F.Cu / In1..In30.Cu / B.Cu /
-        outer / inner, a double quote, backslash or newline in a name or condition,
-        unbalanced quotes or parentheses, or a duplicate name.
+        the keywords outer and inner, a quote, backslash or control character in a
+        name, a double quote, backslash or newline in a condition, a '...' literal
+        glued to the text beside it ('X'Y' || 'Z'W': what a ' inside a net name
+        leaves, even in number), unbalanced quotes or parentheses, or a duplicate name.
+        Copper layer names are written quoted, (layer "In1.Cu"); outer and inner as
+        bare keywords, (layer outer): quoted, 9.0.4 / 10.0.5 drop the file, 10.99
+        refuses it.
     merge(existing, block) -> the file text: the managed block replaced in place, or
         appended after the user's rules (so managed rules win where KiCad takes the
         last matching rule); text outside the markers stays byte-identical (CRLF
@@ -44,7 +49,9 @@ Net names go into conditions as single-quoted literals and rule names, so a name
 a quote or backslash (ST-E11: they cannot be escaped), a double quote, a control
 character or a KiCad wildcard (* or ?: 'A.NetName == ...' would match other nets) is
 refused with ValueError. KiCad compares these strings without regard to case, so two
-nets differing only in case share their rules.
+nets differing only in case share their rules. Other rule builders (rf_rules) quote
+exact net names with net_literal too: render cannot tell a wanted wildcard from a net
+named 'USB*'.
 
 Stdlib only (plus drc_guard) and Python 3.11-compatible.
 """
@@ -87,11 +94,19 @@ PLANE_ROLE = "plane"
 ROUTABLE_ROLES = ("signal", "mixed")
 DIFF = "diff"
 MM_DECIMALS = 6                                   # 1 nm, KiCad's internal unit
+# (layer outer) / (layer inner) are keywords: KiCad reads them bare only. Quoted, 9.0.4 and
+# 10.0.5 drop the whole file (rc 0, nothing fires) and 10.99 refuses it (rc 3).
+LAYER_KEYWORDS = ("outer", "inner")
 
 _UNSAFE_NET = re.compile(r"['\"\\*?\x00-\x1f\x7f]")
 _UNSAFE_TEXT = re.compile(r"[\"\\\x00-\x1f\x7f]")
+_UNSAFE_NAME = re.compile(r"['\"\\\x00-\x1f\x7f]")
 _COPPER = re.compile(r"(?:F|B)\.Cu|In(?:[1-9]|[12][0-9]|30)\.Cu|outer|inner")
 _SQ_STRING = re.compile(r"'[^']*'")
+_LITERAL = "\x00"                 # stands for a '...' literal (control characters are refused)
+# a literal touching a name, a number, a call's '(' / ')' or another literal: what a ' inside
+# a name leaves behind ('X'Y' || ... 'Z'W'), since such a quote cannot be escaped (ST-E11)
+_GLUED = re.compile(r"[\w.)\x00]\s*\x00|\x00\s*[\w.(\x00]")
 _DQ_STRING = re.compile(r'"([^"]*)"')
 _CALL = re.compile(r"((?:[A-Za-z_]\w*\s*\.\s*)*)([A-Za-z_]\w*)\s*\(")
 _DEG = re.compile(r"\d\s*deg", re.I)
@@ -112,7 +127,8 @@ class Rule:
     def render(self) -> str:
         parts = [f'(rule "{self.name}"']
         if self.layer is not None:
-            parts.append(f'  (layer "{self.layer}")')
+            layer = self.layer if self.layer in LAYER_KEYWORDS else f'"{self.layer}"'
+            parts.append(f"  (layer {layer})")
         if self.condition is not None:
             parts.append(f'  (condition "{self.condition}")')
         parts.append(f"  (constraint {self.constraint}))")
@@ -313,10 +329,16 @@ def _balanced(text: str) -> bool:
 
 
 def _check_calls(rule: Rule, expr: str) -> None:
-    """Every function call in `expr` is A.- or B.-qualified (critique E1)."""
+    """Every '...' literal stands alone and every function call in `expr` is A.- or
+    B.-qualified (critique E1)."""
     if expr.count("'") % 2:
         raise ValueError(f"rule {rule.name!r}: unbalanced single quote in {expr!r}")
-    code = _SQ_STRING.sub("''", expr)
+    code = _SQ_STRING.sub(_LITERAL, expr)
+    if _GLUED.search(code):
+        raise ValueError(
+            f"rule {rule.name!r}: a '...' string literal in {expr!r} runs into the text beside "
+            "it: a ' inside a name cannot be escaped (ST-E11); write each net name with "
+            "dru_writer.net_literal and rename nets that hold a quote")
     if not _balanced(code):
         raise ValueError(f"rule {rule.name!r}: unbalanced parentheses in {expr!r}")
     for match in _CALL.finditer(code):
@@ -329,14 +351,14 @@ def _check_calls(rule: Rule, expr: str) -> None:
 
 
 def _check_name_and_layer(rule: Rule) -> None:
-    if not isinstance(rule.name, str) or not rule.name or _UNSAFE_TEXT.search(rule.name):
-        raise ValueError(f"rule name {rule.name!r} must be non-empty text without a double "
-                         "quote, backslash or control character")
+    if not isinstance(rule.name, str) or not rule.name or _UNSAFE_NAME.search(rule.name):
+        raise ValueError(f"rule name {rule.name!r} must be non-empty text without a quote, "
+                         "backslash or control character")
     if rule.layer is not None and not (isinstance(rule.layer, str)
                                        and _COPPER.fullmatch(rule.layer)):
         raise ValueError(f"rule {rule.name!r}: layer {rule.layer!r} is not one of F.Cu, "
-                         "In1.Cu..In30.Cu, B.Cu, outer, inner (an unknown layer makes KiCad "
-                         "drop the whole rules file)")
+                         "In1.Cu..In30.Cu, B.Cu or the keywords outer / inner (an unknown "
+                         "layer makes KiCad drop the whole rules file)")
 
 
 def _check_condition(rule: Rule) -> None:

@@ -14,11 +14,30 @@ keeps the legacy bbox walk (the same vias as before). With a warning: an Edge.Cu
 that is not one closed outline falls back to the bbox; an outline that cannot be
 inset (a neck under twice the fence distance) to the bbox fence, filtered by it.
 
+Layer roles (D7-20a; ADR D7.8 R22 / R26): --stackup=<stem>.stackup.json (or
+--stackup <path>: the physical-design artifact, kicad-eda/physical@1) makes the
+stitching follow the stackup's roles:
+  * a single-sided board (B.Cu 'unused', ADR D7.2.6) is refused before it is
+    touched: no vias, no stitching;
+  * the GND net defaults to the roles' ground (swig_import_ses.ground_net); an
+    explicit gnd_net argument still wins;
+  * the GND layers are the plane / mixed layers of that net plus the outer
+    layers carrying a pour of it; the zones are refilled first and a via goes
+    only where >= MIN_GND_FILL_LAYERS of them have fill of the net (a via on
+    one fill is via_dangling);
+  * Er is the substrate under F.Cu (its ply, or the series mean of its plies;
+    the er argument is ignored).
+The artifact's copper must be the board's enabled copper; a mismatch or an
+unreadable artifact is ok=false with the board untouched. The JSON adds
+"stackup": {artifact, gnd_layers, min_fill_layers, er_source, fill_rejected}
+(fill_rejected: vias the fill rule dropped). Without --stackup nothing changes.
+
 Usage:
   <kicad-python> emc_stitch.py <pcb> [max_freq_hz=0] [mode=grid|fence]
                                [gnd_net=GND] [er=4.2] [via_dia_mm=0.6] [via_drill_mm=0.3]
-                               [--fence-cutouts]
-Arguments after <pcb> are positional and optional; the last stdout line is the JSON.
+                               [--fence-cutouts] [--stackup=<stem>.stackup.json]
+Arguments after <pcb> are positional and optional (the options may stand anywhere
+after it); the last stdout line is the JSON.
 """
 from __future__ import annotations
 
@@ -26,9 +45,9 @@ import json
 import math
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 
@@ -40,6 +59,9 @@ except ImportError:          # the dev venv: only the pure fence / grid helpers 
 import board_outline as bo  # noqa: E402
 import outline as ol  # noqa: E402
 
+if TYPE_CHECKING:
+    import stackup_model as sm
+
 C0 = 299_792_458.0  # m/s
 DEFAULT_GND_NET = "GND"
 DEFAULT_ER = 4.2            # FR-4 relative permittivity
@@ -47,6 +69,10 @@ DEFAULT_VIA_DIA_MM = 0.6
 DEFAULT_VIA_DRILL_MM = 0.3
 USAGE_EXIT = 2
 FENCE_CUTOUTS_FLAG = "--fence-cutouts"
+STACKUP_FLAG = "--stackup"
+NET_ROLES = ("plane", "mixed")     # stackup_roles.NET_ROLES: layers that carry a net
+OUTER = ("F.Cu", "B.Cu")
+MIN_GND_FILL_LAYERS = 2     # a via tied to fewer GND fills is via_dangling (R22)
 FENCE_MARGIN_MM = 0.1       # the fence never sits closer than the via keep-out + this
 EDGE_MARGIN_MM = 0.01       # containment margin over copper-edge clearance + via radius
 OWN_SPACING = 0.7           # our own vias stay at least this many pitches apart
@@ -231,7 +257,9 @@ def _rules(board: Any, via_d_mm: float, via_drill_mm: float, fence_inset_mm: flo
 class _Stitcher:
     """Adds GND through vias where they clear the non-GND copper (circles), the
     holes, the bbox keep-out and the outline (shape; None: bbox only), keeping
-    our own vias OWN_SPACING pitches apart; counts them by kind."""
+    our own vias OWN_SPACING pitches apart; counts them by kind. With `filled`
+    (--stackup) a spot must also pass filled(x, y) (GND fill on enough layers);
+    fill_rejected counts the spots that failed only that."""
     board: Any
     gnd_code: int
     rules: _Rules
@@ -240,6 +268,8 @@ class _Stitcher:
     shape: Shape | None
     placed: dict = field(default_factory=lambda: {"fence": 0, "interior": 0})
     new_holes: list = field(default_factory=list)
+    filled: Callable[[int, int], bool] | None = None
+    fill_rejected: int = 0
 
     def clears(self, x: int, y: int) -> bool:
         r, (x0, y0, x1, y1) = self.rules, self.rules.box
@@ -261,6 +291,9 @@ class _Stitcher:
         lim = (self.rules.pitch * OWN_SPACING) ** 2
         if not self.clears(x, y) or any((x - hx) ** 2 + (y - hy) ** 2 < lim
                                         for hx, hy in self.new_holes):
+            return
+        if self.filled is not None and not self.filled(x, y):
+            self.fill_rejected += 1
             return
         v = pcbnew.PCB_VIA(self.board)
         v.SetPosition(pcbnew.VECTOR2I(x, y))
@@ -294,7 +327,11 @@ def _fence_points(rules: _Rules, shape: Shape | None,
 def add_stitching(board, gnd_name=DEFAULT_GND_NET, via_d_mm=DEFAULT_VIA_DIA_MM,
                   via_drill_mm=DEFAULT_VIA_DRILL_MM, fence_inset_mm=0.5,
                   max_freq_hz=0.0, er=DEFAULT_ER, default_pitch_mm=3.0,
-                  interior=True, fence_cutouts: bool = False) -> dict:
+                  interior=True, fence_cutouts: bool = False,
+                  roles: Mapping[str, Any] | None = None) -> dict:
+    """Place the fence and the grid (module doc). ``roles`` (--stackup: the
+    result's "stackup" record, its "gnd_layers" the GND layers) adds the fill
+    rule: a via only where >= MIN_GND_FILL_LAYERS of them have fill of the net."""
     gnd_code = _gnd_netcode(board, gnd_name)
     if gnd_code is None:
         return {"ok": False, "reason": f"no '{gnd_name}' net on board"}
@@ -306,32 +343,147 @@ def add_stitching(board, gnd_name=DEFAULT_GND_NET, via_d_mm=DEFAULT_VIA_DIA_MM,
         shape, warnings = None, [f"Edge.Cuts outline unusable ({e}): vias are checked against "
                                  "its bounding box only (they may land in cutouts)"]
     circles, holes, _clr = _obstacles(board, gnd_code)
-    placer = _Stitcher(board, gnd_code, rules, circles, holes, shape)
+    filled = None if roles is None else gnd_fill_test(board, gnd_code, roles["gnd_layers"])
+    placer = _Stitcher(board, gnd_code, rules, circles, holes, shape, filled=filled)
+    if roles is not None:
+        warnings = warnings + _thin_gnd_warning(gnd_name, roles["gnd_layers"])
     fence, kind, fence_warnings = _fence_points(rules, shape, fence_cutouts)
     for x, y in fence:                       # perimeter fence first
         placer.place(x, y, "fence")
     if interior:                             # then the grid, filtered the same way
         for x, y in grid_points(rules.inset_box(), rules.pitch):
             placer.place(x, y, "interior")
+    stackup = {} if roles is None else {
+        "stackup": {**roles, "fill_rejected": placer.fill_rejected}}
     return {"ok": True, "gnd": gnd_name, "pitch_mm": round(pcbnew.ToMM(rules.pitch), 2),
             "via_dia_mm": via_d_mm, "via_drill_mm": via_drill_mm, "er": er,
             "vias_added": sum(placer.placed.values()), **placer.placed,
             "outline": kind, "fence_cutouts": bool(fence_cutouts),
-            "warnings": warnings + fence_warnings}
+            "warnings": warnings + fence_warnings, **stackup}
+
+
+# ---------------------------------------------------------------------------
+# Layer roles (--stackup, D7-20a)
+# ---------------------------------------------------------------------------
+def single_sided_refusal(rs: sm.ResolvedStackup) -> str | None:
+    """Why a single-sided stackup is never stitched (ADR D7.2.6, R26), or None."""
+    if not rs.single_sided and not any(c.role == "unused" for c in rs.copper):
+        return None
+    return ("single-sided board (copper_layers 1, B.Cu unused): no vias and no EMC stitching "
+            "(ADR D7.2.6, R26)")
+
+
+def gnd_fill_layers(rs: sm.ResolvedStackup, gnd: str,
+                    pours: Iterable[tuple[str, str]]) -> tuple[str, ...]:
+    """The stitching GND layers, top to bottom: the plane / mixed layers whose
+    role net is `gnd`, plus the outer layers (never 'unused') carrying a pour
+    of it (`pours`: (layer, net) of the board's copper zones)."""
+    poured = {layer for layer, net in pours if net == gnd}
+    return tuple(c.name for c in rs.copper
+                 if (c.role in NET_ROLES and c.net == gnd)
+                 or (c.name in OUTER and c.role != "unused" and c.name in poured))
+
+
+def substrate_er(rs: sm.ResolvedStackup) -> tuple[float, str]:
+    """(Er, source) of the dielectric under F.Cu: its ply's Er, or the series
+    (thickness-weighted harmonic) mean of its plies (ADR D7.6 multi-ply)."""
+    die = rs.dielectrics[0]
+    if len(die.plies) == 1:
+        return die.plies[0].er, f"{die.name} (1 ply)"
+    er = sum(p.thickness for p in die.plies) / sum(p.thickness / p.er for p in die.plies)
+    return er, f"{die.name} ({len(die.plies)} plies, series mean)"
+
+
+def gnd_fill_test(board: Any, gnd_code: int,
+                  layers: Sequence[str]) -> Callable[[int, int], bool]:
+    """(x, y) sheet nm -> True when >= MIN_GND_FILL_LAYERS of `layers` have
+    fill of the GND net there (zone layers via GetLayerSet, ADR D7.1)."""
+    wanted = set(layers)
+    zones = [(lid, z) for z in board.Zones()
+             if not z.GetIsRuleArea() and z.GetNetCode() == gnd_code
+             for lid in z.GetLayerSet().CuStack()
+             if board.GetLayerName(lid) in wanted and z.HasFilledPolysForLayer(lid)]
+
+    def filled(x: int, y: int) -> bool:
+        p = pcbnew.VECTOR2I(int(x), int(y))
+        hit = {lid for lid, z in zones if z.HitTestFilledArea(lid, p, 0)}
+        return len(hit) >= MIN_GND_FILL_LAYERS
+    return filled
+
+
+def _thin_gnd_warning(gnd: str, layers: Sequence[str]) -> list[str]:
+    if len(layers) >= MIN_GND_FILL_LAYERS:
+        return []
+    return [f"only {list(layers)} can carry {gnd} fill: a stitching via needs "
+            f"{MIN_GND_FILL_LAYERS} GND layers, so none is placed"]
+
+
+def _load_stackup(path: str) -> sm.ResolvedStackup:
+    """The artifact's stackup (swig_import_ses.read_roles): the stackup modules
+    load only with --stackup, so the legacy path never needs them."""
+    import swig_import_ses as ses
+    return ses.read_roles(path)[0]
+
+
+def _prefill(board: Any) -> list[str]:
+    """Fill every zone before placing: the fill rule judges the current copper."""
+    try:
+        board.BuildConnectivity()
+        pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+    except Exception as e:
+        return [f"zone fill before stitching failed ({type(e).__name__}: {e}); the GND fill "
+                f"rule judged the fill saved in the board"]
+    return []
+
+
+def role_setup(a: Mapping[str, Any], board: Any,
+               rs: sm.ResolvedStackup) -> tuple[dict, list[str]] | str:
+    """(add_stitching keyword overrides, warnings) for --stackup, or why the
+    artifact does not fit this board."""
+    import swig_import_ses as ses
+    bad = ses.copper_mismatch(rs, ses.board_copper(board))
+    if bad:
+        return bad
+    gnd = a["gnd_net"] if a["gnd_given"] else ses.ground_net(rs)
+    warnings = _prefill(board)
+    er, source = substrate_er(rs)
+    roles = {"artifact": a["stackup"],
+             "gnd_layers": list(gnd_fill_layers(rs, gnd, ses.existing_pours(board))),
+             "min_fill_layers": MIN_GND_FILL_LAYERS, "er_source": source}
+    return {"gnd_name": gnd, "er": er, "roles": roles}, warnings
+
+
+def _options(argv: list) -> tuple[list, set, str | None]:
+    """(argv without the options, the other --flags, the --stackup path or
+    None): --stackup=<path> or --stackup <path>, anywhere after the script."""
+    rest, flags, stackup, it = argv[:1], set(), None, iter(argv[1:])
+    for arg in it:
+        if arg == STACKUP_FLAG or arg.startswith(STACKUP_FLAG + "="):
+            stackup = arg.partition("=")[2] if "=" in arg else next(it, "")
+            if not stackup or stackup.startswith("--"):
+                raise ValueError(f"{STACKUP_FLAG} needs a <stem>.stackup.json path")
+        elif arg.startswith("--"):
+            flags = flags | {arg}
+        else:
+            rest = [*rest, arg]
+    return rest, flags, stackup
 
 
 def parse_args(argv: list) -> dict:
     """<pcb> [max_freq_hz] [mode] [gnd_net] [er] [via_dia_mm] [via_drill_mm]
-    [--fence-cutouts] — positional, optional, validated; the flag may stand
-    anywhere after the script. Raises ValueError with a clear message."""
-    flags = {a for a in argv[1:] if a.startswith("--")}
+    [--fence-cutouts] [--stackup=<path>] — positional, optional, validated; the
+    options may stand anywhere after the script. Raises ValueError with a clear
+    message."""
+    argv, flags, stackup = _options(argv)
     if flags - {FENCE_CUTOUTS_FLAG}:
         raise ValueError(f"unknown option(s) {sorted(flags - {FENCE_CUTOUTS_FLAG})}; the "
-                         f"only option is {FENCE_CUTOUTS_FLAG}")
-    argv = argv[:1] + [a for a in argv[1:] if not a.startswith("--")]
+                         f"options are {FENCE_CUTOUTS_FLAG} and {STACKUP_FLAG}=<path>")
     if len(argv) < 2:
         raise ValueError("usage: emc_stitch.py <pcb> [max_freq_hz] [grid|fence] "
-                         "[gnd_net] [er] [via_dia_mm] [via_drill_mm] [--fence-cutouts]")
+                         "[gnd_net] [er] [via_dia_mm] [via_drill_mm] [--fence-cutouts] "
+                         "[--stackup=<stem>.stackup.json]")
+    if stackup is not None and not os.path.isfile(stackup):
+        raise ValueError(f"stackup artifact not found: {stackup}")
 
     def num(i, default, name):
         if len(argv) <= i or argv[i] == "":
@@ -351,6 +503,7 @@ def parse_args(argv: list) -> dict:
         "via_d_mm": num(6, DEFAULT_VIA_DIA_MM, "via_dia_mm"),
         "via_drill_mm": num(7, DEFAULT_VIA_DRILL_MM, "via_drill_mm"),
         "fence_cutouts": FENCE_CUTOUTS_FLAG in flags,
+        "stackup": stackup, "gnd_given": len(argv) > 4 and bool(argv[4]),
     }
     if args["er"] <= 0:
         raise ValueError(f"er must be > 0, got {args['er']}")
@@ -374,22 +527,47 @@ def _refill_and_save(board: Any, pcb: str, res: dict) -> dict:
     return {**res, "warnings": warnings}
 
 
+def _fail(reason: str, code: int = 1) -> int:
+    print(json.dumps({"ok": False, "reason": reason}))
+    return code
+
+
+def _stackup_or_refusal(path: str | None) -> tuple[Any, str | None]:
+    """(the --stackup artifact's stackup or None, a refusal or None): an
+    unreadable artifact or a single-sided board, before the board is loaded."""
+    if path is None:
+        return None, None
+    try:
+        rs = _load_stackup(path)
+    except (OSError, ValueError) as e:
+        return None, f"stackup artifact {path} is unusable: {e}"
+    return rs, single_sided_refusal(rs)
+
+
 def main() -> int:
     try:
         a = parse_args(sys.argv)
     except ValueError as e:
-        print(json.dumps({"ok": False, "reason": str(e)}))
-        return USAGE_EXIT
+        return _fail(str(e), USAGE_EXIT)
+    rs, refusal = _stackup_or_refusal(a["stackup"])
+    if refusal:
+        return _fail(refusal)
     try:                      # FileNotFoundError, or LoadBoard failing / returning None
         board = bo.load_board(a["pcb"])
     except (OSError, RuntimeError) as e:
-        print(json.dumps({"ok": False, "reason": f"cannot load board: {e}"}))
-        return 1
-    res = add_stitching(board, gnd_name=a["gnd_net"], via_d_mm=a["via_d_mm"],
-                        via_drill_mm=a["via_drill_mm"], max_freq_hz=a["max_freq_hz"],
-                        er=a["er"], interior=a["interior"], fence_cutouts=a["fence_cutouts"])
+        return _fail(f"cannot load board: {e}")
+    kw = {"gnd_name": a["gnd_net"], "via_d_mm": a["via_d_mm"], "via_drill_mm": a["via_drill_mm"],
+          "max_freq_hz": a["max_freq_hz"], "er": a["er"], "interior": a["interior"],
+          "fence_cutouts": a["fence_cutouts"]}
+    notes: list[str] = []
+    if rs is not None:
+        setup = role_setup(a, board, rs)
+        if isinstance(setup, str):
+            return _fail(setup)
+        kw, notes = {**kw, **setup[0]}, setup[1]
+    res = add_stitching(board, **kw)
     if res.get("ok"):
-        res = _refill_and_save(board, a["pcb"], res)
+        res = _refill_and_save(board, a["pcb"], {**res, "warnings": notes + res["warnings"]})
     print(json.dumps(res))
     return 0 if res.get("ok") else 1
 

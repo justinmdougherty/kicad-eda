@@ -30,12 +30,22 @@ failure exits 1); --route agent hands the board off as soon as it passes G3,
 without trying Freerouting. A feature's handoff_veto turns a would-be
 handoff into a G4 FAIL; a feature's route_provider is never handed off.
 
+Resuming (ROADMAP D5, rp_route_modes): --resume routed (run(..., resume=
+'routed')) judges the board the router subagent routed after the handoff (G1/G2
+re-run, G3 carried + a courtyard DRC, G4 on the KiCad 11 board through the
+board API, G5 as usual); --resume stalled runs the stall fallback chain
+(Freerouting on the pre-KiCad-11 snapshot, the near-miss recovery, the
+pack_scale ladder from the handoff's pack_scale + 1, then stop). Both need
+<stem>_route_handoff.json and the design it was made from (same route hash;
+a G2 remediation in a resumed run is an error); neither hands off again. A
+resume that cannot continue is the report's error (PASS false, exit 1).
+
 Module map (pipeline/; each is a top-level import, and the rp_ prefix keeps
 the names clear of the modules in server/ and server/tools/):
   run_pipeline.py        STAGES, run(), main() and the aliases run_all.py uses
   rp_paths.py            puts server/ and server/tools/ on sys.path (imported first)
-  rp_cli.py              command line: parse_cli (--strict, --route), board_dims,
-                         UsageError, USAGE, exit_code
+  rp_cli.py              command line: parse_cli (--strict, --route, --resume),
+                         board_dims, UsageError, USAGE, exit_code
   rp_context.py          RunContext (+ decide), Attempt, record_gate, halt (report,
                          review, run-level decisions), file suffixes, route modes
   rp_kicad.py            KiCad subprocess wrappers: drc, render, gate_check,
@@ -45,12 +55,15 @@ the names clear of the modules in server/ and server/tools/):
                          the G2/G3 policy remedies, the connector probe
   rp_stage_schematic.py  stage_load (mode, hard stop, agent-board preservation),
                          G1 (netlist lint), G2 (schematic + review loop)
-  rp_stage_place.py      the route cache, G3 placement (+ napkin policy rounds) and
-                         the pack_scale ladder
-  rp_route.py            Freerouting attempts, near-miss heal, routed snapshots
+  rp_stage_place.py      the route cache, G3 placement (+ napkin policy rounds), the
+                         pack_scale ladder, the resumed G3 and the stall chain
+  rp_route.py            Freerouting attempts (+ from the pre-KiCad-11 snapshot),
+                         near-miss heal, routed snapshots
   rp_route_modes.py      --route auto|freerouting|agent: the best routed attempt, the
-                         handoff to the agent (<stem>_route_handoff.json), handoff_veto
-  rp_stage_layout.py     G4 judge, board-fix loop, EMC stitching
+                         handoff to the agent (<stem>_route_handoff.json), handoff_veto;
+                         --resume: the handoff checks, routing records and decisions
+  rp_stage_layout.py     G4 judge (KiCad 11 boards through the board API), board-fix
+                         loop, EMC stitching
   rp_stage_fab.py        the cache manifest, G5 fab package, sourcing audit and safety
                          warnings
 
@@ -65,8 +78,9 @@ Rules for changing the harness:
 
 Usage:
   <venv-python> run_pipeline.py <netlist.json> [<board_w> <board_h>] [placement.json] [--strict]
-                [--route auto|freerouting|agent]
-  (no dims: the netlist "board" w/h, else the board is auto-sized to its parts)
+                [--route auto|freerouting|agent] [--resume routed|stalled]
+  (no dims: the netlist "board" w/h, else the board is auto-sized to its parts;
+  --resume takes no placement file and no --route)
   exit codes: 0 PASS, 1 FAIL, 2 usage error, 3 routing handed off to the agent
 """
 from __future__ import annotations
@@ -98,21 +112,29 @@ STAGES: tuple[Callable[[rp_context.RunContext], bool], ...] = (
 
 
 def run(netlist: str, w: float, h: float, placement: str = "", *, napkin: bool = True,
-        route: str = rp_route_modes.DEFAULT_ROUTE) -> dict:
+        route: str = rp_route_modes.DEFAULT_ROUTE, resume: str = "") -> dict:
     """Drive `netlist` through every gate (stopping at the first failure) and
     return the report; it is also written to <stem>_pipeline_report.json. A
     crash is recorded in that file (PASS false, "error") and re-raised.
     napkin=False is --strict (a netlist "mode": "napkin" still means napkin);
     route is --route (rp_route_modes.ROUTE_MODES; ValueError for another): a
-    handoff ends the run with report status 'handoff' and PASS false."""
+    handoff ends the run with report status 'handoff' and PASS false. resume
+    is --resume ('' or rp_context.RESUME_MODES; ValueError for another or
+    with a placement override): the run continues the handoff (route is not
+    consulted: a resumed run never hands off), and a resume that cannot
+    continue (rp_route_modes.ResumeError) is the report's error, not a crash."""
     rp_route_modes.check_route(route)
+    rp_route_modes.check_resume(resume, placement)
     ctx = rp_context.RunContext(netlist=netlist, w=w, h=h, placement=placement, napkin=napkin,
-                                route=route)
+                                route=route, resume=resume)
     try:
         rp_stage_schematic.stage_load(ctx)
+        rp_route_modes.load_resume(ctx)
         for stage in STAGES:
             if not stage(ctx):
                 break
+    except rp_route_modes.ResumeError as exc:
+        return rp_context.halt(ctx, error=f"--resume {resume}: {exc}")
     except Exception as exc:
         rp_context.halt(ctx, error=f"{type(exc).__name__}: {exc}")
         raise
@@ -158,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
     rep = run(cli.netlist, w, h, cli.placement, **rp_cli.run_options(cli))
     print(json.dumps(rep, indent=2))
     print("\n" + rep["gate_summary"], file=sys.stderr)
+    if rep.get("error"):
+        print(f"run_pipeline: error: {rep['error']}", file=sys.stderr)
     if rep.get("handoff"):
         print(f"run_pipeline: routing handed to the agent: {rep['handoff']}", file=sys.stderr)
     return rp_cli.exit_code(rep)

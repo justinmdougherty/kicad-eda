@@ -12,8 +12,12 @@ Write the probe in an empty directory: LoadBoard reads <stem>.kicad_dru when pre
 Prints one JSON object line: {board, kicad, layers, tracks, zones, filled}.
 stdlib + pcbnew only; kicad_quiet is imported before pcbnew (no modal wx dialogs).
 """
+from __future__ import annotations
+
 import json
 import sys
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 sys.path.insert(0, sys.argv[3])
 import kicad_quiet  # noqa: E402,F401  (before pcbnew: no modal wx dialogs)
@@ -21,23 +25,26 @@ import pcbnew  # noqa: E402
 
 EDGE_WIDTH_MM = 0.1
 
+XY = Sequence[float]
+Nets = Mapping[str, "pcbnew.NETINFO_ITEM"]
 
-def nm(value_mm):
+
+def nm(value_mm: float) -> int:
     return int(round(float(value_mm) * 1_000_000))
 
 
-def point(origin, xy):
+def point(origin: XY, xy: XY) -> pcbnew.VECTOR2I:
     return pcbnew.VECTOR2I(nm(origin[0] + xy[0]), nm(origin[1] + xy[1]))
 
 
-def layer_id(board, name):
+def layer_id(board: pcbnew.BOARD, name: str) -> int:
     lid = board.GetLayerID(name)
     if lid < 0 or not board.IsLayerEnabled(lid):
         raise SystemExit(f"layer {name} is not enabled on the probe board")
     return lid
 
 
-def add_outline(board, origin, size):
+def add_outline(board: pcbnew.BOARD, origin: XY, size: XY) -> None:
     w, h = size
     corners = [(0, 0), (w, 0), (w, h), (0, h)]
     for a, b in zip(corners, corners[1:] + corners[:1], strict=True):
@@ -50,7 +57,8 @@ def add_outline(board, origin, size):
         board.Add(seg)
 
 
-def add_zone(board, spec, nets, origin, size):
+def add_zone(board: pcbnew.BOARD, spec: Mapping[str, Any], nets: Nets, origin: XY,
+             size: XY) -> None:
     zone = pcbnew.ZONE(board)
     zone.SetLayer(layer_id(board, spec["layer"]))
     zone.SetNetCode(nets[spec["net"]].GetNetCode())
@@ -66,7 +74,7 @@ def add_zone(board, spec, nets, origin, size):
     board.Add(zone)
 
 
-def add_track(board, spec, nets, origin):
+def add_track(board: pcbnew.BOARD, spec: Mapping[str, Any], nets: Nets, origin: XY) -> None:
     track = pcbnew.PCB_TRACK(board)
     track.SetLayer(layer_id(board, spec["layer"]))
     track.SetStart(point(origin, spec["from"]))
@@ -76,10 +84,10 @@ def add_track(board, spec, nets, origin):
     board.Add(track)
 
 
-def draw(spec):
+def draw(spec: Mapping[str, Any]) -> pcbnew.BOARD:
     board = pcbnew.CreateEmptyBoard()
     board.SetCopperLayerCount(int(spec["copper_layers"]))
-    nets = {}
+    nets: dict[str, pcbnew.NETINFO_ITEM] = {}
     for name in spec["nets"]:
         nets[name] = pcbnew.NETINFO_ITEM(board, name)
         board.Add(nets[name])
@@ -92,7 +100,7 @@ def draw(spec):
     return board
 
 
-def main():
+def main() -> None:
     with open(sys.argv[1], encoding="utf-8") as fh:
         spec = json.load(fh)["board"]
     out = sys.argv[2]

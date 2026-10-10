@@ -37,10 +37,13 @@ like a layout engineer, not like a maze solver — short, deliberate, 45°.
   then come from the project file).
 - A placed board: `build_board_from_netlist` (G3 passed) or the GUI flow's
   Stage 7 gate. Placement that fights you is fixed in placement, not routing.
-- Decide up front whether you might fall back to Freerouting. **The first
-  `route_check` / `save_board` through a headless session rewrites the file
-  as a KiCad 11 board** (see "File format" below). Copy the `.kicad_pcb` and
-  its `.kicad_pro` first if the KiCad 9 version matters.
+- Never copy or edit the board files yourself. **The first `route_check` /
+  `save_board` / `close_board` through a headless session rewrites the file
+  as a KiCad 11 board** (see "File format" below); just before that save the
+  server snapshots the pre-KiCad-11 file as `X.k9.kicad_pcb` +
+  `X.k9.kicad_pro` (+ `.kicad_prl` / `.kicad_dru` when present), and the board
+  tools' responses carry `pre_k11_snapshot` while it exists. A KiCad 11 GUI
+  session takes the snapshot at `open_board` (`pre_k11_snapshot_taken`).
 
 ## The tools (every one takes `pcb` first; every response carries `ok`, `backend: "api"`, `mode`)
 
@@ -233,17 +236,26 @@ tracks are expensive — route around them.
 
 ## When stuck — and when to stop
 
-Stop and report when three consecutive `route_check` rounds do not reduce
-`errors + unconnected`, or a single connection has failed twelve attempts.
-Say which connections remain and which foreign copper blocks each. The fix
-is upstream: move the part (`move_footprint` in the GUI flow; fixed `x/y` or
+Every `route_check` reports `progress` (`rounds`, `score` = errors +
+unconnected, `best`, `rounds_without_improvement`) and `stalled`: true after
+3 rounds without a new best score while the board is not clean, with a
+`stall_note` naming the fallback (ROADMAP D5); a round that is not counted
+(unsaved copper, a failed DRC) says so in `progress_note`. A single
+connection that has failed twelve attempts counts as a stall too. On a
+stall, stop routing, `close_board(pcb, save=True)`, and say which
+connections remain and which foreign copper blocks each. The fix is
+upstream: move the part (`move_footprint` in the GUI flow; fixed `x/y` or
 `pack_scale` in the netlist for the pipeline), swap the part's side, or add
-a corridor preroute. **Freerouting is a last resort and only for a KiCad 9
-format board**: `autoroute_board` (and `check_design_gates`,
-`add_ground_stitching`) run under KiCad 9/10's pcbnew Python, which cannot
-open a board saved by the KiCad 11 session — they return `ok: false` with
-`swig_readable`'s reason. Once you have saved through the API, the only way
-back to Freerouting is the copy you made before starting.
+a corridor preroute. **Freerouting is the fallback, on the pre-KiCad-11
+snapshot**: `autoroute_board` (and `check_design_gates`,
+`add_ground_stitching`) run under KiCad 9/10's pcbnew Python and refuse a
+board saved by the KiCad 11 session (`ok: false` with `swig_readable`'s
+reason). After a harness handoff the orchestrator runs the handoff's
+`--resume stalled` (Freerouting from the snapshot, then a higher
+pack_scale, then stop) — never call `autoroute_board` yourself there. In a
+conversation, `autoroute_board(pcb, from_snapshot=True)` restores
+`X.k9.kicad_pcb` over the board (the agent's KiCad 11 copy moves to
+`X.agent.kicad_pcb`) and routes it with Freerouting.
 
 ## File format — read this before the first `route_check`
 
@@ -259,8 +271,9 @@ load board"). Consequences:
 - `autoroute_board`, `check_design_gates`, `add_ground_stitching` (SWIG) refuse
   the file; the routed gate is `route_status` instead (`check_design_gates`
   with `stage="routed"` answers with it automatically).
-- Open the board in KiCad 11 only. Tell the user this before they double-click
-  the file in KiCad 9/10.
+- Open the board in KiCad 11 only (the snapshot `X.k9.kicad_pcb` beside it is
+  the board as it was before the first KiCad 11 save, in KiCad 9/10 format).
+  Tell the user this before they double-click the file in KiCad 9/10.
 - A **GUI** session keeps the running editor's format (a KiCad 9 GUI saves a
   KiCad 9 file) — routing in a KiCad 9 GUI session keeps every SWIG tool usable.
 

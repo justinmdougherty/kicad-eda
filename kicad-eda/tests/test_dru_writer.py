@@ -278,7 +278,9 @@ def test_render_refuses_unqualified_calls(condition: str) -> None:
 @pytest.mark.parametrize("condition", [
     "A.intersectsArea('X')", "B.intersectsArea('X') && A.NetName != 'GND'",
     "A.NetName == 'Net-(D1-A)'", "A.NetName == 'F(X)' && A.Type == 'Track'",
-    "(A.NetName == 'X' || A.NetName == 'Y') && !A.isPlated()", "A.hasNetclass ('NC')"])
+    "(A.NetName == 'X' || A.NetName == 'Y') && !A.isPlated()", "A.hasNetclass ('NC')",
+    "A.NetName=='X'||A.NetName=='Y'", "A.fromTo('U1-1', 'U2-1')", "!(A.NetName == 'X')",
+    "A.NetName == ''"])
 def test_render_accepts_qualified_calls_and_parentheses_in_strings(condition: str) -> None:
     assert condition in dw.render([dw.Rule("r", None, condition, "disallow track")])
 
@@ -299,7 +301,18 @@ def test_render_checks_assertion_expressions_too() -> None:
     (dw.Rule("r", "In31.Cu", None, "disallow track"), "In31.Cu"),
     (dw.Rule("r", "In0.Cu", None, "disallow track"), "In0.Cu"),
     (dw.Rule('r"x', None, None, "disallow track"), "rule name"),
+    (dw.Rule("r'x", None, None, "disallow track"), "rule name"),
+    (dw.Rule("r\\x", None, None, "disallow track"), "rule name"),
     (dw.Rule("", None, None, "disallow track"), "rule name"),
+    # a ' inside a net name cannot be escaped (ST-E11): an even count of quotes is not enough
+    (dw.Rule("r", None, "A.NetName == 'X'Y' || A.NetName == 'Z'W'", "disallow track"),
+     "literal"),
+    (dw.Rule("r", None, "A.NetName == 'it''s'", "disallow track"), "literal"),
+    (dw.Rule("r", None, "A.fromTo('U1-1''U2-1')", "disallow track"), "literal"),
+    (dw.Rule("r", None, "A.NetName == 'X' 'Y'", "disallow track"), "literal"),
+    (dw.Rule("r", None, "A.memberOf'G'", "disallow track"), "literal"),
+    (dw.Rule("r", None, None, "assertion \"A.NetName == 'X'Y' || A.NetName == 'Z'W'\""),
+     "literal"),
     (dw.Rule("r", None, 'A.NetName == "X"', "disallow track"), "condition"),
     (dw.Rule("r", None, "A.NetName == 'X\\Y'", "disallow track"), "condition"),
     (dw.Rule("r", None, "A.NetName == 'X", "disallow track"), "quote"),
@@ -315,12 +328,25 @@ def test_render_refuses_rules_kicad_would_drop_or_misread(rule: dw.Rule, match: 
         dw.render([rule])
 
 
-@pytest.mark.parametrize("layer", ["F.Cu", "B.Cu", "In1.Cu", "In30.Cu", "outer", "inner"])
-def test_render_accepts_copper_layer_names(layer: str) -> None:
-    assert f'(layer "{layer}")' in dw.render([dw.Rule("r", layer, None, "disallow track")])
+@pytest.mark.parametrize("layer", ["F.Cu", "B.Cu", "In1.Cu", "In30.Cu"])
+def test_copper_layer_names_render_quoted(layer: str) -> None:
+    text = dw.render([dw.Rule("r", layer, None, "disallow track")])
+    assert f'\n  (layer "{layer}")\n' in text
 
 
-@pytest.mark.parametrize("layer", ["F.Courtyard", "Edge.Cuts", "f.cu", "F.Cu ", ""])
+@pytest.mark.parametrize("keyword", ["outer", "inner"])
+def test_outer_and_inner_render_as_bare_keywords(keyword: str) -> None:
+    # a quoted "outer" / "inner" makes 9.0.4 and 10.0.5 drop the whole file (rc 0, the canary
+    # never fires) and is a parse error (rc 3) on 10.99; only the keyword form is read
+    rule = dw.Rule("r", keyword, "A.NetName == 'X'", "disallow track")
+    assert rule.render() == (f'(rule "r"\n  (layer {keyword})\n'
+                             "  (condition \"A.NetName == 'X'\")\n  (constraint disallow track))")
+    text = dw.render([rule])
+    assert f"\n  (layer {keyword})\n" in text and f'"{keyword}"' not in text
+
+
+@pytest.mark.parametrize("layer", ["F.Courtyard", "Edge.Cuts", "f.cu", "F.Cu ", "",
+                                   "Outer", "INNER", '"outer"', "outer "])
 def test_render_refuses_layers_outside_the_verified_copper_set(layer: str) -> None:
     with pytest.raises(ValueError, match="layer"):
         dw.render([dw.Rule("r", layer, None, "disallow track")])

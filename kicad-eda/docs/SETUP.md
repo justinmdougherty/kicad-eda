@@ -118,13 +118,21 @@ schematic file itself.
    Linux nightlies are one level up on the same site) and install it. It
    lands in `C:\Program Files\KiCad\10.99` (a KiCad 11 nightly calls itself
    version 10.99) and does not touch your KiCad 10.
-2. **Open KiCad 11 once** and let it do its first-run setup. Until then it has
-   no library tables and the plugin reports `symbol Device:R not found`.
-   (Alternative without opening it: copy `sym-lib-table` and `fp-lib-table`
-   from `C:\Program Files\KiCad\10.99\share\kicad\template` into
-   `%APPDATA%\kicad\10.99`.)
+2. **Open KiCad 11 once** and let it do its first-run setup, so it has its
+   library tables. Nothing breaks if you skip this: a nightly without them
+   cannot place stock symbols, so the pipeline automatically writes the
+   schematic file itself instead, as without the nightly (a KiCad 10 file;
+   its result's `fallback` entry says so, and the choice is logged in the
+   project's `<stem>.decisions.jsonl`). The plugin never edits KiCad's
+   settings for you. (Alternative to opening it: copy `sym-lib-table` and
+   `fp-lib-table` from `C:\Program Files\KiCad\10.99\share\kicad\template`
+   into `%APPDATA%\kicad\10.99`.)
 3. Keep KiCad 10: the board build still needs its bundled Python, which the
-   nightly no longer ships.
+   nightly no longer ships. It also limits which footprint files a board can
+   use: KiCad 9 loads footprints up to `(version 20241229)` and KiCad 10 up to
+   `(version 20260206)`; one saved by KiCad 11 is newer still. Parts the
+   plugin generates for you are written in KiCad 9's format, so they always
+   load (see `docs/LIBRARIES.md` in the repo).
 
 Schematics made this way are KiCad 11 files — open them in KiCad 11, not 10.
 
@@ -320,7 +328,8 @@ and re-runs only what changed.
 | `java not found (Freerouting needs a JRE/JDK)` during routing | Step 5, then restart Claude Code. `java -version` must work in a fresh terminal. |
 | Routing seems frozen for minutes | Normal for dense boards. The pipeline has its own timeout and will tell you if the router actually failed. |
 | You have KiCad 9 | Upgrade to 10. The headless tools call KiCad APIs that changed between 9 and 10. |
-| `symbol Device:R not found` (or "no libraries") right after installing the KiCad 11 nightly | The nightly has never been opened, so it has no library tables. Open KiCad 11 once, or copy `sym-lib-table` and `fp-lib-table` from `C:\Program Files\KiCad\10.99\share\kicad\template` into `%APPDATA%\kicad\10.99` (Step 4). |
+| `symbol Device:R not found` (or "no libraries") right after installing the KiCad 11 nightly | The nightly has never been opened, so it has no library tables. The pipeline needs no action: it builds the schematic with its KiCad 10 file writer instead and says so (`fallback` in the result, logged in `<stem>.decisions.jsonl`). To use KiCad 11's schematic API — e.g. for the interactive schematic tools — open KiCad 11 once, or copy `sym-lib-table` and `fp-lib-table` from `C:\Program Files\KiCad\10.99\share\kicad\template` into `%APPDATA%\kicad\10.99` (Step 4). |
+| A board build fails with `pcbnew ... could not load footprint ...`, `newer than (version N)` | The footprint file was saved by a newer KiCad than the one building the board: KiCad 9 loads footprints up to `(version 20241229)`, KiCad 10 up to `(version 20260206)`. Ask Claude to convert the library to KiCad 9's format or to generate the part itself (`docs/LIBRARIES.md`, section 7). |
 | KiCad 10 refuses to open the `.kicad_sch` | It was written by KiCad 11 (the schematic API backend). Open it in KiCad 11, or ask Claude to rebuild it with `backend="file"` for a KiCad 10 file. |
 | Something else | Copy the error into the chat — Claude can usually diagnose its own pipeline. The internals run-book is `docs/PIPELINE.md` in the repo. |
 

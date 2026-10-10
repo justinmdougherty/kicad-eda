@@ -18,6 +18,13 @@ the placement, and so the route):
      the rollback is a G4 decision of its own and the scale loop escalates.
 Both apply only to Freerouting: a route_provider is called once per attempt.
 
+--resume stalled (ROADMAP D5) starts with route_from_snapshot: the same route
+with autoroute_board(from_snapshot=True), which restores the pre-KiCad-11
+snapshot X.k9.* over the agent's KiCad 11 board (that set moves to X.agent.*)
+and routes it; the snapshot (the board before the agent touched it) is then
+the <pcb>.placed copy the alternates start from, and the near-miss recovery
+above applies as on any Freerouting attempt.
+
 Files beside the board (git-ignored):
   <pcb>.placed    the placed board before the first route (every alternate starts there)
   <pcb>.alt<s>    the board routed with dsn_seed s (0 = the canonical order)
@@ -43,6 +50,7 @@ import kicad_server as k
 import rp_context
 import rp_hooks
 import rp_kicad
+import toolchain as tc
 
 NEAR_MISS_UNCONNECTED = 4     # 1..4 unrouted = same-net micro-gaps: recover in place
 AUTOROUTE_MAX_PASSES, AUTOROUTE_TIMEOUT_S = 600, 1500
@@ -56,6 +64,8 @@ NOTHING_APPLIED = "the healer applied nothing"   # a no-op heal: restored, not l
 HEAL_RULE = ("a micro-gap heal is kept only when the healed board has DRC unconnected 0, "
              "no more DRC errors than before, no new routed-check issue and no finding "
              "left open; otherwise the routed board is restored and pack_scale escalates")
+# what autoroute_board(from_snapshot=True) adds to its result (board_autoroute.run)
+FALLBACK_FIELDS = ("fallback_from_snapshot", "pre_k11_snapshot", "agent_copy", "fallback_note")
 
 
 def route_attempt(ctx: rp_context.RunContext, attempt: int, scale: float) -> bool:
@@ -74,16 +84,47 @@ def route_attempt(ctx: rp_context.RunContext, attempt: int, scale: float) -> boo
     router: Callable[..., dict] = provider or k.autoroute_board
     ra = router(ctx.pcb, AUTOROUTE_MAX_PASSES, "", AUTOROUTE_TIMEOUT_S)
     ctx.route_rep = {"attempt": attempt, "pack_scale": scale, **route_fields(ra)}
-    snapshot_routed(ctx.pcb)   # so a failed retry-build can restore it
+    return settle_route(ctx, attempt, ra, recover=provider is None)
+
+
+def settle_route(ctx: rp_context.RunContext, attempt: int, ra: dict, recover: bool) -> bool:
+    """After one route: snapshot the routed board (a failed retry-build
+    restores it), record a router failure, and recover a near miss in place
+    when `recover` (Freerouting with a <pcb>.placed copy). True = stop
+    escalating (see route_attempt)."""
+    snapshot_routed(ctx.pcb)
     unconnected = ra.get("unconnected")
     if unconnected is None:
         ctx.route_rep = {**ctx.route_rep, "error": router_error(ra)}
         return True
     if unconnected == 0:
         return True
-    if provider is not None or unconnected > NEAR_MISS_UNCONNECTED:
+    if not recover or unconnected > NEAR_MISS_UNCONNECTED:
         return False
     return route_alternates(ctx, attempt, ra) or heal_near_miss(ctx, attempt)
+
+
+def route_from_snapshot(ctx: rp_context.RunContext, attempt: int, scale: float) -> bool:
+    """--resume stalled, first fallback (ROADMAP D5): autoroute_board(pcb,
+    from_snapshot=True) restores X.k9.* over the agent's KiCad 11 board (kept
+    as X.agent.*) and routes it with Freerouting (a board still in the
+    pre-KiCad-11 format is routed as it is). The board the route started
+    from (the snapshot, or that board) becomes <pcb>.placed, so a near miss
+    gets the alternates and the verified heal. ctx.route_rep carries the
+    fallback fields (FALLBACK_FIELDS). A restore or router failure is
+    route_rep['error'] (unconnected None). True = stop escalating."""
+    clear_recovery_copies(ctx.pcb)
+    placed = ctx.pcb + PLACED_SUFFIX
+    if tc.is_pre_k11(ctx.pcb):
+        copy_board(ctx.pcb, placed)
+    ra = k.autoroute_board(ctx.pcb, AUTOROUTE_MAX_PASSES, "", AUTOROUTE_TIMEOUT_S,
+                           from_snapshot=True)
+    if ra.get("fallback_from_snapshot"):
+        copy_board(tc.pre_k11_snapshot_path(ctx.pcb), placed)
+    ctx.provider_routed = False
+    ctx.route_rep = {"attempt": attempt, "pack_scale": scale, **route_fields(ra),
+                     **{key: ra[key] for key in FALLBACK_FIELDS if key in ra}}
+    return settle_route(ctx, attempt, ra, recover=Path(placed).is_file())
 
 
 def route_fields(ra: dict) -> dict:
