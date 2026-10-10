@@ -35,7 +35,10 @@ REPORT_SUFFIX = "_pipeline_report.json"
 CACHE_SUFFIX = ".cache.json"
 ATTEMPT_SUFFIX = ".attempt"   # <pcb>.attempt: the last ROUTED board of the scale loop
 AGENT_SUFFIX = ".agent"       # <stem>.agent.kicad_pcb/.kicad_pro: a preserved KiCad 11 board
-SCHEMATIC_REP_KEYS = ("ok", "backend", "components", "nets", "erc_ok", "erc_violations")
+# report['schematic']: fallback = kicad_server's api -> file fallback {from, to, reason,
+# decision} (ROADMAP D5, it records the G2 decision itself); libraries = the sources in use
+SCHEMATIC_REP_KEYS = ("ok", "backend", "components", "nets", "erc_ok", "erc_violations",
+                      "fallback", "libraries")
 # (name, feeds) of the gates.py verdicts, for a Halt naming a gate not yet recorded
 GATE_TITLES: dict[str, tuple[str, str]] = {
     "G1": ("Requirements / netlist review", "SRR"),
@@ -47,12 +50,24 @@ BOARD_REP_KEYS = ("ok", "footprints", "pads_assigned", "zones", "antenna_keepout
                   "mounting_holes", "missing_pads", "error", "reason", "stderr")
 OPEN_PREFIX = review_report.OPEN_PREFIX       # an unfixed board-fix finding, never a decision
 REMEDY_RATIONALE = "standard remedy for an auto task (gates.py)"
+# --route (ROADMAP D5; rp_route_modes): run() defaults to auto, a RunContext made
+# directly to freerouting (the harness without a handoff, as napkin defaults to False)
+ROUTE_AUTO, ROUTE_FREEROUTING, ROUTE_AGENT = "auto", "freerouting", "agent"
+ROUTE_MODES: tuple[str, ...] = (ROUTE_AUTO, ROUTE_FREEROUTING, ROUTE_AGENT)
+STATUS_HANDOFF = "handoff"       # report['status'] of a run that handed routing to the agent
 # report['routing'] of a harness run (review_report renders method / requested / why)
-ROUTING_REQUESTED = "auto"
+ROUTING_REQUESTED = ROUTE_AUTO
 ROUTING_WHY = "harness default: Freerouting on a canonical DSN (deterministic, no tokens)"
+FREEROUTING_WHY = ("--route freerouting: Freerouting on a canonical DSN (deterministic, no "
+                   "tokens); a G4 failure is final, never handed to the agent")
 ROUTE_CACHE_WHY = ("the route hash matches a routed run (nothing that moves copper "
                    "changed), so its Freerouting board was reused; G3 and G4 re-judge it")
 AGENT_ROUTING = "agent routing through the KiCad board API (the router subagent)"
+ROUTING_WHYS: dict[str, str] = {ROUTE_AUTO: ROUTING_WHY, ROUTE_FREEROUTING: FREEROUTING_WHY}
+# a board a feature's route_provider routed instead of Freerouting (rp_route)
+PROVIDER_METHOD = "route provider (a pipeline feature's router)"
+PROVIDER_ROUTED_WHY = ("a pipeline feature supplies the router (route_provider): it routed the "
+                       "board instead of Freerouting; a failure is a G4 FAIL, never a handoff")
 
 
 @dataclass
@@ -63,11 +78,22 @@ class RunContext:
     `report` is the JSON report halt() finalises and persists; `analysis` is
     the last design_report.analyze() result (the report keeps a summary).
     `ext` holds pipeline feature state keyed by feature name (rp_hooks; never
-    reported by itself); `halted_by` is set when a feature hook stopped the run."""
+    reported by itself); `halted_by` is set when a feature hook stopped the run.
+    `napkin` is the mode (ROADMAP D5): the one asked for (run() defaults to
+    True, --strict passes False), made True at load by a netlist "mode":
+    "napkin" (rp_napkin.resolve_mode); False = the strict harness. `route`
+    is the --route mode (ROUTE_MODES; run() defaults to auto); the route
+    modes (rp_route_modes) keep their state in route_attempts (the routed
+    attempts of the ladder), best_attempt + best_board + best_placed (auto:
+    the one with the fewest unrouted nets, its routed and placed boards) and
+    handoff_pending (agent: placed, not routed); provider_routed says a
+    feature's route_provider routed the last attempt."""
     netlist: str
     w: float
     h: float
     placement: str = ""
+    napkin: bool = False
+    route: str = ROUTE_FREEROUTING
     no_cache: bool = field(default_factory=lambda: bool(os.environ.get("PIPELINE_NO_CACHE")))
     design: dict = field(default_factory=dict)
     syms: str = ""
@@ -86,6 +112,12 @@ class RunContext:
     g4: dict = field(default_factory=dict)
     ext: dict[str, Any] = field(default_factory=dict)   # feature state, keyed by feature name
     halted_by: dict = field(default_factory=dict)       # {gate, feature, hook, message}
+    route_attempts: list[dict] = field(default_factory=list)   # rp_route_modes.note_attempt
+    best_attempt: Attempt | None = None               # auto: the fewest-unrouted attempt ...
+    best_board: bytes = b""                           # ... its routed board's bytes ...
+    best_placed: bytes = b""                          # ... and its placed board's (<pcb>.placed)
+    handoff_pending: bool = False                     # agent: placed, waiting for the agent
+    provider_routed: bool = False                     # a route_provider routed the last attempt
     run_decided: bool = False                         # halt recorded the run-level decisions
     base: str = field(init=False)                     # the netlist path without .json
     netlist_dir: Path = field(init=False)             # absolute (feature hooks resolve from it)
@@ -192,14 +224,15 @@ def halt(ctx: RunContext, error: str | None = None) -> dict:
     netlist path is known): final verdict + summary, the keys the review
     renders and the run-level decisions (record_run), then <stem>_review.md
     (write_review) and <stem>_pipeline_report.json, on every exit (pass, gate
-    failure, or `error` for a crash). A review failure is report['review_error']
-    and never masks the run's own error; a report write failure is flagged in
-    the report, on stderr and in a re-written review."""
+    failure, a routing handoff, or `error` for a crash). A handoff (report
+    status STATUS_HANDOFF) is never a PASS. A review failure is
+    report['review_error'] and never masks the run's own error; a report write
+    failure is flagged in the report, on stderr and in a re-written review."""
     report = ctx.report
     if error is not None:
         report["error"] = error
-    report["PASS"] = (error is None and bool(report["gates"])
-                      and all(g["passed"] for g in report["gates"]))
+    report["PASS"] = (error is None and report.get("status") != STATUS_HANDOFF
+                      and bool(report["gates"]) and all(g["passed"] for g in report["gates"]))
     report["gate_summary"] = gates.summarize(report["gates"])
     report["pipeline_report"] = str(ctx.report_path)
     _guarded(ctx, record_run)
@@ -250,7 +283,7 @@ def record_run(ctx: RunContext) -> None:
         report["pre_k11_snapshot"] = snapshot
     routed_here = "routing" not in report and bool(ctx.route_rep or report.get("autoroute"))
     if routed_here:
-        report["routing"] = routing_record(report)
+        report["routing"] = routing_record(report, ctx.route, provider=ctx.provider_routed)
     if not ctx.run_decided:
         ctx.run_decided = True
         decide_run(ctx, routed_here)
@@ -259,12 +292,19 @@ def record_run(ctx: RunContext) -> None:
         report["decisions_log"] = str(log)
 
 
-def routing_record(report: dict) -> dict:
-    """report['routing'] of a harness run: the route cache when it hit, else
-    Freerouting (the harness router), with the reason."""
+def routing_record(report: dict, requested: str = ROUTING_REQUESTED, *,
+                   provider: bool = False) -> dict:
+    """report['routing'] of a harness run that routed the board itself: the
+    route cache when it hit, a feature's route_provider when it routed the
+    board (`provider`), else Freerouting, with the --route mode requested and
+    the reason. (A handoff, a refused handoff and a route_provider in agent
+    mode record their own: rp_route_modes.)"""
     if report.get("route_cache") == "hit":
-        return {"method": "route cache", "requested": ROUTING_REQUESTED, "why": ROUTE_CACHE_WHY}
-    return {"method": "freerouting", "requested": ROUTING_REQUESTED, "why": ROUTING_WHY}
+        return {"method": "route cache", "requested": requested, "why": ROUTE_CACHE_WHY}
+    if provider:
+        return {"method": PROVIDER_METHOD, "requested": requested, "why": PROVIDER_ROUTED_WHY}
+    return {"method": "freerouting", "requested": requested,
+            "why": ROUTING_WHYS.get(requested, ROUTING_WHY)}
 
 
 def decide_run(ctx: RunContext, routed: bool) -> None:
@@ -280,13 +320,20 @@ def decide_run(ctx: RunContext, routed: bool) -> None:
 
 def decide_routing(ctx: RunContext) -> None:
     question = "How is the board routed?"
-    if ctx.report["routing"]["method"] == "route cache":
+    method = ctx.report["routing"]["method"]
+    if method == "route cache":
         ctx.decide("routing", question, "reuse the routed board of an earlier run (route "
                    "cache hit)", ROUTE_CACHE_WHY, source="run_pipeline route cache",
                    alternatives=("re-route with Freerouting (set PIPELINE_NO_CACHE=1)",))
+    elif method == PROVIDER_METHOD:
+        ctx.decide("routing", question, "the router a pipeline feature supplies "
+                   "(route_provider) instead of Freerouting", PROVIDER_ROUTED_WHY,
+                   source="run_pipeline routing",
+                   alternatives=("Freerouting on a canonical DSN (the harness router)",))
     else:
         ctx.decide("routing", question, "Freerouting on a canonical DSN (the harness router)",
-                   ROUTING_WHY, source="run_pipeline routing", alternatives=(AGENT_ROUTING,))
+                   ctx.report["routing"]["why"], source="run_pipeline routing",
+                   alternatives=(AGENT_ROUTING,))
 
 
 def decide_sourcing(ctx: RunContext) -> None:

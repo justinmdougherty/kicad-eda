@@ -88,9 +88,11 @@ def _build_g3_fixture() -> str:
 
 
 def _fixture_g3() -> tuple[str, dict]:
-    """Run the G3 fixture and assert it fails AT G3 with both findings."""
+    """Run the G3 fixture and assert it fails AT G3 with both findings. It
+    runs strict (napkin=False): napkin mode would turn the inward connector
+    out, and the fixture exists to prove DETECTION."""
     netlist = _build_g3_fixture()
-    rep = rp.run(netlist, 56, 40)
+    rep = rp.run(netlist, 56, 40, napkin=False)
     g3 = next((g for g in rep.get("gates", []) if g["gate"] == "G3"), {})
     blockers = " | ".join(g3.get("blockers", []))
     warnings = " | ".join(g3.get("warnings", []))

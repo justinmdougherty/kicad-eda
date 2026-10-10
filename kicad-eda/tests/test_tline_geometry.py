@@ -154,7 +154,10 @@ def test_embedded_microstrip_warns_about_the_routed_layer_above() -> None:
     assert g.kind == "embedded_microstrip"
     assert [p.thickness for p in g.below] == [0.3] and [p.thickness for p in g.above] == [0.1]
     assert setup.ref_below == ("In2.Cu",) and setup.ok
-    assert any("F.Cu" in n and "routed" in n for n in setup.notes)
+    assert any(w.startswith("In1.Cu: ") and "F.Cu" in w and "routed" in w
+               for w in setup.warnings)
+    quiet = geo.resolve_line(_rs({}), "F.Cu", {"impedance": 50})
+    assert quiet.geom.kind == "microstrip" and quiet.warnings == ()
 
 
 def test_plane_and_unknown_layers_are_not_line_layers() -> None:
@@ -184,6 +187,20 @@ def test_ref_layers_override_naming_a_signal_layer_is_an_error() -> None:
 
 
 # ---------------------------------------------------------------- line requests
+@pytest.mark.parametrize("value,expected", [(9.15e8, 9.15e8), (1, 1.0), ("x", None),
+                                            ("9e8", None), (True, None), (0, None),
+                                            (-1e9, None), (float("nan"), None),
+                                            (float("inf"), None), (None, None)])
+def test_rf_freq_counts_only_a_finite_positive_number(value: Any, expected: Any) -> None:
+    assert geo.rf_freq({"freq_hz": value}) == expected
+    assert geo.rf_freq({}) is None
+
+
+def test_a_non_numeric_frequency_does_not_make_an_rf_line() -> None:
+    setup = geo.resolve_line(_rs({}), "F.Cu", {"impedance": 50, "freq_hz": "x"})
+    assert setup.geom.kind == "microstrip" and not setup.rf and not setup.coplanar
+
+
 def test_auto_line_with_frequency_on_an_outer_layer_is_cpwg() -> None:
     setup = geo.resolve_line(_rs({}), "F.Cu", {"impedance": 50, "freq_hz": 9.15e8})
     assert setup.geom.kind == "cpwg" and setup.coplanar and setup.geom.ground_gap is None
@@ -196,12 +213,13 @@ def test_cpwg_on_an_inner_layer_adds_same_layer_grounds() -> None:
     setup = geo.resolve_line(_preset("JLC06161H-2116"), "In2.Cu",
                              {"impedance": 50, "line": "cpwg", "ground_gap": 0.2})
     assert setup.geom.kind == "dual_stripline" and setup.geom.ground_gap == 0.2
-    assert setup.coplanar and any("same-layer" in n for n in setup.notes)
+    assert setup.coplanar and any("same-layer" in w for w in setup.warnings)
 
 
-def test_ground_gap_on_a_non_coplanar_line_is_ignored_with_a_note() -> None:
+def test_ground_gap_on_a_non_coplanar_line_is_ignored_with_a_warning() -> None:
     setup = geo.resolve_line(_rs({}), "F.Cu", {"impedance": 50, "ground_gap": 0.2})
-    assert setup.geom.ground_gap is None and any("ground_gap" in n for n in setup.notes)
+    assert setup.geom.ground_gap is None and any("ground_gap" in w for w in setup.warnings)
+    assert setup.ok and setup.issues == ()
 
 
 @pytest.mark.parametrize("layer,line", [("F.Cu", "stripline"), ("In2.Cu", "microstrip"),
@@ -215,14 +233,16 @@ def test_line_request_contradicting_the_stackup_is_an_error(layer: str, line: st
 def test_stripline_request_on_a_dual_stripline_layer_is_honoured_as_dual() -> None:
     setup = geo.resolve_line(_preset("JLC06161H-2116"), "In2.Cu",
                              {"impedance": 50, "line": "stripline"})
-    assert setup.geom.kind == "dual_stripline" and any("dual" in n for n in setup.notes)
+    assert setup.geom.kind == "dual_stripline" and any("dual" in w for w in setup.warnings)
 
 
 def test_cpw_without_a_back_plane_on_an_outer_layer() -> None:
     rs = _layers("S", (0.8, 4.4), "S")
     setup = geo.resolve_line(rs, "F.Cu", {"impedance": 50, "line": "cpw", "ground_gap": 0.2})
     assert setup.geom.kind == "cpw" and [p.thickness for p in setup.geom.below] == [0.8]
-    assert setup.ok and setup.ref_below == ()
+    assert setup.ok and setup.ref_below == () and setup.warnings == ()
+    over_plane = geo.resolve_line(_rs({}), "F.Cu", {"impedance": 50, "line": "cpw"})
+    assert any(w.startswith("F.Cu: cpw") and "cpwg" in w for w in over_plane.warnings)
 
 
 # ---------------------------------------------------------------- pairs

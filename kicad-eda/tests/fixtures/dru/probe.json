@@ -1,0 +1,34 @@
+{
+  "description": "DRU live probe (D7-12a, tests/test_dru_writer_live.py). board: what build_probe.py draws (4 copper layers, In1.Cu GND zone, sheet mm). design + lines: the stackup and the RF50 line base_rules turns into R8 (In1.Cu GND, In2.Cu +3V3), R7 (RF50 off B.Cu) and R6 (RF50 on F.Cu: 0.36 mm, window 0.36 +/- max(0.005, 1.5 %) = [0.3546, 0.3654]). Each 'expect' track must be the ONLY new violation of its family; the 'control' tracks must stay clean.",
+  "board": {
+    "copper_layers": 4,
+    "origin": [100, 100],
+    "size": [40, 30],
+    "nets": ["GND", "+3V3", "SIG", "RF50"],
+    "zones": [{"layer": "In1.Cu", "net": "GND", "inset": 1.0}],
+    "tracks": [
+      {"id": "foreign_on_plane", "net": "SIG", "layer": "In1.Cu", "width": 0.25, "from": [5, 5], "to": [15, 5]},
+      {"id": "own_net_on_plane", "net": "GND", "layer": "In1.Cu", "width": 0.25, "from": [5, 10], "to": [15, 10]},
+      {"id": "narrow_impedance", "net": "RF50", "layer": "F.Cu", "width": 0.30, "from": [5, 5], "to": [15, 5]},
+      {"id": "impedance_in_window", "net": "RF50", "layer": "F.Cu", "width": 0.36, "from": [5, 10], "to": [15, 10]},
+      {"id": "impedance_off_layer", "net": "RF50", "layer": "B.Cu", "width": 0.36, "from": [5, 5], "to": [15, 5]},
+      {"id": "signal_on_b", "net": "SIG", "layer": "B.Cu", "width": 0.25, "from": [5, 10], "to": [15, 10]},
+      {"id": "signal_on_f", "net": "SIG", "layer": "F.Cu", "width": 0.25, "from": [5, 15], "to": [15, 15]}
+    ]
+  },
+  "design": {
+    "name": "dru_probe",
+    "components": [],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]], "SIG": [["J1", "3"]], "RF50": [["J1", "4"]]},
+    "stackup": {"preset": "jlcpcb:JLC04161H-7628", "rationale": "DRU probe: 4L SIG / GND / +3V3 / SIG"}
+  },
+  "lines": {
+    "RF50": {"kind": "single", "status": "closed_form", "primary_layer": "F.Cu",
+             "layers": {"F.Cu": {"width": 0.36, "width_window": [0.3546, 0.3654]}}}
+  },
+  "expect": {
+    "R8": {"track": "foreign_on_plane", "type": "items_not_allowed"},
+    "R7": {"track": "impedance_off_layer", "type": "items_not_allowed"},
+    "R6": {"track": "narrow_impedance", "type": "track_width"}
+  }
+}

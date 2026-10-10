@@ -19,7 +19,18 @@ Pipeline feature modules (pipeline/rp_feature_*.py, rp_hooks) are OFF in a
 World: a test enables the ones it means with world.use_features(...) (names or
 module objects), and `recorder` installs an in-memory feature that implements
 every hook as a recording no-op. Drive a run with world.run(**kw): RUN_DEFAULTS
-is the one place later harness options are pinned for every stage test.
+is the one place later harness options are pinned for every stage test
+(napkin=False: run() defaults to napkin mode, the stage tests prove the strict
+behaviour; tests/test_run_pipeline_napkin.py passes napkin=True. route=
+'freerouting': run() defaults to 'auto', which hands a G4 failure to the agent;
+the stage tests prove the Freerouting-only behaviour, and
+tests/test_run_pipeline_route_modes.py passes the mode it means).
+
+The KiCad GUI the open-editor guard asks (kicad_ipc.connect) is a stand-in
+too: `open_documents` lists what it has open ([] = no GUI answers), and every
+connection is counted in `connects`, not in `calls`. The napkin connector
+probe (rp_napkin.connector_probe) consumes `probes` and is recorded as
+("probe", ()).
 """
 from __future__ import annotations
 
@@ -33,16 +44,19 @@ import pytest
 
 import design_report as drpt
 import kicad_env as env
+import kicad_ipc as ipc
 import kicad_server as k
 import lint_netlist as lint
 import rp_hooks
 import rp_kicad
+import rp_napkin
 import run_pipeline as rp
 import thermal_check
 
 # run() keyword defaults every World.run pins (a new harness option goes here so
 # the existing stage tests keep proving today's behaviour)
-RUN_DEFAULTS: dict[str, Any] = {"w": 30, "h": 30, "placement": ""}
+RUN_DEFAULTS: dict[str, Any] = {"w": 30, "h": 30, "placement": "", "napkin": False,
+                                "route": "freerouting"}
 
 K9_HEADER = '(kicad_pcb (version 20241229) (generator "pcbnew") (generator_version "9.0")\n'
 K11_HEADER = '(kicad_pcb (version 20260901) (generator "pcbnew") (generator_version "10.99")\n'
@@ -119,6 +133,9 @@ class World:
                      "pitch_mm": 3.0}]
         self.fab = [{"ok": True, "zip": str(tmp_path / "netlist_JLCPCB.zip"),
                      "files": [f"f{i}" for i in range(12)], "bom": "BOM.csv", "cpl": "CPL.csv"}]
+        self.open_documents: list[dict[str, str]] = []   # [{type, path}] open in the fake GUI
+        self.connects = 0
+        self.probes: list[Any] = [{"ok": False, "reason": "no connector probe scripted"}]
         self.header = K9_HEADER
         self._patch(monkeypatch, tmp_path)
 
@@ -168,6 +185,8 @@ class World:
         mp.setattr(rp_kicad, "board_fix", self.fake_board_fix)
         mp.setattr(rp_kicad, "render", self.fake_render)
         mp.setattr(rp_kicad, "emc_stitch", self.fake_emc)
+        mp.setattr(ipc, "connect", self.fake_connect)
+        mp.setattr(rp_napkin, "connector_probe", self.fake_probe)
 
     # --- the stand-ins ---------------------------------------------------------
     def fake_lint(self, design: dict, syms: str, **kw: Any) -> dict:
@@ -241,6 +260,21 @@ class World:
     def fake_fab(self, pcb: str, netlist: str = "") -> dict:
         self._rec("fab")
         return dict(_next(self.fab))
+
+    def fake_connect(self) -> dict:
+        """kicad_ipc.connect: a KiCad GUI holding `open_documents`, or none."""
+        self.connects += 1
+        if not self.open_documents:
+            return {"ipc_connected": False, "reason": "fake: no KiCad GUI is running"}
+        return {"ipc_connected": True, "kicad_version": "9.0.4",
+                "open_documents": [dict(d) for d in self.open_documents], "capabilities": {}}
+
+    def fake_probe(self, pcb: str, netlist: str) -> dict:
+        self._rec("probe")
+        res = _next(self.probes)
+        if isinstance(res, Exception):
+            raise res
+        return copy.deepcopy(res)
 
 
 # --- an in-memory pipeline feature ------------------------------------------------

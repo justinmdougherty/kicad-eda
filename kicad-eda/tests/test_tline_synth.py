@@ -72,7 +72,7 @@ def test_class_a_closed_form_is_final_and_needs_no_fd() -> None:
     assert (s.accuracy_class, s.status, s.fd, s.decision_draft) == ("A", "closed_form", None, None)
     assert s.value == s.geom.width == pytest.approx(0.365)
     assert abs(s.error_pct) < 2.0 and fd.solves == 0
-    assert s.width_window == (0.36, 0.37)
+    assert s.width_window == (0.359525, 0.370475)          # +/- 1.5 % above 0.333 mm
 
 
 @FD
@@ -131,6 +131,66 @@ def test_no_fd_backend_is_reported() -> None:
     assert s.status == "fallback_unverified" and "numpy" in s.decision_draft["rationale"]
 
 
+class NoSolveFd(CountingFd):
+    """A tier whose synthesis comes back without a single solve."""
+
+    def synthesize_fd(self, geom: LineGeometry, *_a: Any, **_k: Any) -> tuple:
+        return geom, None, {"solves": 0, "seconds": 0.0, "converged": False}
+
+
+def test_a_synthesis_that_ran_no_solve_is_named_plainly_in_the_draft() -> None:
+    s = synth.synthesize(_usb(), 90.0, target_kind="zdiff", fd=NoSolveFd("scipy"))
+    assert s.status == "fallback_unverified" and s.fd is None
+    rationale = s.decision_draft["rationale"]
+    assert rationale.startswith("the FD tier ran no solve") and "Error" not in rationale
+
+
+class FixedZFd(NoSolveFd):
+    """A tier whose verification returns `z` ohm; its re-synthesis raises `exc` or, without
+    one, comes back with no solve."""
+
+    def __init__(self, z: float, exc: Exception | None = None) -> None:
+        super().__init__("scipy")
+        self.z, self.exc = z, exc
+
+    def solve(self, geom: LineGeometry, **_k: Any) -> fs.FdResult:
+        self.solves += 1
+        return fs.FdResult(z0=self.z, eeff=3.0, z_even=None, z_odd=None, z_diff=None, cells=1,
+                           seconds=0.0, method="fake")
+
+    def synthesize_fd(self, geom: LineGeometry, *a: Any, **k: Any) -> tuple:
+        if self.exc is not None:
+            raise self.exc
+        return super().synthesize_fd(geom, *a, **k)
+
+
+RESYNTH_FAILURES = [(fs.FdBudgetExhausted("spent"), "FdBudgetExhausted: spent"),
+                    (None, "the FD tier ran no solve")]
+
+
+@pytest.mark.parametrize("exc,why", RESYNTH_FAILURES)
+def test_a_failed_re_synthesis_after_a_good_verification_is_a_warning(
+        exc: Exception | None, why: str) -> None:
+    """Z within 1 % but the slope implies a > 1 % width move: the re-synthesis is tried; when
+    it cannot run, the FD-verified width stands (no draft) and a warning says why."""
+    s = synth.synthesize(_ms(0.0994, 4.1), 50.0, fd=FixedZFd(50.45, exc), label="RF on F.Cu")
+    assert s.accuracy_class == "B" and s.status == "fd" and s.fd["verified"]
+    assert s.decision_draft is None and s.z_achieved == pytest.approx(50.45)
+    hits = [w for w in s.warnings if "re-synthesis" in w]
+    assert len(hits) == 1 and hits[0].startswith("RF on F.Cu: ") and why in hits[0]
+    assert hits[0] in s.record()["warnings"]
+
+
+@pytest.mark.parametrize("exc,why", RESYNTH_FAILURES)
+def test_a_failed_re_synthesis_after_a_missed_verification_is_in_the_draft(
+        exc: Exception | None, why: str) -> None:
+    s = synth.synthesize(_ms(0.0994, 4.1), 50.0, fd=FixedZFd(51.5, exc))
+    assert s.status == "fd" and not s.fd["verified"]
+    rationale = s.decision_draft["rationale"]
+    assert "puts Z +3.00 % off" in rationale and why in rationale
+    assert not any("re-synthesis" in w for w in s.warnings)
+
+
 @FD
 def test_fd_cache_by_cross_section_hash_skips_the_solves() -> None:
     first_fd, again_fd = CountingFd(), CountingFd()
@@ -144,7 +204,7 @@ def test_fd_cache_by_cross_section_hash_skips_the_solves() -> None:
 
 # ---------------------------------------------------------------- geometry rules
 def test_width_window_rule() -> None:
-    assert synth.width_window(0.365) == (0.36, 0.37)
+    assert synth.width_window(0.3) == (0.295, 0.305)          # +/- 0.005 mm floor
     assert synth.width_window(1.0) == (0.985, 1.015)
 
 
@@ -200,8 +260,8 @@ def test_pair_without_a_gap_ties_the_gap_to_the_width() -> None:
 
 
 def test_explicit_width_is_checked_not_solved() -> None:
-    s = synth.synthesize(replace(_ms(), width=0.3), 50.0, fixed=True, z_tol_pct=5.0)
-    assert s.value == 0.3 and s.z_achieved > 50.0
+    s = synth.synthesize(replace(_ms(), width=0.33), 50.0, fixed=True, z_tol_pct=5.0)
+    assert s.value == 0.33 and 50.0 < s.z_achieved < 52.5
     assert not any("tolerance" in w for w in s.warnings)
     off = synth.synthesize(replace(_ms(), width=0.2), 50.0, fixed=True, z_tol_pct=5.0)
     assert any("tolerance" in w for w in off.warnings)

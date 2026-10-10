@@ -1,0 +1,84 @@
+(version 1)
+# kicad-eda managed begin
+# Written by kicad-eda from the stackup and the impedance lines (ADR D7.8). Everything
+# between these markers is rewritten on every build: keep your own rules outside them
+# (for one constraint KiCad uses the last matching rule, so a rule below the end
+# marker overrides a managed one).
+# canary: fires only on net __KICAD_EDA_CANARY__ and proves this file compiled
+(rule "__kicad_eda_canary" (condition "A.NetName == '__KICAD_EDA_CANARY__'") (constraint track_width (min 10mm)))
+# R8 plane-role layers: tracks of any other net are not allowed
+(rule "kicad_eda_plane_In1.Cu"
+  (layer "In1.Cu")
+  (condition "A.Type == 'Track' && A.NetName != 'GND'")
+  (constraint disallow track))
+(rule "kicad_eda_plane_In4.Cu"
+  (layer "In4.Cu")
+  (condition "A.Type == 'Track' && A.NetName != '+3V3'")
+  (constraint disallow track))
+# R7 impedance nets: tracks only on their solved layers
+(rule "kicad_eda_offlayer_CLK_50R_F.Cu"
+  (layer "F.Cu")
+  (condition "A.NetName == 'CLK_50R'")
+  (constraint disallow track))
+(rule "kicad_eda_offlayer_CLK_50R_B.Cu"
+  (layer "B.Cu")
+  (condition "A.NetName == 'CLK_50R'")
+  (constraint disallow track))
+(rule "kicad_eda_offlayer_RF_ANT_In2.Cu"
+  (layer "In2.Cu")
+  (condition "A.NetName == 'RF_ANT'")
+  (constraint disallow track))
+(rule "kicad_eda_offlayer_RF_ANT_In3.Cu"
+  (layer "In3.Cu")
+  (condition "A.NetName == 'RF_ANT'")
+  (constraint disallow track))
+(rule "kicad_eda_offlayer_RF_ANT_B.Cu"
+  (layer "B.Cu")
+  (condition "A.NetName == 'RF_ANT'")
+  (constraint disallow track))
+# R6 impedance nets: track width inside the solved window (min / opt / max)
+(rule "kicad_eda_width_CLK_50R_In2.Cu"
+  (layer "In2.Cu")
+  (condition "A.NetName == 'CLK_50R'")
+  (constraint track_width (min 0.349675mm) (opt 0.355mm) (max 0.360325mm)))
+(rule "kicad_eda_width_CLK_50R_In3.Cu"
+  (layer "In3.Cu")
+  (condition "A.NetName == 'CLK_50R'")
+  (constraint track_width (min 0.349675mm) (opt 0.355mm) (max 0.360325mm)))
+(rule "kicad_eda_width_ETH_TX_N_F.Cu"
+  (layer "F.Cu")
+  (condition "A.NetName == 'ETH_TX_N'")
+  (constraint track_width (min 0.18mm) (opt 0.185mm) (max 0.19mm)))
+(rule "kicad_eda_width_ETH_TX_N_In2.Cu"
+  (layer "In2.Cu")
+  (condition "A.NetName == 'ETH_TX_N'")
+  (constraint track_width (min 0.14mm) (opt 0.145mm) (max 0.15mm)))
+(rule "kicad_eda_width_ETH_TX_N_In3.Cu"
+  (layer "In3.Cu")
+  (condition "A.NetName == 'ETH_TX_N'")
+  (constraint track_width (min 0.14mm) (opt 0.145mm) (max 0.15mm)))
+(rule "kicad_eda_width_ETH_TX_N_B.Cu"
+  (layer "B.Cu")
+  (condition "A.NetName == 'ETH_TX_N'")
+  (constraint track_width (min 0.18mm) (opt 0.185mm) (max 0.19mm)))
+(rule "kicad_eda_width_ETH_TX_P_F.Cu"
+  (layer "F.Cu")
+  (condition "A.NetName == 'ETH_TX_P'")
+  (constraint track_width (min 0.18mm) (opt 0.185mm) (max 0.19mm)))
+(rule "kicad_eda_width_ETH_TX_P_In2.Cu"
+  (layer "In2.Cu")
+  (condition "A.NetName == 'ETH_TX_P'")
+  (constraint track_width (min 0.14mm) (opt 0.145mm) (max 0.15mm)))
+(rule "kicad_eda_width_ETH_TX_P_In3.Cu"
+  (layer "In3.Cu")
+  (condition "A.NetName == 'ETH_TX_P'")
+  (constraint track_width (min 0.14mm) (opt 0.145mm) (max 0.15mm)))
+(rule "kicad_eda_width_ETH_TX_P_B.Cu"
+  (layer "B.Cu")
+  (condition "A.NetName == 'ETH_TX_P'")
+  (constraint track_width (min 0.18mm) (opt 0.185mm) (max 0.19mm)))
+(rule "kicad_eda_width_RF_ANT_F.Cu"
+  (layer "F.Cu")
+  (condition "A.NetName == 'RF_ANT'")
+  (constraint track_width (min 0.285mm) (opt 0.29mm) (max 0.295mm)))
+# kicad-eda managed end

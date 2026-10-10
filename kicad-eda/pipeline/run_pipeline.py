@@ -14,19 +14,42 @@ and <stem>_review.md next to the netlist on every exit (pass, gate failure,
 crash, or a usage error once the netlist path is known), with the run's
 decisions in the append-only <stem>.decisions.jsonl (ROADMAP D5).
 
+Napkin mode (ROADMAP D5) is the default: the D5 policies turn floating IC
+pins, connectors facing the interior, fractured planes and short EP via farms
+into recorded automatic remedies, and a schematic / board open in a KiCad
+editor is written as a <stem>.napkin.* sibling instead. --strict
+(run(..., napkin=False)) is the harness without those policies (a file open
+in an editor then halts the run); a netlist "mode": "napkin" always means
+napkin.
+
+Routing (ROADMAP D5, rp_route_modes): --route auto (run(..., route='auto'),
+the default) routes with Freerouting first and, when G4 then fails, hands
+the board to the router subagent: <stem>_route_handoff.json, report status
+'handoff', PASS false, exit 3. --route freerouting never hands off (a G4
+failure exits 1); --route agent hands the board off as soon as it passes G3,
+without trying Freerouting. A feature's handoff_veto turns a would-be
+handoff into a G4 FAIL; a feature's route_provider is never handed off.
+
 Module map (pipeline/; each is a top-level import, and the rp_ prefix keeps
 the names clear of the modules in server/ and server/tools/):
   run_pipeline.py        STAGES, run(), main() and the aliases run_all.py uses
   rp_paths.py            puts server/ and server/tools/ on sys.path (imported first)
-  rp_cli.py              command line: parse_cli, board_dims, UsageError, USAGE
+  rp_cli.py              command line: parse_cli (--strict, --route), board_dims,
+                         UsageError, USAGE, exit_code
   rp_context.py          RunContext (+ decide), Attempt, record_gate, halt (report,
-                         review, run-level decisions), file suffixes
+                         review, run-level decisions), file suffixes, route modes
   rp_kicad.py            KiCad subprocess wrappers: drc, render, gate_check,
                          board_fix, emc_stitch, courtyard_drc, board_cli
   rp_route_hash.py       the route-cache key registry and route_hash
-  rp_stage_schematic.py  stage_load, G1 (netlist lint), G2 (schematic + review loop)
-  rp_stage_place.py      the route cache, G3 placement and the pack_scale ladder
+  rp_napkin.py           napkin mode: the mode decision, the open-editor hard stop,
+                         the G2/G3 policy remedies, the connector probe
+  rp_stage_schematic.py  stage_load (mode, hard stop, agent-board preservation),
+                         G1 (netlist lint), G2 (schematic + review loop)
+  rp_stage_place.py      the route cache, G3 placement (+ napkin policy rounds) and
+                         the pack_scale ladder
   rp_route.py            Freerouting attempts, near-miss heal, routed snapshots
+  rp_route_modes.py      --route auto|freerouting|agent: the best routed attempt, the
+                         handoff to the agent (<stem>_route_handoff.json), handoff_veto
   rp_stage_layout.py     G4 judge, board-fix loop, EMC stitching
   rp_stage_fab.py        the cache manifest, G5 fab package, sourcing audit and safety
                          warnings
@@ -41,8 +64,10 @@ Rules for changing the harness:
   - KiCad subprocess wrappers go in rp_kicad.py.
 
 Usage:
-  <venv-python> run_pipeline.py <netlist.json> [<board_w> <board_h>] [placement.json]
+  <venv-python> run_pipeline.py <netlist.json> [<board_w> <board_h>] [placement.json] [--strict]
+                [--route auto|freerouting|agent]
   (no dims: the netlist "board" w/h, else the board is auto-sized to its parts)
+  exit codes: 0 PASS, 1 FAIL, 2 usage error, 3 routing handed off to the agent
 """
 from __future__ import annotations
 
@@ -59,6 +84,7 @@ import rp_context
 import rp_kicad
 import rp_route
 import rp_route_hash
+import rp_route_modes
 import rp_stage_fab
 import rp_stage_layout
 import rp_stage_place
@@ -71,11 +97,17 @@ STAGES: tuple[Callable[[rp_context.RunContext], bool], ...] = (
     rp_stage_layout.stage_g4, rp_stage_fab.stage_cache_manifest, rp_stage_fab.stage_g5)
 
 
-def run(netlist: str, w: float, h: float, placement: str = "") -> dict:
+def run(netlist: str, w: float, h: float, placement: str = "", *, napkin: bool = True,
+        route: str = rp_route_modes.DEFAULT_ROUTE) -> dict:
     """Drive `netlist` through every gate (stopping at the first failure) and
     return the report; it is also written to <stem>_pipeline_report.json. A
-    crash is recorded in that file (PASS false, "error") and re-raised."""
-    ctx = rp_context.RunContext(netlist=netlist, w=w, h=h, placement=placement)
+    crash is recorded in that file (PASS false, "error") and re-raised.
+    napkin=False is --strict (a netlist "mode": "napkin" still means napkin);
+    route is --route (rp_route_modes.ROUTE_MODES; ValueError for another): a
+    handoff ends the run with report status 'handoff' and PASS false."""
+    rp_route_modes.check_route(route)
+    ctx = rp_context.RunContext(netlist=netlist, w=w, h=h, placement=placement, napkin=napkin,
+                                route=route)
     try:
         rp_stage_schematic.stage_load(ctx)
         for stage in STAGES:
@@ -121,12 +153,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"run_pipeline: error: {e}\n{rp_cli.USAGE}", file=sys.stderr)
         if cli is not None:                  # the netlist path is known: report + review
             usage_report(cli, str(e))
-        return 2
+        return rp_cli.EXIT_USAGE
     print(f"run_pipeline: board {w} x {h} mm ({source})", file=sys.stderr)
-    rep = run(cli.netlist, w, h, cli.placement)
+    rep = run(cli.netlist, w, h, cli.placement, **rp_cli.run_options(cli))
     print(json.dumps(rep, indent=2))
     print("\n" + rep["gate_summary"], file=sys.stderr)
-    return 0 if rep["PASS"] else 1
+    if rep.get("handoff"):
+        print(f"run_pipeline: routing handed to the agent: {rep['handoff']}", file=sys.stderr)
+    return rp_cli.exit_code(rep)
 
 
 # ---- aliases: the names pipeline/run_all.py and tests/test_toolchain.py use --

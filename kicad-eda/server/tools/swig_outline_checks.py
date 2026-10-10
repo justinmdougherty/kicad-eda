@@ -23,10 +23,14 @@ Codes (swig_gate_checks.main prints them in "codes" / "warning_codes", parallel 
                       all NPTH) off the board (blocker) or nearer the edge than the fab's
                       hole_to_edge (warning); never judged by its courtyard
   fab_outline         outline_audit.fab_issues for FAB_PROFILE: errors block, warnings warn
-  connector_edge      connector_verdict (swig_gate_checks supplies _world_mouth's mouth)
-  edge_mount_off_edge an edge-mount part's marker > 0.25 mm from the outline (edge_mount)
+  connector_edge      connector_verdict (swig_gate_checks supplies _world_mouth's mouth):
+                      the mouth face's nearest edge, else the edge it faces along the mouth
+  edge_mount_off_edge an edge-mount part's marker > 0.25 mm from the outline (edge_mount):
+                      a blocker, a warning naming the "edge" key when the netlist leaves
+                      the part to the auto placer (edge_mount_severity)
   plane_islands       a plane that fills as > 1 island on a board with cutouts or a
                       non-convex outline (warning, GND included)
+  plane_islands_unread pcbnew could not hand a zone layer's fill back (warning)
   copper_outside      G4: a track / arc / via / pad off the material - KiCad DRC does not
                       flag copper lying wholly inside an Edge.Cuts hole
 """
@@ -73,6 +77,9 @@ EDGE_MOUNT_OFF_EDGE = "edge_mount_off_edge"
 EDGE_MOUNT_UNREAD = "edge_mount_unread"
 COPPER_OUTSIDE = "copper_outside"
 PLANE_ISLANDS = "plane_islands"
+PLANE_ISLANDS_UNREAD = "plane_islands_unread"
+# netlist keys that say who chose a part's position (edge_mount_severity)
+PLACEMENT_KEYS = ("edge", "overhang", "at", "x", "y")
 _AUDIT_CODES = (("courtyard_", COURTYARD_OUTSIDE), ("pad_", PAD_EDGE_CLEARANCE),
                 ("copper_", COPPER_OUTSIDE), ("hole_", HOLE_EDGE), ("fab_", FAB_OUTLINE),
                 ("connector_edge", CONNECTOR_EDGE))
@@ -216,33 +223,100 @@ def _convex(pts: Sequence[Point]) -> bool:
 # --- connectors and edge-mount parts (pure) -----------------------------------------------
 @dataclass(frozen=True)
 class ConnectorVerdict:
-    """kind 'inward' | 'far', the mouth's distance to its nearest edge (mm) and
-    outline_audit's message (it names that edge and its outward normal)."""
+    """kind 'inward' | 'far', the distance its text reports (mm: to the mouth
+    face's nearest edge, or along the mouth to the edge it faces) and the longer
+    message naming those edges (outline_audit's, or _faced_detail's)."""
     kind: str
     dist: float
     detail: str
 
 
-def connector_verdict(outline: ol.Outline, ref: str, face: Sequence[float],
+def connector_verdict(outline: ol.Outline, ref: str, box: Sequence[float],
                       mouth: Sequence[float], panel_cutouts: bool = False
                       ) -> ConnectorVerdict | None:
-    """outline_audit.connector_edge_issue for the mouth face (board frame). A face
-    already off the material (the body hangs past the edge, e.g. an edge SMA) is at
-    the edge: only its facing is judged, as the old rule's negative distance passed."""
-    p = (float(face[0]), float(face[1]))
-    limit = oa.CONNECTOR_MAX_DIST_MM if ol.contains(outline, p) else math.inf
-    issue = oa.connector_edge_issue(outline, ref, p, mouth, limit, panel_cutouts)
+    """The G3 connector rule for a courtyard box (board frame) and its axis mouth:
+    outline_audit.connector_edge_issue judges the mouth face against its NEAREST
+    edge. A face already off the material (the body hangs past the edge, e.g. an
+    edge SMA) is at the edge: only its facing is judged. When the nearest edge does
+    not face the mouth, the edge the mouth looks at (faced_edge) still seats it
+    within 3 mm, so a part tucked into a corner is judged by the side it faces, as
+    the old bbox rule did; past 3 mm it is 'far' when the mouth points away from
+    the outline's centre (the old rule's facing test), else 'inward'."""
+    face = face_point(box, mouth)
+    on = ol.contains(outline, face)
+    limit = oa.CONNECTOR_MAX_DIST_MM if on else math.inf
+    issue = oa.connector_edge_issue(outline, ref, face, mouth, limit, panel_cutouts)
     if issue is None:
         return None
-    far = issue.message.startswith(f"{ref}: mating face is ")
-    return ConnectorVerdict("far" if far else "inward", ol.nearest_edge(outline, p).distance,
-                            issue.message)
+    nearest = ol.nearest_edge(outline, face).distance
+    if issue.message.startswith(f"{ref}: mating face is "):
+        return ConnectorVerdict("far", nearest, issue.message)
+    hit = faced_edge(outline, face, mouth, panel_cutouts) if on else None
+    if hit is not None and hit.distance <= limit + 1e-9:
+        return None
+    if hit is not None and _away_from_centre(outline, box, mouth):
+        return ConnectorVerdict("far", hit.distance, _faced_detail(outline, ref, face, mouth, hit))
+    return ConnectorVerdict("inward", nearest, issue.message)
+
+
+def faced_edge(outline: ol.Outline, face: Point, mouth: Sequence[float],
+               panel_cutouts: bool = False) -> Any:
+    """The first edge the ray from the mouth face along the mouth crosses
+    (outline.EdgeHit), when it counts (the outer ring, or a cutout with
+    board.panel_cutouts) and its outward normal is within 45 deg of the mouth;
+    else None."""
+    hit = ol.ray_to_edge(outline, face, mouth)
+    if hit is None or not (hit.ring == 0 or panel_cutouts):
+        return None
+    norm = math.hypot(float(mouth[0]), float(mouth[1]))
+    cos = (mouth[0] * hit.normal[0] + mouth[1] * hit.normal[1]) / norm
+    return hit if cos >= oa.FACING_MIN_COS - 1e-9 else None
+
+
+def _away_from_centre(outline: ol.Outline, box: Sequence[float], mouth: Sequence[float]) -> bool:
+    """The old rule's facing test: seen from the courtyard centre, the mouth points
+    away from the centre of the outline's bounding box."""
+    x0, y0, x1, y1 = ol.bbox(outline)
+    dx = (float(box[0]) + float(box[2])) / 2.0 - (x0 + x1) / 2.0
+    dy = (float(box[1]) + float(box[3])) / 2.0 - (y0 + y1) / 2.0
+    return mouth[0] * dx + mouth[1] * dy > 0
+
+
+def _xy(p: Sequence[float]) -> str:
+    return "({:.3f}, {:.3f})".format(*(round(float(v), 3) + 0.0 for v in p))   # no '-0.000'
+
+
+def _faced_detail(outline: ol.Outline, ref: str, face: Point, mouth: Sequence[float],
+                  hit: Any) -> str:
+    """The far-from-its-edge text plus the edge the mouth faces and the nearest one."""
+    near = ol.nearest_edge(outline, face)
+    ring = "the board outline" if hit.ring == 0 else f"cutout {hit.ring}"
+    return (f"{ref}: mating face is {hit.distance:.1f} mm from the board edge it faces (must "
+            f"be at the edge, <={oa.CONNECTOR_MAX_DIST_MM:g} mm); the edge it faces: {ring} at "
+            f"{_xy(hit.point)}, outward normal {_xy(hit.normal)}, along the mouth {_xy(mouth)} "
+            f"from {_xy(face)}; nearest edge: {_xy(near.point)}, {near.distance:.1f} mm away "
+            f"({oa.FRAME})")
+
+
+def edge_mount_severity(comp: Mapping | None) -> str:
+    """How an edge-mount part off the edge is judged. 'error' when the netlist
+    chose its position or asked for an edge ("edge", "overhang", "at", "x" / "y"
+    set) or does not list it; 'warning' when the netlist leaves it to the auto
+    placer, which packs it as an ordinary part unless an "edge" key asks for an
+    edge (build_layout): the warning names that key (F3-13b review, round 1)."""
+    if comp is None or any(comp.get(k) is not None for k in PLACEMENT_KEYS):
+        return "error"
+    return "warning"
 
 
 def edge_mount_verdict(ref: str, info: em.EdgeMount, pl: Placement, outline: ol.Outline,
-                       origin: Point) -> Finding | None:
+                       origin: Point, severity: str = "error") -> Finding | None:
     """edge_mount_off_edge when an edge-mount part's marker (EdgeMount.anchor_mm,
-    footprint frame) lies more than 0.25 mm from the outline."""
+    footprint frame) lies more than 0.25 mm from the outline: the straddle text,
+    plus (as a warning, edge_mount_severity) the netlist key that seats it."""
+    if severity not in SEVERITIES:
+        raise ValueError(f"edge_mount_verdict severity must be one of {SEVERITIES}, "
+                         f"got {severity!r}")
     if not info.edge_mount or info.anchor_mm is None:
         return None
     sx, sy = to_world(info.anchor_mm, pl)
@@ -250,10 +324,15 @@ def edge_mount_verdict(ref: str, info: em.EdgeMount, pl: Placement, outline: ol.
     text = em.straddle_issue(ref, ol.distance_to_edge(outline, at))
     if text is None:
         return None
+    seat = (f"seat the marker on the board edge with the body overhanging it by "
+            f"{info.overhang_mm:g} mm")
+    if severity == "warning":
+        return Finding(EDGE_MOUNT_OFF_EDGE, "warning", (
+            f"{text}; it is auto-placed (no \"edge\", \"at\" or x/y in the netlist): give it "
+            f"\"edge\": \"top\" | \"bottom\" | \"left\" | \"right\" so the builder can {seat}"))
     return Finding(EDGE_MOUNT_OFF_EDGE, "error", text,
                    f"{text}: its {info.source} edge marker is at ({at[0]:.3f}, {at[1]:.3f}) "
-                   f"(board frame, mm); seat the marker on the board edge so the body "
-                   f"overhangs by {info.overhang_mm:g} mm")
+                   f"(board frame, mm); {seat}")
 
 
 def part_overhang(comp: Mapping | None, info: em.EdgeMount | None) -> float | None:
@@ -463,7 +542,8 @@ def _survey(board: Any, design: Mapping, shape: BoardShape) -> _Survey:
             continue
         ref, pl = fp.GetReference(), placement_of(fp)
         info, notes = _edge_mount(fp, pl)
-        hit = edge_mount_verdict(ref, info, pl, shape.outline, shape.origin)
+        hit = edge_mount_verdict(ref, info, pl, shape.outline, shape.origin,
+                                 edge_mount_severity(comps.get(ref)))
         found += notes + ([] if hit is None else [hit])
         overhang = part_overhang(comps.get(ref), info)
         parts += [{"ref": ref, "polygon": _in_board(chain, shape.origin), "overhang": overhang}
@@ -522,14 +602,30 @@ def routed_findings(board: Any, shape: BoardShape) -> list[Finding]:
             + from_audit(oa.pad_issues(shape.outline, pads, 0.0), routed=True))
 
 
-def _islands(zone: Any, layer: int) -> int:
-    """Filled islands of `layer` of at least MIN_ISLAND_MM2 (0 for an unfilled layer)."""
-    try:
-        polys = pcbnew.SHAPE_POLY_SET(zone.GetFilledPolysList(layer))
-    except Exception:            # no fill on this layer: no islands to count
-        return 0
+def _islands(filled: Any) -> int:
+    """Islands of at least MIN_ISLAND_MM2 in a zone layer's fill (an unfilled
+    layer's fill is an empty SHAPE_POLY_SET: 0)."""
+    polys = pcbnew.SHAPE_POLY_SET(filled)
     return sum(1 for i in range(polys.OutlineCount())
                if abs(polys.Outline(i).Area()) / 1e12 >= MIN_ISLAND_MM2)
+
+
+def _zone_islands(board: Any, zone: Any, layer: int) -> Finding | None:
+    """The plane_islands warning of one zone layer; plane_islands_unread naming
+    the error when pcbnew cannot hand its fill back (never a silent 0)."""
+    net, name = zone.GetNetname() or "(no net)", board.GetLayerName(layer)
+    try:
+        filled = zone.GetFilledPolysList(layer)
+    except Exception as e:  # noqa: BLE001 - SWIG maps C++ throws to several types: reported
+        return Finding(PLANE_ISLANDS_UNREAD, "warning", f"{net}: the fill on {name} could not "
+                       f"be read ({type(e).__name__}: {e}); its islands were not counted")
+    n = _islands(filled)
+    if n <= 1:
+        return None
+    return Finding(PLANE_ISLANDS, "warning", (
+        f"{net}: plane on {name} fills as {n} separate islands on this board's outline "
+        f"(cutouts or a non-convex edge split it); join them with a corridor preroute or "
+        f"stitching, or check every island reaches its pads"))
 
 
 def plane_island_findings(board: Any, shape: BoardShape) -> list[Finding]:
@@ -538,16 +634,6 @@ def plane_island_findings(board: Any, shape: BoardShape) -> list[Finding]:
     check_plane_integrity blocks a split that strands pads."""
     if shape.outline is None or not is_shaped(shape.outline):
         return []
-    out = []
-    for zone in board.Zones():
-        if zone.GetIsRuleArea():
-            continue
-        for layer in zone.GetLayerSet().CuStack():
-            n = _islands(zone, layer)
-            if n > 1:
-                out.append(Finding(PLANE_ISLANDS, "warning", (
-                    f"{zone.GetNetname() or '(no net)'}: plane on {board.GetLayerName(layer)} "
-                    f"fills as {n} separate islands on this board's outline (cutouts or a "
-                    f"non-convex edge split it); join them with a corridor preroute or "
-                    f"stitching, or check every island reaches its pads")))
-    return out
+    found = (_zone_islands(board, zone, layer) for zone in board.Zones()
+             if not zone.GetIsRuleArea() for layer in zone.GetLayerSet().CuStack())
+    return [f for f in found if f is not None]

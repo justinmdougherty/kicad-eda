@@ -111,12 +111,12 @@ def test_build_classes_impedance_net_is_forced_and_warns_below_floor():
     built = nw.build_classes(design, cls=3)
     names = {c["name"]: c for c in built["classes"]}
     assert set(names) == {"NC_RF", "NC_USB"}
-    rf_w = impedance.microstrip_width(90, 0.20, 4.20)
+    rf_w = impedance.microstrip_width(90, 0.146, 4.20)
     assert names["NC_RF"]["track_width"] == round(rf_w, 3) < 0.2
     assert built["summary"]["RF"]["impedance"]["mode"] == "single"
     assert any(w.startswith("RF: 90.0-ohm width") and "below the Class floor 0.2mm" in w
                for w in built["warnings"])
-    dp = impedance.diff_pair(90, 0.20, 4.20)
+    dp = impedance.diff_pair(90, 0.1616, 4.20)
     usb = names["NC_USB"]
     assert usb["diff_pair_width"] == round(dp["width"], 3)
     assert usb["diff_pair_gap"] == round(dp["gap"], 3)
@@ -126,7 +126,7 @@ def test_build_classes_impedance_net_is_forced_and_warns_below_floor():
 def test_build_classes_impedance_overrides_current_width():
     design = {"nets": {"RF": []}, "net_specs": {"RF": {"impedance": 50, "current": 3.0}}}
     c = nw.build_classes(design, cls=3)["classes"][0]
-    assert c["track_width"] == round(impedance.microstrip_width(50, 0.20, 4.20), 3)
+    assert c["track_width"] == round(impedance.microstrip_width(50, 0.173, 4.20), 3)
 
 
 def test_build_classes_copper_and_temp_rise_flow_through(buck_design):

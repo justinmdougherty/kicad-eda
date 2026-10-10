@@ -6,6 +6,8 @@ Pure unit tier, no KiCad. The golden-ish fixture is the pipeline report the
 gated harness printed for examples/buck_5v3a in the kicad-eda Docker image
 (KiCad 10.0, 2026-10-04 rerun), embedded verbatim below.
 """
+# BUCK_REPORT_JSON is embedded verbatim, so its long lines cannot be wrapped:
+# ruff: noqa: E501
 from __future__ import annotations
 
 import ast
@@ -423,6 +425,36 @@ def test_verdict_without_a_pass_key_or_with_pass_false(buck_report, buck_design)
     no_gates = {"netlist": "/w/netlist.json", "gates": []}
     assert "- **Verdict: FAIL**: no gate ran." in \
         _section(rr.render_review(no_gates, [], buck_design), "Summary")
+
+
+def _handoff_report(buck_report: dict, **extra) -> dict:
+    """buck_5v3a as an auto-mode run that handed routing to the agent after G4 failed."""
+    rep = copy.deepcopy(buck_report)
+    g4 = gates.g4_layout({"unconnected": 3}, {"errors": 0, "unconnected": 3}, [])
+    rep["gates"] = rep["gates"][:3] + [g4]
+    for key in ("fab", "renders_final", "sourcing"):
+        del rep[key]
+    return {**rep, "PASS": False, "status": "handoff",
+            "handoff": "/w/netlist_route_handoff.json", **extra}
+
+
+def test_handoff_verdict_names_the_resume_command(buck_report, buck_design):
+    cmd = "/usr/bin/python3 /p/run_pipeline.py /w/netlist.json --resume routed"
+    rep = _handoff_report(buck_report, handoff_resume={"routed": cmd, "stalled": "x"})
+    summary = _section(rr.render_review(rep, [], buck_design), "Summary")
+    assert (f"- **Verdict: HANDOFF**: routing handed to the agent; resume with `{cmd}`"
+            in summary)
+    assert "Verdict: FAIL" not in summary
+
+
+def test_handoff_verdict_without_commands_points_at_the_handoff_report(buck_report,
+                                                                       buck_design):
+    md = rr.render_review(_handoff_report(buck_report), [], buck_design)
+    assert ("- **Verdict: HANDOFF**: routing handed to the agent; resume with the command in "
+            "`/w/netlist_route_handoff.json`") in _section(md, "Summary")
+    crashed = {**_handoff_report(buck_report), "error": "RuntimeError: boom"}
+    assert "- **Verdict: FAIL**: the run crashed: RuntimeError: boom" in \
+        rr.render_review(crashed, [], buck_design)
 
 
 def test_fab_export_failure_and_sourcing_problems(buck_report, buck_design):

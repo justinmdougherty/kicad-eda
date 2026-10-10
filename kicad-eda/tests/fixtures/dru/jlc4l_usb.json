@@ -1,0 +1,15 @@
+{
+  "description": "DRU snapshot input (D7-12a): JLC04161H-3313 4L (SIG / GND / +3V3 / SIG) with a 90 ohm USB pair restricted to F.Cu. Only USB_DP carries the line record; USB_DM gets the same rules as its diff_pair partner. lines = the D7-07 facade's records for USB_DP, trimmed to the keys dru_writer reads.",
+  "design": {
+    "name": "jlc4l_usb",
+    "components": [],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]]},
+    "stackup": {"preset": "jlcpcb:JLC04161H-3313", "impedance_control": {"required": true},
+                "rationale": "4L: USB pair on F.Cu"},
+    "net_specs": {"USB_DP": {"diff": 90, "diff_pair": "USB_DM", "gap": 0.15, "layers": ["F.Cu"]}}
+  },
+  "lines": {
+    "USB_DP": {"kind": "diff", "status": "fallback_unverified", "primary_layer": "F.Cu",
+               "layers": {"F.Cu": {"width": 0.135, "width_window": [0.13, 0.14]}}}
+  }
+}

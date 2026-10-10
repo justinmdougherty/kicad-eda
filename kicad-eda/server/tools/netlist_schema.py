@@ -7,8 +7,10 @@ netclass_writer, ipc_rules, impedance, thermal_check, design_report, gates,
 run_pipeline) and the roadmap keys of docs/ROADMAP_DECISIONS.md D1-D5:
 ``libraries``, ``board.corner_radius|outline|cutouts|datum|panel_cutouts``,
 component ``at``, ``board_only``, ``dnp``, ``in_bom`` and ``edge``,
-``copper_layers``, ``source`` (with the import provenance files), ``rebuild``,
-``variant``, ``blocks``, ``mode`` and ``assumptions``. docs/PIPELINE.md section 2
+``source`` (with the import provenance files), ``rebuild``, ``variant``,
+``blocks``, ``mode`` and ``assumptions``. The D7 keys (``copper_layers`` 1 | even
+2..32, ``stackup``, the net_specs RF keys, ``rf``, ``layer_policy``, component
+``clock_hz``) are merged in from netlist_schema_d7. docs/PIPELINE.md section 2
 is the human-readable side.
 
 Policy:
@@ -43,6 +45,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import netlist_schema_d7 as d7
+
 # --- shared enums (the decisions' vocabularies; import these, never re-type) --
 SOURCE_KINDS = ("kicad", "eagle", "altium", "easyeda", "vision", "gerber")  # D4 (+F4/F6)
 REBUILD_MODES = ("keep", "reflow")                                  # D4
@@ -51,7 +55,7 @@ VARIANT_HOLES = ("source", "corners", "none")   # variant.holes (rebuild_variant
 BOARD_EDGES = ("top", "bottom", "left", "right")    # component edge (F3-12), antenna_keepout
 MODES = ("napkin",)                                                 # D5
 CONFIDENCE_LEVELS = ("high", "med", "low")                          # D5
-COPPER_LAYER_COUNTS = (2, 4, 6)                                     # D4
+COPPER_LAYER_COUNTS = d7.COPPER_LAYER_COUNTS    # D7.2.1: (1,) + tuple(range(2, 33, 2))
 DXF_UNITS = ("mm", "cm", "in", "mil")                               # D2
 IPC_CLASSES = (1, 2, 3)
 
@@ -111,7 +115,9 @@ _SOURCE_BODY: dict[str, Any] = {
 }
 
 
-_DEFS: dict[str, Any] = {
+# The classic definitions; d7.merge_defs adds the D7 ones (stackup, rf, ...) and
+# the net_spec RF keys / component clock_hz.
+_DEFS: dict[str, Any] = d7.merge_defs({
     # --- geometry primitives (mm, board frame: origin = outline bbox
     # top-left, Y down) ---
     "point": {"type": "array", "prefixItems": [_NUM, _NUM],
@@ -334,7 +340,7 @@ _DEFS: dict[str, Any] = {
             "override": {"type": ["string", "null"]},
         },
     },
-}
+})
 
 # Read-only: subschemas are shared objects and validate() compiles it once.
 SCHEMA: dict[str, Any] = {
@@ -344,12 +350,12 @@ SCHEMA: dict[str, Any] = {
                    "pipeline (docs/PIPELINE.md section 2).",
     "type": "object",
     "required": ["components"],
-    "properties": {
+    # d7.merge_top_level adds copper_layers, stackup, rf and layer_policy
+    "properties": d7.merge_top_level({
         "name": _STR,
         "title": _STR,
         "class": {"type": "integer", "enum": list(IPC_CLASSES)},
         "mode": {"enum": list(MODES)},
-        "copper_layers": {"type": "integer", "enum": list(COPPER_LAYER_COUNTS)},
         "libraries": _ref("libraries"),
         "board": _ref("board"),
         "mounting_holes": _ref("mounting_holes"),
@@ -373,14 +379,13 @@ SCHEMA: dict[str, Any] = {
                                    "ep_vias_min": {"type": "number", "multipleOf": 1,
                                                    X_MESSAGE: "ep_vias_min is a whole "
                                                               "number of vias, e.g. 4 or 4.0"}}},
-        "stackup": {"type": ["object", "null"], "properties": _numbers("h", "er", "t")},
         "require_sourcing": {"type": ["boolean", "null"]},
         "source": _ref("source"),
         "rebuild": {"enum": list(REBUILD_MODES)},
         "variant": _ref("variant"),
         "blocks": {"type": "array", "items": _ref("block")},
         "assumptions": {"type": "array", "items": _ref("assumption")},
-    },
+    }),
     "$defs": _DEFS,
 }
 

@@ -1,0 +1,25 @@
+{
+  "description": "DRU snapshot input (D7-12a): JLC06161H-2116 6L (SIG / GND / SIG / SIG / +3V3 / SIG). ETH_TX_P/N 100 ohm pair on every eligible layer (no disallow), CLK_50R on In2/In3 only, RF_ANT on F.Cu only (RF default). lines = the D7-07 facade's records, trimmed to the keys dru_writer reads.",
+  "design": {
+    "name": "six_layer",
+    "components": [],
+    "nets": {"GND": [["J1", "1"]], "+3V3": [["J1", "2"]]},
+    "stackup": {"preset": "jlcpcb:JLC06161H-2116", "impedance_control": {"required": true},
+                "rationale": "6L: two inner routing layers"},
+    "net_specs": {"ETH_TX_P": {"diff": 100, "diff_pair": "ETH_TX_N", "gap": 0.15},
+                  "CLK_50R": {"impedance": 50, "layers": ["In2.Cu", "In3.Cu"]},
+                  "RF_ANT": {"impedance": 50, "freq_hz": 9.15e8}}
+  },
+  "lines": {
+    "ETH_TX_P": {"kind": "diff", "status": "fallback_unverified", "primary_layer": "F.Cu",
+                 "layers": {"F.Cu": {"width": 0.185, "width_window": [0.18, 0.19]},
+                            "In2.Cu": {"width": 0.145, "width_window": [0.14, 0.15]},
+                            "In3.Cu": {"width": 0.145, "width_window": [0.14, 0.15]},
+                            "B.Cu": {"width": 0.185, "width_window": [0.18, 0.19]}}},
+    "CLK_50R": {"kind": "single", "status": "fallback_unverified", "primary_layer": "In2.Cu",
+                "layers": {"In2.Cu": {"width": 0.355, "width_window": [0.349675, 0.360325]},
+                           "In3.Cu": {"width": 0.355, "width_window": [0.349675, 0.360325]}}},
+    "RF_ANT": {"kind": "single", "status": "closed_form", "primary_layer": "F.Cu",
+               "layers": {"F.Cu": {"width": 0.29, "width_window": [0.285, 0.295]}}}
+  }
+}

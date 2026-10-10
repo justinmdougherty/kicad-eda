@@ -43,7 +43,7 @@ and hangs headless; 1.9.0 is the pinned router**).
 
 ## 2. Author the netlist (`netlist.json`)
 
-The single source of truth. Pad-level, hand-authored or generated. Both
+The single source of truth. Pad-level, hand-authored or generated. The
 examples in this section are literal designs: `tests/test_netlist_schema.py`
 strips the `//` comments and validates them against the schema.
 
@@ -54,7 +54,8 @@ strips the `//` comments and validates them against the schema.
   "class": 2,                          // IPC producibility class (1/2/3)
   "mode": "napkin",                    // hands-off run: decide + record, never
                                        //   stop to ask (see "assumptions")
-  "copper_layers": 4,                  // 2 | 4 | 6 (default 4)
+  "copper_layers": 4,                  // 1 | even 2..32 (default 4); 1 = single-
+                                       //   sided; must match the stackup (ST-E7)
 
   // PROJECT LIBRARIES — nickname -> path relative to this file (${KIPRJMOD}
   // = its directory; absolute allowed). Looked up before the project
@@ -151,7 +152,9 @@ strips the `//` comments and validates them against the schema.
   "no_connect": [["U1","3"]],
   "power_flags": ["VBUS"],             // extra PWR_FLAG nets (ERC)
   "planes": {"In1.Cu":"GND", "In2.Cu":"+3V3"},  // default: In1 GND, In2 1st rail
-  "stackup": {"h":0.20, "er":4.2},     // outer dielectric for impedance math
+  "stackup": {"h":0.20, "er":4.2},     // legacy shorthand (ST-W7): one unmasked
+                                       //   outer ply; the stackup model (preset or
+                                       //   layers): see the stackup / RF example
   "require_sourcing": true,            // G5: missing lcsc/mpn = blocker
   "thermal": {"t_ambient":50, "tj_margin":0.8, "ep_vias_min":4},  // board-level;
                                        //   ep_vias_min: whole number (4.0 passes)
@@ -287,11 +290,147 @@ them by hand:
 }
 ```
 
+A **stackup / controlled-impedance / RF design** (ADR D7) declares its layer
+count with a rationale, an arbitrary stackup and the RF intent of its nets.
+The `rf` block, the RF `net_specs` keys and `clock_hz` are accepted and typed
+now; the RF rule families that act on them arrive in wave 2b:
+
+```jsonc
+{
+  "name": "lora_gnss_node",
+  "mode": "napkin",
+  "copper_layers": 4,                  // 1 | even 2..32; must match the stackup
+  "layer_policy": {"max_layers": 6, "fab": "pcbway"},  // napkin hints (layer
+                                       //   scoring is wave 3); optional
+
+  // STACKUP — exactly one of two shapes:
+  //  * legacy shorthand {"h": 0.20, "er": 4.2, "t": 0.035} (no other key): one
+  //    unmasked outer microstrip over the 4-layer default (ST-W7);
+  //  * the model (unknown keys rejected) with at most one of
+  //    "preset": "jlcpcb:JLC04161H-3313" (+ "roles": {"In2.Cu": {"role":
+  //    "mixed", "net": "+3V3"}} overriding the preset's roles) or "layers"
+  //    (below); neither = the default geometry for copper_layers.
+  "stackup": {
+    "fab": "pcbway",                   // capability lint + Dk / mask basis; null = none
+    "board_thickness": 1.4,            // ordered nominal (mm) vs the computed sum (ST-W1)
+    "finish": "ENIG",                  // HASL | LF-HASL | ENIG | OSP | ImAg | ImSn | null
+    "mask": {"material": "lpi", "dk": 3.8, "df": 0.025, "color": "Green",
+             "over_substrate": 0.0305, "over_trace": 0.0152, "between_traces": 0.0305},
+                                       // omitted = the fab's mask, else generic LPI;
+                                       //   null = no mask (ST-W9)
+    "dk_policy": "design",             // auto | fab | design | process | typical
+    "design_freq_hz": 1.575e9,         // default: the highest net_specs freq_hz, else 1e9
+    "impedance_control": {"required": true, "tolerance_pct": 10},
+    "via_spans": [["F.Cu", "B.Cu"]],   // through vias only (ST-E8)
+    "rationale": "4L: Rogers under the RF feeds, solid GND under both feeds",
+    "origin": "designer",              // layer_policy = written by the napkin default
+    "layers": [                        // top -> bottom, copper first and last
+      // copper: "name" is positional (F.Cu, In1.Cu.., B.Cu); "oz" defaults to 1
+      // outer / 0.5 inner, "thickness" to oz x 0.035 mm; "role" signal | plane
+      // | mixed | unused (B.Cu of copper_layers 1); "net" on plane / mixed:
+      {"type": "copper", "name": "F.Cu", "oz": 1, "role": "signal"},
+      // dielectric: "kind" core | prepreg; one ply ("thickness", "material",
+      // "construction", "dk", "df", "dk_freq_hz", "label", "locked",
+      // "dielectric_model") or "plies"; an explicit dk wins over the library:
+      {"type": "dielectric", "kind": "core", "material": "rogers.ro4350b",
+       "thickness": 0.254, "locked": true},
+      {"type": "copper", "oz": 1, "role": "plane", "net": "GND"},
+      {"type": "dielectric", "kind": "prepreg", "plies": [
+         {"material": "rogers.ro4450f", "thickness": 0.101},
+         {"material": "isola.370hr", "construction": "2116", "thickness": 0.12}]},
+      {"type": "copper", "oz": 0.5, "thickness": 0.0175, "role": "plane", "net": "+3V3"},
+      {"type": "dielectric", "kind": "core", "material": "FR-4 core", "label": "FR-4 0.71",
+       "dk": 4.6, "df": 0.02, "dk_freq_hz": 1e9, "thickness": 0.71},
+      {"type": "copper", "oz": 1, "role": "signal"}]
+  },
+
+  "components": [
+    {"ref":"U1","lib_id":"MCU_Microchip_SAMD:ATSAMD21G18A-A","value":"ATSAMD21G18A",
+     "footprint":"Package_QFP:TQFP-48_7x7mm_P0.5mm",
+     "clock_hz":[4.8e7, 32768]},       // clocks (Hz) for the GNSS harmonic check
+    {"ref":"U2","lib_id":"RF_Module:RFM95W-915S2","value":"RFM95W",
+     "footprint":"RF_Module:HOPERF_RFM9XW_SMD"},
+    {"ref":"U3","lib_id":"SPS_parts:LG290P","value":"LG290P",
+     "footprint":"SPS_parts:Quectel_LG290P_LGA-79"},
+    {"ref":"J2","lib_id":"Connector:Conn_Coaxial","value":"U.FL",
+     "footprint":"Connector_Coaxial:U.FL_Hirose_U.FL-R-SMT-1_Vertical"},
+    {"ref":"AE1","lib_id":"Device:Antenna","value":"IFA 915 MHz",
+     "footprint":"SPS_parts:IFA_915MHz"},
+    {"ref":"C10","lib_id":"Device:C","value":"NM","footprint":"Capacitor_SMD:C_0402_1005Metric"},
+    {"ref":"R2","lib_id":"Device:R","value":"0R","footprint":"Resistor_SMD:R_0402_1005Metric"},
+    {"ref":"C11","lib_id":"Device:C","value":"NM","footprint":"Capacitor_SMD:C_0402_1005Metric"}
+  ],
+  "nets": {"GND":      [["U1","18"],["U2","1"],["U3","10"],["J2","2"],["C10","2"],["C11","2"]],
+           "+3V3":     [["U1","17"],["U2","13"],["U3","1"]],
+           "LORA_RF1": [["U2","9"],["C10","1"],["R2","1"]],
+           "LORA_ANT": [["R2","2"],["C11","1"],["AE1","1"]],
+           "GNSS_RF":  [["J2","1"],["U3","25"]]},
+
+  // RF intent per net: "freq_hz" turns the RF rules on; every key is optional.
+  // Diff pairs add "pair": "edge" (default) | "broadside" ("layers": [La, Lb]).
+  "net_specs": {
+    "LORA_ANT": {"impedance": 50, "freq_hz": 9.15e8, "role": "tx",   // tx | rx | trx
+                 "line": "cpwg",       // auto | microstrip | cpwg | stripline |
+                                       //   dual_stripline | embedded_microstrip | cpw
+                 "layers": ["F.Cu"],   // allowed layers (RF default: the primary outer)
+                 "ref_layers": {"F.Cu": ["In1.Cu"]}, "void_layers": {"F.Cu": []},
+                 "ref_nets": ["GND"],  // RF references must carry these (ST-E10)
+                 "width": null, "ground_gap": null,   // explicit = checked, not solved
+                 "z_tol_pct": 5, "max_vias": 0, "max_len_mm": 25, "stub_max_mm": null,
+                 "fence": {"pitch_mm": null, "offset_mm": null, "via": [0.6, 0.3],
+                           "rows": 1, "freq_hz": null},          // or false
+                 "isolation_mm": 1.0, "rf_group": "LORA", "ref_plane_margin_h": 5,
+                 "ref_plane_exempt": [{"rect": [2.0, 10.0, 3.0, 2.5], "layers": ["In1.Cu"],
+                                       "why": "SMA pin relief"}],
+                 "allow_branches": [["C11", "1"]],
+                 "route": "preroute"}, // auto | preroute | agent (never Freerouting)
+    "LORA_RF1": {"impedance": 50, "freq_hz": 9.15e8, "rf_group": "LORA"},
+    "GNSS_RF":  {"impedance": 50, "freq_hz": 1.57542e9, "role": "rx", "rf_group": "GNSS"}
+  },
+
+  // RF BLOCK — chains, group isolation, antennas, coexistence (entries reject
+  // unknown keys):
+  "rf": {
+    "chains": [{"name": "LORA_TX", "group": "LORA", "from": ["U2", "9"], "to": ["AE1", "1"],
+                "nets": ["LORA_RF1", "LORA_ANT"], "series": ["R2"], "shunts": ["C10", "C11"],
+                "match_max_dist_mm": 2.0, "max_len_mm": 25, "tx_power_dbm": 20}],
+    "isolation": [{"groups": ["LORA", "GNSS"], "min_mm": 15, "edges_differ": true}],
+    "antennas": [{"ref": "AE1",
+                  "kind": "pcb_trace",           // pcb_trace | chip | module | connector
+                  "preset": null,
+                  "generator": {"family": "ifa", // ifa | mifa | meander | chip_land
+                                "band_hz": [9.02e8, 9.28e8], "params": {}},
+                  "feed_net": "LORA_ANT", "ground_net": "GND",
+                  "keepout": {"layers": "all", "from_footprint": true,  // or [layers]
+                              "rect": null, "polygon": null},
+                  "ground_under": false, "edge": "top", "clearance_mm": 5,
+                  "license_ack": false,
+                  "match": {"topology": "pi", "refs": ["C10", "R2", "C11"], "max_dist_mm": 2.0,
+                            "fit": {"C10": "NM", "R2": "0R", "C11": "NM"}},
+                  "sim": "none",
+                  "human_steps": ["VNA-tune the pi network on the assembled board"]}],
+    "coexistence": {
+      "check": true,
+      "tx": [{"group": "LORA", "band_hz": [9.02e8, 9.28e8], "power_dbm": 20}],
+      "rx": [{"group": "GNSS", "bands_hz": [[1.559e9, 1.606e9], [1.164e9, 1.189e9]],
+              "abs_max_dbm": 10, "oob_rejection_db": 30, "lna_gain_db": 43}],
+      "isolation_db": [{"from": "LORA", "to": "GNSS", "db": 20}],
+      "margin_db": 6}}
+}
+```
+
 **Schema.** `server/tools/netlist_schema.py` is the machine-checked form of
 these blocks (JSON Schema 2020-12). Every key above is typed. Unknown keys
 pass at the top level, on components and on the provenance records
 (`source`, `variant`, a `blocks` entry). `libraries`, `board.outline` and a
-cutout reject them, so a typo cannot silently fall back to a rectangle.
+cutout reject them, so a typo cannot silently fall back to a rectangle. The D7
+keys come from `server/tools/netlist_schema_d7.py`: the stackup model, its
+layer entries, `mask`, `impedance_control`, `layer_policy`, `rf` and every
+entry of `rf` (and a `fence` object) reject unknown keys too; the legacy
+shorthand takes only `h`/`er`/`t`. The stackup semantics (alternation,
+positional names, roles vs `planes`, references, fab capability, layer-count
+floors) are G1 lint's, `server/tools/lint_rules_stackup.py`: `ST-E*` errors and
+`ST-W*` warnings, each with its JSON path.
 Required: `components` (each with `ref`, `footprint`, and `lib_id` unless
 `board_only`); `source` needs `kind` + `path`; `variant` needs `mode`; a
 `blocks` entry needs `name` + a non-empty `ref_map`; an assumption needs `id`,

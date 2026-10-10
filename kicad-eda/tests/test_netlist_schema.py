@@ -230,7 +230,7 @@ def test_enum_constants_match_the_decisions():
     assert ns.REBUILD_MODES == ("keep", "reflow")
     assert ns.MODES == ("napkin",)
     assert ns.CONFIDENCE_LEVELS == ("high", "med", "low")
-    assert ns.COPPER_LAYER_COUNTS == (2, 4, 6)
+    assert ns.COPPER_LAYER_COUNTS == (1,) + tuple(range(2, 33, 2))    # D7.2.1 (was D4's 2|4|6)
     assert ns.COPPER_MODES == ("carry", "reroute")
     assert ns.VARIANT_HOLES == ("source", "corners", "none")
     assert ns.BOARD_EDGES == ("top", "bottom", "left", "right")
@@ -350,7 +350,8 @@ POSITIVE = [
     _set("board.outline", {"dxf": "C:/mech/outline.dxf"}),
     _set("board.cutouts", [{"loop": [[10, 10, 1], [20, 10, 1]]}]),   # 2-vertex circle loop
     _set("board.outline.loop.2", [60, 40, -2.5]), _set("board.cutouts", []),
-    _set("copper_layers", 2), _set("copper_layers", 6), _reflow,
+    _set("copper_layers", 2), _set("copper_layers", 6), _set("copper_layers", 1),
+    _set("copper_layers", 8), _set("copper_layers", 32), _reflow,
     _set("source", {"kind": "vision", "path": "scans/sheet1.pdf"}),
     _set("components.2.lib_id", "Mechanical:MountingHole"),   # board_only with a lib_id
     _set("components.3.board_only", False),
@@ -467,8 +468,8 @@ NEGATIVE = [
     (_with(at=[30.0, "20", 90]), "$.components[0].at[1]", "expected number"),
     (_with(at="30,20,90"), "$.components[0].at", "[x, y, rot]"),
     # D4 imports
-    (_set("copper_layers", 3), "$.copper_layers", "must be one of"),
-    (_set("copper_layers", 8), "$.copper_layers", "must be one of"),
+    (_set("copper_layers", 3), "$.copper_layers", "1 (single-sided) or an even number 2..32"),
+    (_set("copper_layers", 34), "$.copper_layers", "1 (single-sided) or an even number 2..32"),
     (_set("copper_layers", "4"), "$.copper_layers", "expected integer"),
     (_set("copper_layers", 4.0), "$.copper_layers", "expected integer"),
     (_set("components.2.board_only", "yes"), "$.components[2].board_only",
@@ -757,7 +758,7 @@ def test_import_is_stdlib_only_and_validate_fails_loudly_without_jsonschema():
         "import sys; sys.modules['jsonschema'] = None\n"
         f"sys.path.insert(0, {str(ROOT / 'server' / 'tools')!r})\n"
         "import netlist_schema as ns\n"
-        "assert ns.COPPER_LAYER_COUNTS == (2, 4, 6)\n"
+        "assert ns.COPPER_LAYER_COUNTS == (1,) + tuple(range(2, 33, 2))\n"
         "try:\n"
         "    ns.validate({'components': []})\n"
         "except RuntimeError as e:\n"

@@ -38,7 +38,10 @@ HELPER_MODULES = {"kicad_server", "toolchain", "lint_netlist", "design_report", 
 
 
 def _run(world: World, placement: str = "") -> dict:
-    return rp.run(str(world.netlist), 30, 30, placement)
+    """A strict Freerouting-only run (World.run pins napkin=False and
+    route='freerouting'): these tests prove today's behaviour, a G4 failure
+    included (the route modes have tests/test_run_pipeline_route_modes.py)."""
+    return world.run(placement=placement)
 
 
 def _persisted(world: World) -> dict:
@@ -90,8 +93,8 @@ def _functions(path: Path) -> list[tuple[str, int]]:
 
 def test_no_function_in_the_harness_is_longer_than_80_lines():
     assert {"run_pipeline", "rp_paths", "rp_cli", "rp_context", "rp_kicad", "rp_route_hash",
-            "rp_route", "rp_stage_schematic", "rp_stage_place", "rp_stage_layout",
-            "rp_stage_fab"} <= {p.stem for p in HARNESS_FILES}
+            "rp_route", "rp_route_modes", "rp_stage_schematic", "rp_stage_place",
+            "rp_stage_layout", "rp_stage_fab", "rp_napkin"} <= {p.stem for p in HARNESS_FILES}
     long = {f"{path.stem}.{name}": n for path in HARNESS_FILES
             for name, n in _functions(path) if n > 80}
     assert long == {}
@@ -120,9 +123,9 @@ def _helper_from_imports(path: Path) -> list[str]:
 def test_stage_modules_call_helpers_through_module_objects():
     """The run_pipeline docstring rule: rp_kicad.drc(...), never 'from rp_kicad
     import drc' -- so one monkeypatch on the module object reaches every caller."""
-    stage_files = [p for p in HARNESS_FILES
-                   if p.stem.startswith("rp_stage_") or p.stem in ("rp_route", "run_pipeline")]
-    assert len(stage_files) >= 6
+    stage_files = [p for p in HARNESS_FILES if p.stem.startswith("rp_stage_")
+                   or p.stem in ("rp_route", "rp_route_modes", "rp_napkin", "run_pipeline")]
+    assert len(stage_files) >= 8
     assert {p.name: _helper_from_imports(p) for p in stage_files
             if _helper_from_imports(p)} == {}
 
@@ -487,6 +490,73 @@ def test_failed_g4_writes_no_cache_manifest(world):
     world.drcs = [CLEAN_DRC, {**CLEAN_DRC, "errors": 1, "types": {"clearance": 1}}]
     _run(world)
     assert not (world.dir / "netlist.cache.json").exists()
+
+
+@pytest.mark.parametrize("setup", [
+    lambda w, ctx: ctx.cache_path.write_text("[1, 2]", encoding="utf-8"),
+    lambda w, ctx: ctx.design.__setitem__("planes", {"In2.Cu": "N1"}),
+    lambda w, ctx: ctx.cache_path.write_text(json.dumps(
+        {"route_hash": rp_route_hash.route_hash(ctx.design), "routed_ok": False}),
+        encoding="utf-8"),
+    lambda w, ctx: w.pcb.unlink(),
+    lambda w, ctx: w.pcb.write_text(K11_HEADER + "(routed)\n", encoding="utf-8"),
+    lambda w, ctx: setattr(ctx, "no_cache", True),
+    lambda w, ctx: setattr(ctx, "placement", "placement.json"),
+], ids=["junk-manifest", "hash-changed", "not-routed", "no-board", "kicad-11-board",
+        "no-cache", "placement-override"])
+def test_a_route_cache_miss_removes_the_stale_manifest(world, setup):
+    """A miss re-places the board, so the manifest of an earlier run no longer
+    describes the board on disk: it is removed (a passing run writes a new
+    one), so a later run can never reuse a board this run left unrouted."""
+    ctx = _context_with_manifest(world, K9_HEADER)
+    setup(world, ctx)
+    rp_stage_place.stage_route_cache(ctx)
+    assert ctx.use_cache is False and not ctx.cache_path.exists()
+
+
+def test_a_route_cache_hit_keeps_the_manifest(world):
+    ctx = _context_with_manifest(world, K9_HEADER)
+    before = ctx.cache_path.read_bytes()
+    rp_stage_place.stage_route_cache(ctx)
+    assert ctx.use_cache is True and ctx.cache_path.read_bytes() == before
+
+
+def test_a_stale_manifest_that_cannot_be_removed_is_named_in_the_miss_reason(world,
+                                                                             monkeypatch):
+    ctx = _context_with_manifest(world, K9_HEADER)
+    ctx.no_cache = True
+    real_unlink = Path.unlink
+
+    def unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == ctx.cache_path:
+            raise PermissionError("locked by another process")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    assert rp_stage_place.stage_route_cache(ctx) is True
+    assert ctx.report["route_cache_reason"] == (
+        "PIPELINE_NO_CACHE is set; the stale cache manifest could not be removed "
+        "(PermissionError: locked by another process)")
+    assert ctx.cache_path.is_file()
+
+
+def test_a_reverted_netlist_never_reuses_the_board_a_failed_run_left(world):
+    """Run 1 passes; run 2 (the netlist changed) re-places and fails G4; run
+    3 (the netlist reverted) has run 1's route hash but must not reuse run 2's
+    board as run 1's: run 2's miss removed run 1's manifest."""
+    _run(world)
+    changed = copy.deepcopy(DESIGN)
+    changed["planes"] = {"In2.Cu": "N1"}
+    world.write_design(changed)
+    world.drcs = [CLEAN_DRC, {**CLEAN_DRC, "errors": 1, "types": {"clearance": 1}}]
+    assert _run(world)["PASS"] is False
+    assert not (world.dir / "netlist.cache.json").exists()
+    world.write_design(copy.deepcopy(DESIGN))
+    world.drcs = [CLEAN_DRC]
+    world.calls.clear()
+    rep = _run(world)
+    assert rep["route_cache"] == "miss" and len(world.args_of("build")) == 1
+    assert rep["PASS"] is True
 
 
 # --- G5 ------------------------------------------------------------------------------

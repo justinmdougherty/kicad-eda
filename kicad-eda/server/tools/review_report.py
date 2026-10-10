@@ -278,6 +278,12 @@ def _verdict(r: _Review) -> str:
     error = r.report.get("error")
     if error:
         return f"- **Verdict: FAIL**: the run crashed: {_flat(error)}"
+    if r.report.get("status") == "handoff":           # run_pipeline's route modes (F5-13a)
+        resume, handoff = r.report.get("handoff_resume"), r.report.get("handoff")
+        command = resume.get("routed") if isinstance(resume, Mapping) else None
+        how = (_code(str(command)) if command else f"the command in {_code(str(handoff))}"
+               if handoff else "--resume routed")
+        return f"- **Verdict: HANDOFF**: routing handed to the agent; resume with {how}"
     missing = _not_reached(r.gates)
     tail = f" Not reached: {', '.join(missing)}." if missing else ""
     failed = next((g for g in r.gates if not g["passed"]), None)

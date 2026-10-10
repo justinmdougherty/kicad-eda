@@ -1,7 +1,12 @@
 """The harness command line: parse <netlist.json> [<board_w> <board_h>]
-[placement.json] and decide the board dimensions (command line, else the
-netlist board block, else a feature's board_dims hook, else the builder's
-auto-size default)."""
+[placement.json] [--strict] [--route auto|freerouting|agent] and decide the
+board dimensions (command line, else the netlist board block, else a
+feature's board_dims hook, else the builder's auto-size default). --strict
+(anywhere on the line) turns the napkin policies off (ROADMAP D5: the harness
+defaults to napkin behaviour; a netlist "mode": "napkin" still means napkin).
+--route picks the routing mode (rp_route_modes; default auto: Freerouting
+first, the agent when G4 fails). Exit codes (exit_code): 0 PASS, 1 FAIL,
+2 usage, 3 routing handed off to the agent."""
 from __future__ import annotations
 
 import json
@@ -10,9 +15,15 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import rp_paths  # noqa: F401  first: puts server/ and server/tools/ on sys.path
+import rp_context
 import rp_hooks
 
-USAGE = "usage: run_pipeline.py <netlist.json> [<board_w> <board_h>] [placement.json]"
+STRICT_FLAG = "--strict"
+ROUTE_FLAG = "--route"
+MODES = ", ".join(rp_context.ROUTE_MODES)
+USAGE = ("usage: run_pipeline.py <netlist.json> [<board_w> <board_h>] [placement.json] "
+         f"[{STRICT_FLAG}] [{ROUTE_FLAG} {'|'.join(rp_context.ROUTE_MODES)}]")
+EXIT_PASS, EXIT_FAIL, EXIT_USAGE, EXIT_HANDOFF = 0, 1, 2, 3
 # swig_build_board's defaults; an auto-placed board is sized to its parts
 AUTO_BOARD_DIMS: tuple[float, float] = (50.0, 25.0)
 
@@ -27,6 +38,8 @@ class CliArgs(NamedTuple):
     w: float | None
     h: float | None
     placement: str
+    napkin: bool = True               # False: --strict (the napkin policies off)
+    route: str = rp_context.ROUTE_AUTO   # --route (rp_context.ROUTE_MODES; rp_route_modes)
 
 
 def _is_number(text: str) -> bool:
@@ -42,12 +55,51 @@ def _positive_mm(value: Any) -> bool:
             and math.isfinite(value) and value > 0)
 
 
+def _route_value(argv: list[str], i: int) -> tuple[str, int]:
+    """(the --route value at argv[i], the index after it): '--route MODE' or
+    '--route=MODE'; a missing or unknown mode is a UsageError."""
+    arg = argv[i]
+    if arg.startswith(ROUTE_FLAG + "="):
+        value, after = arg[len(ROUTE_FLAG) + 1:], i + 1
+    elif i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+        value, after = argv[i + 1], i + 2
+    else:
+        raise UsageError(f"{ROUTE_FLAG} needs one of {MODES}")
+    if value not in rp_context.ROUTE_MODES:
+        raise UsageError(f"{ROUTE_FLAG} must be one of {MODES}, got {value!r}")
+    return value, after
+
+
+def split_options(argv: list[str]) -> tuple[list[str], bool, str]:
+    """(the positional arguments, napkin, route): --strict anywhere turns
+    napkin off; --route MODE (or --route=MODE) anywhere, at most once, picks
+    the routing mode (default auto); any other '--' option is a UsageError."""
+    positional: list[str] = []
+    napkin, route, i = True, "", 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == STRICT_FLAG:
+            napkin, i = False, i + 1
+        elif arg == ROUTE_FLAG or arg.startswith(ROUTE_FLAG + "="):
+            if route:
+                raise UsageError(f"{ROUTE_FLAG} given more than once")
+            route, i = _route_value(argv, i)
+        elif arg.startswith("--"):
+            raise UsageError(f"unknown option {arg} (the options are {STRICT_FLAG} and "
+                             f"{ROUTE_FLAG} {'|'.join(rp_context.ROUTE_MODES)})")
+        else:
+            positional, i = [*positional, arg], i + 1
+    return positional, napkin, route or rp_context.ROUTE_AUTO
+
+
 def parse_cli(argv: list[str]) -> CliArgs:
-    """<netlist.json> [<board_w> <board_h>] [placement.json]: the dims come
-    as a pair or not at all; '' or '-' as the placement means none."""
-    if not argv:
+    """<netlist.json> [<board_w> <board_h>] [placement.json] [--strict]
+    [--route MODE]: the dims come as a pair or not at all; '' or '-' as the
+    placement means none."""
+    args, napkin, route = split_options(argv)
+    if not args:
         raise UsageError("missing <netlist.json>")
-    netlist, rest = argv[0], list(argv[1:])
+    netlist, rest = args[0], list(args[1:])
     w = h = None
     if rest and _is_number(rest[0]):
         if len(rest) < 2 or not _is_number(rest[1]):
@@ -60,7 +112,22 @@ def parse_cli(argv: list[str]) -> CliArgs:
     if len(rest) > 1:
         raise UsageError(f"unexpected argument(s): {' '.join(rest[1:])}")
     placement = rest[0] if rest and rest[0] not in ("", "-") else ""
-    return CliArgs(netlist, w, h, placement)
+    return CliArgs(netlist, w, h, placement, napkin, route)
+
+
+def run_options(cli: CliArgs) -> dict[str, Any]:
+    """The keyword arguments main() passes to run(): only what differs from
+    run()'s defaults (napkin, route auto)."""
+    return {**({} if cli.napkin else {"napkin": False}),
+            **({} if cli.route == rp_context.ROUTE_AUTO else {"route": cli.route})}
+
+
+def exit_code(report: dict) -> int:
+    """The process exit code of a finished run: EXIT_HANDOFF when routing was
+    handed to the agent, else EXIT_PASS / EXIT_FAIL from the verdict."""
+    if report.get("status") == rp_context.STATUS_HANDOFF:
+        return EXIT_HANDOFF
+    return EXIT_PASS if report.get("PASS") else EXIT_FAIL
 
 
 def board_dims(design: dict, w: float | None, h: float | None,

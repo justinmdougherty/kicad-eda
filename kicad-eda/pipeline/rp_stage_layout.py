@@ -3,7 +3,8 @@ board-fix corrective-action loop, then the opt-in EMC stitching post-pass,
 which is a transaction: a stitch that makes G4 fail, or whose board cannot be
 judged, is undone byte for byte.
 Feature hooks (rp_hooks): g4_inputs and g4_verdict at every judgement (the
-first, the EMC re-judge and the re-judge of a rolled-back board), emc_args."""
+first, the EMC re-judge and the re-judge of a rolled-back board), emc_args;
+handoff_veto through rp_route_modes when a failed G4 would be handed off."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -13,6 +14,7 @@ import gates
 import rp_context
 import rp_hooks
 import rp_kicad
+import rp_route_modes
 
 G4_FIX_ROUNDS = 2                                # corrective-action rounds at G4
 EMC_ROLLED_BACK = "EMC stitching rolled back: "
@@ -20,11 +22,16 @@ EMC_ROLLED_BACK = "EMC stitching rolled back: "
 
 @rp_context.stage
 def stage_g4(ctx: rp_context.RunContext) -> bool:
-    """G4: layout / board review (feeds CDR): judge, fix loop, EMC post-pass."""
+    """G4: layout / board review (feeds CDR): judge, fix loop, EMC post-pass.
+    A failed G4 in auto mode is then handed to the agent (or, on a feature's
+    veto, fails with the reason as one more blocker): rp_route_modes."""
     judge_g4(ctx)
     stage_g4_fixes(ctx)
     stage_emc(ctx)
-    return rp_context.record_gate(ctx, ctx.g4)
+    passed = rp_context.record_gate(ctx, ctx.g4)
+    if not passed:
+        rp_route_modes.after_g4_failure(ctx)
+    return passed
 
 
 def judge_g4(ctx: rp_context.RunContext, refresh_unconnected: bool = False,

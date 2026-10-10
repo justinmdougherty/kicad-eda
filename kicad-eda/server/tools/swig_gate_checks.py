@@ -127,14 +127,14 @@ def _bbox_connector(ref: str, mouth: tuple, box: tuple) -> str | None:
 def _outline_connector(ref: str, mouth: tuple, shape: Any, panel: bool
                        ) -> tuple[str | None, str | None]:
     """(text, detail) of the outline rule: the courtyard face the mouth opens
-    through, judged against its nearest outline edge."""
+    through, judged against the outline edges (swig_outline_checks.connector_verdict)."""
     import swig_outline_checks as soc
     to = pcbnew.ToMM
     (mx, my), cybb = mouth
     ox, oy = shape.origin
     box = (to(cybb.GetLeft()) - ox, to(cybb.GetTop()) - oy,
            to(cybb.GetRight()) - ox, to(cybb.GetBottom()) - oy)
-    v = soc.connector_verdict(shape.outline, ref, soc.face_point(box, (mx, my)), (mx, my), panel)
+    v = soc.connector_verdict(shape.outline, ref, box, (mx, my), panel)
     if v is None:
         return None, None
     return (inward_text(ref) if v.kind == "inward" else far_text(ref, v.dist)), v.detail
@@ -171,13 +171,15 @@ def connector_findings(board: Any, design: dict, shape: Any) -> list:
 
 
 def keepout_findings(board: Any, design: dict) -> list:
-    """antenna_keepout requested but no no-fill rule area on the board. The pour
-    flag's getter differs between pcbnew 9.x and 10.x: board_outline reads it."""
+    """antenna_keepout requested but no no-fill rule area on the board: ONE rule
+    area, the board's or a footprint's (a stock module's own keep-out counts), with
+    "no copper pour" set on EVERY enabled copper layer (ADR D7.7 / R20). rule_areas
+    reads the flag version-safely (CopperPour on 9.x, ZoneFills on 10.x)."""
     if not design.get("antenna_keepout"):
         return []
-    import board_outline
+    import rule_areas
     import swig_outline_checks as soc
-    if any(board_outline.blocks_pour(z) for z in board.Zones()):
+    if rule_areas.has_rule_area(board, None, "all", no_pour=True, include_footprints=True):
         return []
     return [soc.Finding("antenna_keepout", "error", "antenna_keepout requested in the netlist "
                         "but no no-fill rule area exists on the board")]
@@ -568,12 +570,6 @@ def mode_findings(mode: str, pcb: str, board: Any, design: dict) -> list:
     if mode == "routed":
         return routed_findings(board, pcb, design)
     return [soc.Finding("unknown_mode", "error", f"unknown mode {mode}")]
-
-
-def run_mode(mode: str, pcb: str, board: Any, design: dict) -> tuple[list, list]:
-    """(issues, warnings) of one main() mode."""
-    import swig_outline_checks as soc
-    return soc.split(mode_findings(mode, pcb, board, design))
 
 
 def main() -> int:

@@ -1,31 +1,30 @@
-"""Line geometry from a resolved stackup (ADR D7.6 'Reference resolution' steps 1-6; D7-07).
+"""Line geometry from a resolved stackup (ADR D7.6 'Reference resolution' 1-6; task D7-07).
 
-resolve_line(stackup, layer, spec) walks up and down from the trace's copper layer:
-1. Each side's reference is the first plane-role copper, or mixed-role copper whose net is in
-   ref_nets (impedance nets ["GND", every plane/mixed net]; RF nets - spec has freq_hz -
-   ["GND"]), unless spec ref_layers {layer: [...]} names them (plane or mixed layers).
-2. A copper layer between the trace and its reference is listed in void_layers (dielectric, its
-   copper cut out), or a signal / mixed layer taken as dielectric under the dual-stripline
-   assumption (non-RF nets only), or else ST-E9.
-3. Each side's plies run outward from the trace; a passed copper layer is a ply of its own
-   (its copper thickness filled with the adjacent prepreg's Er, else the lower-Er neighbour's).
-4. Outer layer + one reference: microstrip (coated by the stackup's mask); inner + two:
-   stripline, dual_stripline when a routed layer lies between; inner + one: embedded microstrip
-   (cover = the plies up to the next copper, noted when that copper is routed). line auto:
-   outer + freq_hz -> cpwg; 'cpwg' adds same-layer grounds on any layer (coplanar); 'cpw' is an
-   outer line without a back plane. pair: edge (pair_gap = the netlist gap) or broadside (spec
-   pair 'broadside' with layers [La, Lb] adjacent: above = La's side, below = face gap + Lb's).
-5. A power-net reference gives ST-W10; an RF reference outside ref_nets gives ST-E10.
-6. Heights come from the stackup's plies only (the legacy {h, er} is one unmasked ply).
-`stackup` is a stackup_model.ResolvedStackup or its to_dict() (the artifact form). The width is
-the spec's explicit width or 0 (an unsolved placeholder that tline.synth fills). Stdlib only.
+resolve_line(stackup, layer, spec) walks up and down from the trace's copper layer (stackup: a
+stackup_model.ResolvedStackup or its to_dict()). (1) A side's reference is the first plane-role
+copper, or mixed copper whose net is in ref_nets (impedance ["GND", every plane/mixed net]; RF -
+rf_freq: freq_hz a number > 0 - ["GND"]), unless ref_layers {layer: [...]} names it. (2) Copper
+in between is in void_layers (dielectric, cut out) or routed copper taken as dielectric (dual
+stripline; non-RF only), else ST-E9. (3) Plies run outward; passed copper is a ply filled with
+the adjacent prepreg (else the lower-Er neighbour). (4) Outer + one reference: microstrip
+(masked); inner + two: stripline / dual_stripline; inner + one: embedded microstrip (cover up to
+the next copper; warned when it is routed). line auto: outer + freq_hz -> cpwg; cpwg adds
+same-layer grounds on any layer; cpw: outer, no back plane. pair: edge (gap = the netlist gap)
+or broadside (pair 'broadside', layers [La, Lb] adjacent). (5) Power references: ST-W10; RF
+references outside ref_nets: ST-E10. (6) Heights come from plies only. Width = the spec's
+explicit width or 0 (tline.synth fills it). Warnings ('<layer>: ...') flag a request the stackup
+overrides or a routed layer over the line. Copper rules for tline.synth: width_window,
+default_ground_gap and pour_clearance (ADR D7.6). Stdlib only.
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NamedTuple
 
+from . import evaluate as _closed_form
+from .fallback import apply as _fallback
 from .stripline import dielectric_copper_ply
 from .types import Issue, LineGeometry, MaskModel, Ply
 
@@ -36,6 +35,9 @@ NET_ROLES = ("plane", "mixed")
 RF_REF_NETS = ("GND",)
 GROUND_NAMES = ("GND", "VSS", "0V", "GROUND")
 E9_FIX = "declare a plane/mixed GND layer next to it, route on another layer, or set ref_layers"
+WINDOW_MIN_MM, WINDOW_PCT = 0.005, 1.5
+CPWG_MIN_GAP_MM = 0.15
+POUR_Z_RATIO = 0.99
 
 
 def is_ground(net: str | None) -> bool:
@@ -44,26 +46,22 @@ def is_ground(net: str | None) -> bool:
     return bool(up) and (up in GROUND_NAMES or "GND" in up)
 
 
+def rf_freq(spec: Mapping[str, Any]) -> float | None:
+    """The net's RF frequency: freq_hz when it is a finite number > 0, else None (not RF)."""
+    f = spec.get("freq_hz")
+    ok = isinstance(f, (int, float)) and not isinstance(f, bool) and math.isfinite(f) and f > 0
+    return float(f) if ok else None
+
+
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     return obj.get(key, default) if isinstance(obj, Mapping) else getattr(obj, key, default)
 
 
-class Copper(NamedTuple):
-    name: str
-    thickness: float
-    role: str
-    net: str | None
-
-
-class Dielectric(NamedTuple):
-    kind: str
-    plies: tuple[Ply, ...]            # top to bottom
-
-
-class Stack(NamedTuple):
-    copper: tuple[Copper, ...]
-    dielectrics: tuple[Dielectric, ...]
-    mask: MaskModel | None
+Copper = NamedTuple("Copper", [("name", str), ("thickness", float), ("role", str),
+                               ("net", "str | None")])
+Dielectric = NamedTuple("Dielectric", [("kind", str), ("plies", tuple)])     # plies top down
+Stack = NamedTuple("Stack", [("copper", tuple), ("dielectrics", tuple),
+                             ("mask", "MaskModel | None")])
 
 
 def _ply(p: Any) -> Ply:
@@ -114,7 +112,7 @@ class LineSetup:
     coplanar: bool = False
     rf: bool = False
     issues: tuple[Issue, ...] = ()
-    notes: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -125,22 +123,17 @@ class LineSetup:
                 "nets": list(self.ref_nets)}
 
 
-class Rules(NamedTuple):
-    rf: bool
-    ref_nets: frozenset[str]
-    override: tuple[str, ...] | None
-    voids: frozenset[str]
+Rules = NamedTuple("Rules", [("rf", bool), ("ref_nets", frozenset), ("override", "tuple | None"),
+                             ("voids", frozenset)])
 
 
 def _per_layer(value: Any, layer: str) -> tuple[str, ...] | None:
-    if isinstance(value, Mapping):
-        found = value.get(layer)
-        return None if found is None else tuple(found)
-    return None
+    found = value.get(layer) if isinstance(value, Mapping) else None
+    return None if found is None else tuple(found)
 
 
 def _rules(stack: Stack, spec: Mapping[str, Any], layer: str) -> Rules:
-    rf = bool(spec.get("freq_hz"))
+    rf = rf_freq(spec) is not None
     planes = [c.net for c in stack.copper if c.role in NET_ROLES and c.net]
     ref_nets = spec.get("ref_nets") or (RF_REF_NETS if rf else ["GND", *planes])
     return Rules(rf, frozenset(ref_nets), _per_layer(spec.get("ref_layers"), layer),
@@ -172,10 +165,7 @@ def walk(stack: Stack, k: int, up: bool, rules: Rules) -> Side:
     """One side of copper k walked to its reference (D7.6 steps 1-3)."""
     steps = _steps(stack, k, up)
     first = steps[0][2] if steps else None
-    plies: list[Ply] = []
-    passed: list[tuple[str, Ply]] = []
-    voided: list[str] = []
-    blocked = None
+    plies, passed, voided, blocked = [], [], [], None
     for i, (outward, kind, cu) in enumerate(steps):
         plies.extend(outward)
         if _is_ref(cu, rules):
@@ -238,18 +228,19 @@ def _ref_issues(rules: Rules, refs: Sequence[Side], layer: str, path: str) -> tu
                   "caps near transitions", path),)
 
 
-def _notes(layer: str, kind: str, below: Side, other: Side, coplanar: bool,
-           spec: Mapping[str, Any]) -> tuple[str, ...]:
-    out = []
+def _warnings(layer: str, kind: str, below: Side, other: Side, coplanar: bool,
+              spec: Mapping[str, Any], note: str) -> tuple[str, ...]:
+    """'<layer>: ...' for a line request the stackup overrides or a routed layer over the line."""
+    out = [note] if note else []
     if kind == "embedded_microstrip" and other.first and other.first.role in ROUTABLE:
         out.append(f"embedded microstrip: the next copper {other.first.name} is a routed layer: "
                    "its tracks over the line change Z (keep them off it)")
     if not coplanar and spec.get("ground_gap") is not None:
         out.append(f"ground_gap ignored: a {kind} has no same-layer grounds (set line cpwg)")
     if kind == "cpw" and below.ref:
-        out.append(f"cpw on {layer}: {below.ref} under it is a plane, so this is a CPWG "
-                   "(line cpwg); the substrate is taken down to that plane")
-    return tuple(out)
+        out.append(f"cpw over the {below.ref} plane is a CPWG (line cpwg); the substrate is "
+                   "taken down to that plane")
+    return tuple(f"{layer}: {w}" for w in out)
 
 
 def _geometry(stack: Stack, k: int, kind: str, below: Side, above: tuple[Ply, ...],
@@ -288,11 +279,11 @@ def _classify(stack: Stack, k: int, up: Side, down: Side, spec: Mapping[str, Any
         above = other.plies if base == "embedded_microstrip" else ()
     passed = up.passed + down.passed
     geom = _geometry(stack, k, kind, below, above, passed, coplanar, spec)
-    notes = tuple(n for n in (note,) if n) + _notes(layer, kind, below, other, coplanar, spec)
     return LineSetup(layer, geom, kind, (up.ref,) if up.ref else (),
                      (down.ref,) if down.ref else (), tuple(s.net for s in refs),
                      up.voided + down.voided, tuple(name for name, _ in passed), coplanar,
-                     rules.rf, _ref_issues(rules, refs, layer, path), notes)
+                     rules.rf, _ref_issues(rules, refs, layer, path),
+                     _warnings(layer, kind, below, other, coplanar, spec, note))
 
 
 def _broadside(stack: Stack, k: int, spec: Mapping[str, Any], path: str) -> LineSetup:
@@ -367,3 +358,39 @@ def transition_issues(setups: Sequence[LineSetup], *, path: str = "$") -> tuple[
                   f"({detail}): a layer change needs a return path - a via of the same reference "
                   "net or a decoupling capacitor between the reference nets within 2 mm (R27)",
                   path),)
+
+
+# ---------------------------------------------------------------- copper rules
+def width_window(width: float) -> tuple[float, float]:
+    """The DRU width window: width +/- max(0.005 mm, 1.5 %) (ADR D7.6, rule R6)."""
+    d = max(WINDOW_MIN_MM, width * WINDOW_PCT / 100.0)
+    return round(width - d, 6), round(width + d, 6)
+
+
+def default_ground_gap(min_clearance: float) -> float:
+    """CPWG default gap: max(fab min clearance, 0.15 mm) (ADR D7.6)."""
+    return max(min_clearance, CPWG_MIN_GAP_MM)
+
+
+def pour_clearance(geom: LineGeometry, *, gap: tuple[float, float] = (0.1, 2.0),
+                   grid: float = 0.005) -> tuple[float | None, str]:
+    """(RF<->GND pour clearance, note) of a microstrip: the smallest grid gap in `gap` whose
+    CPWG Z is >= 0.99 x the microstrip Z; (None, '') for other kinds."""
+    if geom.kind != "microstrip":
+        return None, ""
+    single = replace(geom, pair="single", pair_gap=None, ground_gap=None)
+    floor = POUR_Z_RATIO * _fallback(single, _closed_form(single)).z0
+
+    def far(k: int) -> bool:
+        g = replace(single, kind="cpwg", ground_gap=k * grid)
+        try:
+            return _fallback(g, _closed_form(g)).z0 >= floor
+        except ValueError:
+            return False
+
+    lo, hi = math.ceil(gap[0] / grid - 1e-9), math.floor(gap[1] / grid + 1e-9)
+    if not far(hi):
+        return round(hi * grid, 6), f"a {hi * grid:g} mm pour gap still lowers Z by over 1 %"
+    while lo < hi:                                # the smallest k with far(k): far is monotone
+        lo, hi = (lo, (lo + hi) // 2) if far((lo + hi) // 2) else ((lo + hi) // 2 + 1, hi)
+    return round(lo * grid, 6), ""

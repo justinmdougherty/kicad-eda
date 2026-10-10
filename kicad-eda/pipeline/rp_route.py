@@ -63,9 +63,11 @@ def route_attempt(ctx: rp_context.RunContext, attempt: int, scale: float) -> boo
     in place (alternate DSN order or verified heal), or the ROUTER failed
     outright (placement is not the problem, so scale escalation cannot help —
     the error surfaces at G4). A feature's route_provider replaces
-    k.autoroute_board: same call, same result, no alternates and no heal."""
+    k.autoroute_board: same call, same result, no alternates and no heal
+    (ctx.provider_routed says so: the route modes never hand such a board off)."""
     ctx.report["renders_placement"] = rp_kicad.render(ctx.pcb, "place")
     provider = rp_hooks.first("route_provider", ctx)
+    ctx.provider_routed = provider is not None
     clear_recovery_copies(ctx.pcb)
     if provider is None:
         copy_board(ctx.pcb, ctx.pcb + PLACED_SUFFIX)

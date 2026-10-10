@@ -23,13 +23,15 @@ stdin closed, UTF-8, timeout):
   (e) on the rect board the outline rule gives exactly the old texts; pads and
       mounting-hole drills near the edge are judged (pad_edge_clearance / hole_edge);
   (f) an edge SMA whose 'PCB Edge' marker sits 3 mm inside the board ->
-      edge_mount_off_edge; SMAs seated on the edge (front, rotated, flipped) are clean;
+      edge_mount_off_edge (a blocker; a warning naming "edge" when the netlist
+      leaves it to the auto placer); SMAs seated on the edge are clean;
   plus the plane-island warning on a slotted board and the routed mode on a board
   without Edge.Cuts (a warning, never an issue).
 """
 from __future__ import annotations
 
 import ast
+import itertools
 import json
 import math
 import re
@@ -182,7 +184,7 @@ def _mouth(pad: tuple, box: tuple) -> tuple[float, float]:
 def test_connector_verdict_matches_the_old_bbox_rule_on_a_rect(
         pad: tuple, box: tuple, old: tuple) -> None:
     mouth = _mouth(pad, box)
-    v = soc.connector_verdict(RECT, "J1", soc.face_point(box, mouth), mouth)
+    v = soc.connector_verdict(RECT, "J1", box, mouth)
     if old is None:
         assert v is None
         return
@@ -193,27 +195,88 @@ def test_connector_verdict_matches_the_old_bbox_rule_on_a_rect(
     assert "nearest edge" in v.detail and "board frame, mm" in v.detail
 
 
+def _old_rule(box: tuple, mouth: tuple, w: float = 40.0, h: float = 30.0) -> tuple | None:
+    """The pre-outline G3 rule (swig_gate_checks._bbox_connector's arithmetic on a
+    w x h board): inward when the mouth points at the board centre from the
+    courtyard centre, else far when the faced side is > 3 mm away."""
+    x0, y0, x1, y1 = box
+    mx, my = mouth
+    if mx * ((x0 + x1) / 2 - w / 2) + my * ((y0 + y1) / 2 - h / 2) <= 0:
+        return ("inward", None)
+    dist = {(1, 0): w - x1, (-1, 0): x0, (0, 1): h - y1, (0, -1): y0}[mouth]
+    return ("far", dist) if dist > 3.0 else None
+
+
+@pytest.mark.parametrize("box,mouth,old", [
+    ((2.0, 0.2, 9.0, 3.0), (-1, 0), None),            # top-left corner, 2 mm from the left edge
+    ((34.0, 26.5, 37.5, 29.5), (1, 0), None),          # bottom-right corner, 2.5 mm from the right
+    ((4.0, 0.2, 9.0, 3.0), (-1, 0), ("far", 4.0)),     # 4 mm from the edge it faces
+])
+def test_a_connector_tucked_into_a_corner_is_judged_by_the_edge_it_faces(
+        box: tuple, mouth: tuple, old: tuple | None) -> None:
+    # the face's NEAREST edge is the perpendicular one; the old rule judged the
+    # side the mouth faces, and so must the outline rule (review finding, round 1)
+    assert _old_rule(box, mouth) == old                                   # premise
+    v = soc.connector_verdict(RECT, "J1", box, mouth)
+    if old is None:
+        assert v is None
+        return
+    assert v is not None and (v.kind, v.dist) == pytest.approx(old)
+    assert v.detail.startswith("J1: mating face is 4.0 mm from the board edge it faces"), v.detail
+    assert "the edge it faces: the board outline at (0.000, 1.600)" in v.detail, v.detail
+    assert "nearest edge" in v.detail and "board frame, mm" in v.detail
+
+
+CONNECTOR_SIZES = ((6, 3), (3, 6), (10, 5), (5, 10), (4, 4))
+MOUTHS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+
+@pytest.mark.parametrize("w,h", [(40, 30), (60, 40)])
+def test_on_a_rect_the_outline_rule_flags_exactly_what_the_old_rule_flags(w: int, h: int) -> None:
+    """Every connector body up to 10 mm, every mouth, on a 1 mm grid with its
+    courtyard centre on the board: the same connectors are flagged; where both
+    say 'far' the distance is the same. The wording may differ only for a body
+    whose centre is on or past the board's centre line while the mouth face's
+    nearest edge is the one it faces: the old rule said 'inward', the outline
+    rule says 'far' (both block, napkin_policy turns both into face_connector_out)."""
+    rect = ol.from_board_block({"w": w, "h": h})
+    flagged, worded = [], []
+    for (bw, bh), x0, y0, mouth in itertools.product(CONNECTOR_SIZES, range(-5, w + 1),
+                                                     range(-5, h + 1), MOUTHS):
+        box = (float(x0), float(y0), float(x0 + bw), float(y0 + bh))
+        if not (0 < x0 + bw / 2 < w and 0 < y0 + bh / 2 < h):
+            continue
+        old, v = _old_rule(box, mouth, w, h), soc.connector_verdict(rect, "J1", box, mouth)
+        if (old is None) != (v is None):
+            flagged.append((box, mouth, old, v))
+        elif old is not None and (old[0], v.kind) != ("inward", "far") and (
+                old[0] != v.kind or (old[1] is not None and abs(old[1] - v.dist) > 1e-6)):
+            worded.append((box, mouth, old, v))
+    assert flagged == [] and worded == []
+
+
 def test_an_overhanging_mouth_is_at_the_edge_however_far_it_hangs() -> None:
     # an edge SMA hangs 10 mm past the right edge: the old rule's distance went
     # negative; the outline rule must not read 10 mm as "far from the edge"
     box = (35.0, 12.0, 50.0, 18.0)
-    assert soc.connector_verdict(RECT, "J1", soc.face_point(box, (1, 0)), (1, 0)) is None
-    v = soc.connector_verdict(RECT, "J1", soc.face_point(box, (0, 1)), (0, 1))
+    assert soc.connector_verdict(RECT, "J1", box, (1, 0)) is None
+    v = soc.connector_verdict(RECT, "J1", box, (0, 1))
     assert v is not None and v.kind == "inward"          # hanging off, but facing along the edge
 
 
 def test_a_mouth_facing_a_cutout_counts_only_with_panel_cutouts() -> None:
     t10 = ol.from_board_block(T10_BOARD)
-    v = soc.connector_verdict(t10, "J2", (30.0, 23.0), (0, -1))     # under the round hole
+    box = (27.0, 23.0, 33.0, 26.0)                        # mouth face under the round hole
+    v = soc.connector_verdict(t10, "J2", box, (0, -1))
     assert v is not None and v.kind == "inward" and "cutout" in v.detail
-    assert soc.connector_verdict(t10, "J2", (30.0, 23.0), (0, -1), panel_cutouts=True) is None
+    assert soc.connector_verdict(t10, "J2", box, (0, -1), panel_cutouts=True) is None
 
 
 def test_the_l_bay_wall_is_an_edge_the_bbox_rule_could_not_see() -> None:
     # a connector in the L's bay facing the x = 20 wall: the bbox rule called the
     # bay "interior"; the outline knows that wall is a board edge
-    assert soc.connector_verdict(LSHAPE, "J1", (21.0, 25.0), (-1, 0)) is None
-    v = soc.connector_verdict(LSHAPE, "J1", (21.0, 25.0), (1, 0))
+    assert soc.connector_verdict(LSHAPE, "J1", (21.0, 22.0, 27.0, 28.0), (-1, 0)) is None
+    v = soc.connector_verdict(LSHAPE, "J1", (15.0, 22.0, 21.0, 28.0), (1, 0))
     assert v is not None and v.kind == "inward"
 
 
@@ -244,11 +307,43 @@ def test_edge_mount_verdict(pl: soc.Placement, off: tuple | None) -> None:
     assert f.text == ("J2: edge-mount connector does not straddle the board edge "
                       f"(edge marker {dist:.2f} mm from the outline)")
     assert f"({x:.3f}, {y:.3f})" in f.detail and "marker_line" in f.detail
+    assert f.detail.endswith("seat the marker on the board edge with the body overhanging it "
+                             "by 10.02 mm"), f.detail
 
 
 def test_edge_mount_verdict_ignores_parts_that_are_not_edge_mount() -> None:
     assert soc.edge_mount_verdict("J1", em.NOT_EDGE_MOUNT, soc.Placement(0, 0, 0, False), RECT,
                                   (0.0, 0.0)) is None
+
+
+@pytest.mark.parametrize("comp,severity", [
+    (None, "error"),                                   # not in the netlist: no excuse
+    ({"ref": "J2"}, "warning"),                        # left to the auto placer
+    ({"ref": "J2", "edge": None, "x": None}, "warning"),
+    ({"ref": "J2", "edge": "right"}, "error"),         # the netlist asked for an edge
+    ({"ref": "J2", "overhang": 2.0}, "error"),         # ... or for an overhang
+    ({"ref": "J2", "at": [30, 22, 0]}, "error"),       # the netlist placed it
+    ({"ref": "J2", "x": 30, "y": 22}, "error"),
+])
+def test_edge_mount_severity_follows_who_chose_the_position(
+        comp: dict | None, severity: str) -> None:
+    assert soc.edge_mount_severity(comp) == severity
+
+
+def test_an_auto_placed_edge_mount_part_off_the_edge_warns_and_names_the_fix() -> None:
+    f = soc.edge_mount_verdict("J2", SAMTEC, soc.Placement(34.9, 22.0, 0.0, False), RECT,
+                               (0.0, 0.0), severity="warning")
+    assert f is not None and (f.code, f.severity) == ("edge_mount_off_edge", "warning")
+    assert f.text.startswith(em.straddle_issue("J2", 3.0) + "; it is auto-placed"), f.text
+    assert '"edge"' in f.text and "marker" in f.text, f.text
+    assert f.text.endswith('"right" so the builder can seat the marker on the board edge with '
+                           'the body overhanging it by 10.02 mm'), f.text
+
+
+def test_edge_mount_verdict_refuses_an_unknown_severity() -> None:
+    with pytest.raises(ValueError, match="severity"):
+        soc.edge_mount_verdict("J2", SAMTEC, soc.Placement(34.9, 22.0, 0.0, False), RECT,
+                               (0.0, 0.0), severity="fatal")
 
 
 @pytest.mark.parametrize("info,clearance", [(SAMTEC, 0.0), (em.NOT_EDGE_MOUNT, 0.3),
@@ -281,6 +376,42 @@ class _StandIn:
 def test_a_stand_in_board_has_no_outline_and_no_finding() -> None:
     shape = soc.read_shape(_StandIn())
     assert shape.outline is None and shape.origin is None and shape.findings == ()
+
+
+class _Layers:
+    def CuStack(self) -> list[int]:  # noqa: N802 (pcbnew API)
+        return [31]
+
+
+class _UnfilledZone:
+    """A plane whose fill pcbnew cannot hand back (SWIG maps the C++ throw to OSError)."""
+
+    def GetIsRuleArea(self) -> bool:  # noqa: N802 (pcbnew API)
+        return False
+
+    def GetLayerSet(self) -> _Layers:  # noqa: N802
+        return _Layers()
+
+    def GetFilledPolysList(self, layer: int) -> None:  # noqa: N802
+        raise OSError(f"no fill for layer {layer}")
+
+    def GetNetname(self) -> str:  # noqa: N802
+        return "GND"
+
+
+class _ZoneBoard:
+    def Zones(self) -> list:  # noqa: N802
+        return [_UnfilledZone()]
+
+    def GetLayerName(self, layer: int) -> str:  # noqa: N802
+        return "B.Cu"
+
+
+def test_an_unreadable_plane_fill_is_a_warning_never_silent() -> None:
+    found = soc.plane_island_findings(_ZoneBoard(), soc.BoardShape(LSHAPE, (0.0, 0.0)))
+    assert found == [soc.Finding(
+        "plane_islands_unread", "warning", "GND: the fill on B.Cu could not be read (OSError: "
+        "no fill for layer 31); its islands were not counted")]
 
 
 def _top_level_imports(path: Path) -> set[str]:
@@ -518,10 +649,11 @@ def _last_json(stdout: str) -> dict:
     raise AssertionError(f"swig_gate_checks printed no JSON line:\n{stdout}")
 
 
-def _gate(boards: dict, mode: str, name: str, design: dict | None = None) -> dict:
+def _gate(boards: dict, mode: str, name: str, design: dict | None = None,
+          tag: str = "") -> dict:
     """The real swig_gate_checks.py as rp_kicad.gate_check runs it; asserts rc 0
     and the JSON contract (parallel codes / warning_codes / details)."""
-    netlist = boards["work"] / f"{name}_{mode}.json"
+    netlist = boards["work"] / f"{name}_{mode}{tag}.json"
     netlist.write_text(json.dumps(design or {}), encoding="utf-8")
     try:
         proc = subprocess.run([boards["kpy"], str(GATE), mode, str(boards[name]), str(netlist)],
@@ -607,15 +739,42 @@ def test_d_open_outline_is_outline_open_and_connectors_fall_back(boards: dict) -
     assert len(_with(routed, "outline_open")) == 1, routed
 
 
+J2_OFF_EDGE = ("J2: edge-mount connector does not straddle the board edge (edge marker 3.00 mm "
+               "from the outline)")
+SMA_PARTS = [{"ref": ref, "value": "SMA", "footprint": f"Connector_Coaxial:{name}"}
+             for ref, name in (("J1", "SMA_Samtec_SMA-J-P-H-ST-EM1_EdgeMount"),
+                               ("J2", "SMA_Samtec_SMA-J-P-H-ST-EM1_EdgeMount"),
+                               ("J3", "SMA_Samtec_SMA-J-P-H-ST-EM1_EdgeMount"),
+                               ("J4", "SMA_Samtec_SMA-J-P-H-ST-EM1_EdgeMount"),
+                               ("J5", "SMA_Amphenol_132289_EdgeMount"))]
+
+
 def test_f_edge_sma_3mm_inside_is_flagged_seated_ones_are_clean(boards: dict) -> None:
-    out = _gate(boards, "placement", "sma")
-    assert _with(out, "edge_mount_off_edge") == [
-        "J2: edge-mount connector does not straddle the board edge (edge marker 3.00 mm "
-        "from the outline)"], out
+    out = _gate(boards, "placement", "sma")              # no netlist parts: a blocker
+    assert _with(out, "edge_mount_off_edge") == [J2_OFF_EDGE], out
     for ref in ("J1", "J3", "J4", "J5"):                 # front, rot 90, flipped, by name
         assert _about(out["issues"], ref) == [], (ref, boards["j4_rot"], out)
     # J2's body hangs 7 mm past the edge: inside its derived overhang, no courtyard issue
     assert _about(_with(out, "courtyard_outside"), "J2") == [], out
+
+
+def test_f_an_edge_the_netlist_asked_for_blocks_when_missed(boards: dict) -> None:
+    parts = [{**p, "edge": "right"} if p["ref"] == "J2" else p for p in SMA_PARTS]
+    out = _gate(boards, "placement", "sma", {"components": parts}, tag="_edge")
+    assert _with(out, "edge_mount_off_edge") == [J2_OFF_EDGE], out
+    assert _with(out, "edge_mount_off_edge", "warnings") == [], out
+
+
+def test_f_an_auto_placed_sma_off_the_edge_warns_and_names_the_fix(boards: dict) -> None:
+    # the netlist leaves J2 to the auto placer (no edge / at / x / y): until the
+    # builder seats edge-mount parts by itself the finding is a warning naming
+    # the "edge" key, so boards placed that way keep their verdict (F3-13b review)
+    out = _gate(boards, "placement", "sma", {"components": SMA_PARTS}, tag="_auto")
+    assert _with(out, "edge_mount_off_edge") == [], out
+    warned = _with(out, "edge_mount_off_edge", "warnings")
+    assert len(warned) == 1 and warned[0].startswith(J2_OFF_EDGE + "; it is auto-placed"), out
+    for ref in ("J1", "J2", "J3", "J4", "J5"):
+        assert _about(out["issues"], ref) == [], (ref, out)
 
 
 def test_plane_islands_warn_on_a_slotted_board(boards: dict) -> None:
