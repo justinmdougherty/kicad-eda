@@ -298,14 +298,14 @@ def _export_dxf(pcb: str, out_dxf: str) -> dict:
     reference = mx.board_file_outline(board)
     help_text, why = mx.cli_help(tc.run, cli, ("pcb", "export", "dxf"))
     args, warnings, mm = mx.dxf_command(cli, str(board), str(out), help_text, why)
-    run = mx.run_cli(tc.run, args, out, "DXF")
+    run = mx.run_cli(tc.run, args, out, "DXF", board=board)
     base = {"dxf": str(out), **base, "command": args}
     if not run.ok:
         return {"ok": False, "reason": run.reason, **base, "warnings": warnings}
     back = dxf_io.read_board_outline(out, units="mm" if mm else None)
     dist, tol = mx.frame_hausdorff(reference, back.model), mx.HAUSDORFF_TOL_MM
     res = {"ok": dist <= tol, "hausdorff_mm": _r(dist), "tolerance_mm": tol, **base,
-           "warnings": [*warnings, *back.warnings], "frame": EXTERNAL_NOTE}
+           "warnings": [*warnings, *run.warnings, *back.warnings], "frame": EXTERNAL_NOTE}
     if dist > tol:
         res["reason"] = (f"the exported DXF differs from the board's Edge.Cuts by {dist:.4f} mm "
                          f"in the datum frame (aux origin), more than the {tol:g} mm tolerance")
@@ -331,11 +331,11 @@ def export_outline_dxf(pcb: str, out_dxf: str) -> dict:
 def _export_step(pcb: str, out_step: str, board_only: bool) -> dict:
     board, out, cli, base, mx = _job(pcb, out_step, "out_step")
     args = mx.step_command(cli, str(board), str(out), bool(board_only))
-    run = mx.run_cli(tc.run, args, out, "STEP file")
+    run = mx.run_cli(tc.run, args, out, "STEP file", board=board)
     base = {"step": str(out), "board_only": bool(board_only), **base, "command": args}
     if not run.ok:
         return {"ok": False, "reason": run.reason, **base}
-    warnings = mx.log_warnings(run.output)
+    warnings = [*run.warnings, *mx.log_warnings(run.output)]
     try:
         box = mx.step_bbox(out)
         warnings += box.pop("warnings")
@@ -366,12 +366,12 @@ def export_step(pcb: str, out_step: str, board_only: bool = False) -> dict:
 def _export_pos(pcb: str, out_csv: str) -> dict:
     board, out, cli, base, mx = _job(pcb, out_csv, "out_csv")
     args = mx.pos_command(cli, str(board), str(out))
-    run = mx.run_cli(tc.run, args, out, "position file")
+    run = mx.run_cli(tc.run, args, out, "position file", board=board)
     base = {"csv": str(out), **base, "command": args}
     if not run.ok:
         return {"ok": False, "reason": run.reason, **base}
     return {"ok": True, **base, "rows": mx.csv_rows(out), "units": "mm", "frame": EXTERNAL_NOTE,
-            "note": POS_NOTE, "warnings": mx.log_warnings(run.output)}
+            "note": POS_NOTE, "warnings": [*run.warnings, *mx.log_warnings(run.output)]}
 
 
 def export_pos_datum(pcb: str, out_csv: str) -> dict:

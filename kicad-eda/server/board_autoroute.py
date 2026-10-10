@@ -20,6 +20,10 @@ toolchain, kicad_ipc and board_build are imported AS MODULES and their
 functions looked up at call time, so tests that monkeypatch tc.run /
 ipc.write_guard / tc.restore_snapshot reach this code. server/tools is never
 put on sys.path at import time (canonical_dsn puts it there when it runs).
+
+F5-14 (F5-05 spike; 1.9.0 stays): every Freerouting child is kept off the
+network, in its own work dir and, on Windows, on a private desktop via this
+module as a script (`board_autoroute.py --hidden-desktop -- <argv>`).
 """
 
 from __future__ import annotations
@@ -35,43 +39,70 @@ import board_build
 import kicad_ipc as ipc
 import toolchain as tc
 
+if sys.platform == "win32":
+    import _winapi
+    import ctypes
+    from ctypes import wintypes as w
+
+DEAD_PORT = 9                 # nothing listens there: every proxied connect is refused
+HIDDEN_DESKTOP = "--hidden-desktop"
+
+
+def on_windows() -> bool:
+    return os.name == "nt"
+
+
+def offline_jvm_args(work: str) -> list[str]:
+    """Every version (F5-05: 0 outbound connects, same SES): proxies on a dead
+    port; tmpdir / home in the work dir (a stale 1.9 .frb pops a dialog)."""
+    return ["-Djava.net.useSystemProxies=false",
+            "-Dhttp.proxyHost=127.0.0.1", f"-Dhttp.proxyPort={DEAD_PORT}",
+            "-Dhttps.proxyHost=127.0.0.1", f"-Dhttps.proxyPort={DEAD_PORT}",
+            "-DsocksProxyHost=127.0.0.1", f"-DsocksProxyPort={DEAD_PORT}",
+            f"-Djava.io.tmpdir={Path(work) / 'tmp'}", f"-Duser.home={Path(work) / 'home'}"]
+
+
+def v2_settings(work: str, route_timeout: int) -> list[str]:
+    """2.x: headless, a budget so it WRITES the SES before the kill, one
+    thread, no analytics / API / MCP server, its data in the work dir."""
+    budget = max(60, route_timeout - 60)
+    hh, rem = divmod(budget, 3600)
+    mm_, ss = divmod(rem, 60)
+    return ["--gui.enabled=false", f"--router.job_timeout={hh:02d}:{mm_:02d}:{ss:02d}",
+            "--feature_flags.multi_threading=false", "-da",
+            f"--user_data_path={Path(work) / 'fr'}", "--api_server.enabled=false",
+            "--mcp_server.enabled=false"]
+
 
 def freerouting_args(java: str, jar: str, w_dsn: str, w_ses: str,
                      max_passes: int, route_timeout: int) -> list[str] | dict:
-    """The Freerouting command line, or an {ok: False} dict when the platform
-    cannot run this jar (1.x needs a display: xvfb-run on a headless Linux)."""
+    """The Freerouting command line (F5-05's offline lists; the work dir is
+    w_dsn's directory), or an {ok: False} dict when the platform cannot run
+    this jar (1.x needs a display: xvfb-run on a headless Linux)."""
+    work = str(Path(w_dsn).parent)
+    is_v2 = "freerouting-2" in Path(jar).name
     # -dct 0: skip the "Autorouter is about to start" countdown dialog (1.9
     # and 2.x both take it) — no window may wait on a click in a hands-off run.
-    args = [java, "-Xmx4g", "-jar", jar, "-de", w_dsn, "-do", w_ses,
+    args = [java, "-Xmx4g", *offline_jvm_args(work), "-jar", jar, "-de", w_dsn, "-do", w_ses,
             "-mp", str(max_passes), "-dct", "0"]
-    is_v2 = "freerouting-2" in Path(jar).name
+    args += v2_settings(work, route_timeout) if is_v2 else ["-da"]      # -da: no analytics
     # Freerouting 1.x initializes AWT/Swing even in CLI mode — on a
     # display-less Linux box (Docker, CI) it dies with HeadlessException
     # before routing anything. Wrap it in a virtual framebuffer.
-    if os.name != "nt" and not os.environ.get("DISPLAY") and not is_v2:
+    if not on_windows() and not os.environ.get("DISPLAY") and not is_v2:
         if not shutil.which("xvfb-run"):
             return {"ok": False, "reason":
                     "no display and xvfb-run not found — Freerouting 1.x "
                     "needs one (install xvfb, e.g. apt-get install xvfb)"}
         args = ["xvfb-run", "-a"] + args
-    if is_v2:
-        # Freerouting 2.x: true headless, internal wall-clock budget (so it
-        # finishes and WRITES the SES instead of being killed with nothing),
-        # multi-threaded routing, no interactive dialog stalls.
-        budget = max(60, route_timeout - 60)
-        hh, rem = divmod(budget, 3600)
-        mm_, ss = divmod(rem, 60)
-        args += ["--gui.enabled=false",
-                 f"--router.job_timeout={hh:02d}:{mm_:02d}:{ss:02d}",
-                 "--feature_flags.multi_threading=true"]
     return args
 
 
 def route(java: str, jar: str, dsn: str, ses: str, max_passes: int,
           route_timeout: int) -> dict:
-    """Run Freerouting on a copy of the DSN in a space-free temp dir (its CLI
-    re-splits arguments on spaces, so paths like "OneDrive - NTS" break it)
-    and copy the SES back. Returns {ok, [reason|stderr]}."""
+    """Run Freerouting on a copy of the DSN in its own temp dir (cwd, tmp/,
+    home/; no FREEROUTING__* env; on Windows behind the private-desktop
+    launcher: 1.9 opens windows) and copy the SES back. {ok, [reason|stderr]}"""
     work = Path(tempfile.mkdtemp(prefix="frt_"))
     w_dsn, w_ses = str(work / "in.dsn"), str(work / "out.ses")
     shutil.copyfile(dsn, w_dsn)
@@ -79,8 +110,13 @@ def route(java: str, jar: str, dsn: str, ses: str, max_passes: int,
     if isinstance(args, dict):
         shutil.rmtree(work, ignore_errors=True)
         return args
+    for sub in ("tmp", "home"):
+        (work / sub).mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("FREEROUTING__")}
+    if on_windows():
+        args = [sys.executable, str(Path(__file__).resolve()), HIDDEN_DESKTOP, "--", *args]
     try:
-        fr = tc.run(args, timeout=route_timeout)
+        fr = tc.run(args, timeout=route_timeout, cwd=str(work), env=env)
         if Path(w_ses).is_file():
             shutil.copyfile(w_ses, ses)
         return {"ok": Path(ses).is_file(), "stderr": (fr.stdout + fr.stderr)[-1500:]}
@@ -270,3 +306,66 @@ def parse_ses_import(stdout: str) -> dict:
     return {"ok": "True" in stdout, "tracks": digits[-1] if digits else None,
             "vias": None, "warnings": [],
             "error": None if "True" in stdout else stdout.strip()[-300:]}
+
+
+# script mode (Windows): the private-desktop launcher route() puts in front of Java
+def _spawn_suspended(argv: list[str], desktop: str | None) -> tuple[int, int, int]:
+    """CreateProcessW(argv) on `desktop`, suspended, no console window, with
+    this launcher's std handles: (process handle, thread handle, pid)."""
+    class StartupInfo(ctypes.Structure):      # STARTUPINFOW; dw[7] is dwFlags
+        _fields_ = [("cb", w.DWORD), ("reserved", w.LPWSTR), ("desktop", w.LPWSTR),
+                    ("title", w.LPWSTR), ("dw", w.DWORD * 8), ("show", w.WORD * 2),
+                    ("reserved2", w.LPVOID), ("std", w.HANDLE * 3)]
+
+    class ProcessInfo(ctypes.Structure):      # PROCESS_INFORMATION
+        _fields_ = [("handles", w.HANDLE * 2), ("ids", w.DWORD * 2)]
+
+    si, pi = StartupInfo(), ProcessInfo()
+    si.cb, si.desktop, si.dw[7] = ctypes.sizeof(si), desktop, 0x100     # STARTF_USESTDHANDLES
+    si.std[:] = [_winapi.GetStdHandle(n) for n in (
+        _winapi.STD_INPUT_HANDLE, _winapi.STD_OUTPUT_HANDLE, _winapi.STD_ERROR_HANDLE)]
+    cmd = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not k32.CreateProcessW(None, cmd, None, None, True, 0x08000004,    # NO_WINDOW|SUSPENDED
+                              None, None, ctypes.byref(si), ctypes.byref(pi)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return pi.handles[0], pi.handles[1], pi.ids[0]
+
+
+def run_hidden(argv: list[str]) -> int:
+    """Run argv on a new desktop nobody switches to; its exit code. Its job
+    kills the child tree when this launcher dies (route timeout) or exits;
+    its handles close then too. No desktop (non-interactive): current one."""
+    from backends.child_guard import ChildGuard
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    u32.CreateDesktopW.restype = w.HANDLE
+    name = f"kicad_eda_fr_{os.getpid()}"
+    desk = u32.CreateDesktopW(name, None, None, 0, 0x10000000, None)    # GENERIC_ALL
+    if not desk:
+        print(f"no private desktop ({ctypes.WinError(ctypes.get_last_error())}): "
+              "Freerouting's windows may show", file=sys.stderr)
+    try:
+        proc, thread, pid = _spawn_suspended(argv, name if desk else None)  # this winstation
+    except OSError as exc:
+        print(f"cannot start {argv[0]}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        ChildGuard.bind(pid)
+    except OSError as exc:
+        print(f"Freerouting is not tied to its launcher: {exc}", file=sys.stderr)
+    ctypes.WinDLL("kernel32").ResumeThread(w.HANDLE(thread))
+    _winapi.WaitForSingleObject(proc, _winapi.INFINITE)
+    return _winapi.GetExitCodeProcess(proc)
+
+
+def main(argv: list[str]) -> int:
+    """`board_autoroute.py --hidden-desktop -- <command...>` (Windows); 2 = usage."""
+    if len(argv) < 3 or argv[:2] != [HIDDEN_DESKTOP, "--"] or not on_windows():
+        print(f"usage (Windows): board_autoroute.py {HIDDEN_DESKTOP} -- <command> [args...]",
+              file=sys.stderr)
+        return 2
+    return run_hidden(argv[2:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

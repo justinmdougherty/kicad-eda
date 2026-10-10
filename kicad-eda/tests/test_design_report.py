@@ -478,18 +478,19 @@ def test_floating_stacked_pins_carry_a_pin_groups_hint(napkin_lib: Path):
     assert (detail["U1.6"]["stacked_on"], detail["U1.7"]["stacked_on"],
             detail["U1.8"]["stacked_on"]) == ("2", "2", "1")
     assert detail["U1.6"]["hint"] == (
-        "hidden pin stacked on U1.2 ('GND'): put every pad of pin_groups['GND'] (2, 6, 7) "
-        "on net GND; KiCad joins stacked pins in the schematic, but the board takes "
-        "pad nets from the netlist")
+        "hidden pin stacked on U1.2 ('GND'): put every pad named 'GND' (2, 6, 7) on net GND "
+        "(a sym_author part returns them as pin_groups['GND']); KiCad joins stacked pins in "
+        "the schematic, but the board takes pad nets from the netlist")
     assert detail["U1.7"]["hint"] == detail["U1.6"]["hint"]
-    assert "pin_groups['VDD'] (1, 8) on net 3V3" in detail["U1.8"]["hint"]
+    assert ("pad named 'VDD' (1, 8) on net 3V3 (a sym_author part returns them as "
+            "pin_groups['VDD'])") in detail["U1.8"]["hint"]
 
 
 def test_stacked_hint_without_a_netted_group_names_no_net(napkin_lib: Path):
     design = _mcu_design()
     design["nets"] = {"3V3": [["C1", "1"]], "GND": [["C1", "2"]]}
     hint = _detail(design_report.analyze(design, str(napkin_lib)))["U1.6"]["hint"]
-    assert "pin_groups['GND'] (2, 6, 7) on one net;" in hint
+    assert "pad named 'GND' (2, 6, 7) on one net (a sym_author" in hint
 
 
 def test_markdown_lists_each_stack_once(napkin_lib: Path):
@@ -497,11 +498,13 @@ def test_markdown_lists_each_stack_once(napkin_lib: Path):
     stack_lines = [line for line in md.splitlines() if line.startswith("- Stacked pins")]
     assert stack_lines == [
         "- Stacked pins floating on U1: pad(s) 6, 7 — hidden pin stacked on U1.2 ('GND'): put "
-        "every pad of pin_groups['GND'] (2, 6, 7) on net GND; KiCad joins stacked pins in "
-        "the schematic, but the board takes pad nets from the netlist",
+        "every pad named 'GND' (2, 6, 7) on net GND (a sym_author part returns them as "
+        "pin_groups['GND']); KiCad joins stacked pins in the schematic, but the board takes "
+        "pad nets from the netlist",
         "- Stacked pins floating on U1: pad(s) 8 — hidden pin stacked on U1.1 ('VDD'): put "
-        "every pad of pin_groups['VDD'] (1, 8) on net 3V3; KiCad joins stacked pins in the "
-        "schematic, but the board takes pad nets from the netlist"]
+        "every pad named 'VDD' (1, 8) on net 3V3 (a sym_author part returns them as "
+        "pin_groups['VDD']); KiCad joins stacked pins in the schematic, but the board takes "
+        "pad nets from the netlist"]
     assert md.index("- Floating pins:") < md.index("- Stacked pins")
 
 
@@ -513,7 +516,8 @@ def test_lg290p_hint_compacts_the_gnd_pad_list(project: Path):
     rep = design_report.analyze(design, _resolver(project, design))
     gnd = [d for d in rep["flags"]["floating_detail"] if d["name"] == "GND"]
     assert len(gnd) == 58 and {d["stacked_on"] for d in gnd} == {"10"}
-    assert "pin_groups['GND'] (10, 12, 13, 24-79) on net GND" in gnd[0]["hint"]
+    assert ("pad named 'GND' (10, 12, 13, 24-79) on net GND (a sym_author part returns "
+            "them as pin_groups['GND'])") in gnd[0]["hint"]
     md = design_report.to_markdown(rep)
     assert [line.split(" — ")[0] for line in md.splitlines()
             if line.startswith("- Stacked pins")] == [
@@ -604,7 +608,8 @@ def test_stock_stacked_gnd_pins_get_the_hint():
         "nets": {"GND": [["U1", "1"]]}}
     detail = _detail(design_report.analyze(design, str(KICAD.symbols)))
     assert (detail["U1.10"]["stacked_on"], detail["U1.12"]["stacked_on"]) == ("1", "1")
-    assert "pin_groups['GND'] (1, 10, 12) on net GND" in detail["U1.10"]["hint"]
+    # a stock symbol has no sym_author output: the hint names the pads themselves
+    assert "put every pad named 'GND' (1, 10, 12) on net GND" in detail["U1.10"]["hint"]
 
 
 # --- CLI: <symbols> goes through the netlist's resolver, as sch_build's does ----------

@@ -2,18 +2,28 @@
 KiCad-python child the stages start (DRC, renders, the SWIG gate / fix /
 EMC-stitch scripts). Stages call them through this module object
 (rp_kicad.drc(...)) so a test patches one place; a new KiCad wrapper goes
-here."""
+here.
+
+Every child runs through toolchain.run: stdin closed (an inherited MCP stdio
+pipe would block it), output decoded as UTF-8 with replacement, and a
+timeout. DRC goes through drc_guard.run_drc (D7-11): the report is always
+THIS run's, and any failure raises."""
 from __future__ import annotations
 
-import json
+import re
 import subprocess
 from pathlib import Path
 
 import rp_paths  # first: puts server/ and server/tools/ on sys.path
+import drc_guard
 import kicad_server as k
 import toolchain as tc
 
 SERVER = rp_paths.SERVER
+GATE_TIMEOUT_S = 300          # swig_gate_checks / swig_board_fixes
+RENDER_TIMEOUT_S = 300
+EMC_TIMEOUT_S = 600
+ERROR_LINE = re.compile(r"(^|\s)Error:", re.M)   # kicad-cli (wx may prefix a timestamp)
 
 
 def board_cli(pcb: str) -> str:
@@ -27,23 +37,20 @@ def board_cli(pcb: str) -> str:
 
 
 def drc(pcb: str) -> dict:
-    rpt = str(Path(pcb).with_suffix("")) + "_drc.json"
+    """kicad-cli DRC (error severity) of `pcb` with its board kicad-cli,
+    through drc_guard.run_drc: <stem>_drc.json is deleted before kicad-cli
+    runs, so the counts (and the report the board fixer reads) are always this
+    run's. {errors, unconnected, types: {type: count}, kicad_cli}. A failure
+    (no board, a non-zero exit, a crash, an `Error:` line, no or an
+    unreadable report) raises RuntimeError naming kicad-cli's output tail;
+    an older report is never read."""
     cli = board_cli(pcb)
-    subprocess.run([cli, "pcb", "drc", pcb, "--severity-error",
-                    "-o", rpt, "--format", "json"],
-                   capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    d = json.loads(Path(rpt).read_text())
-    return {"errors": len(d.get("violations", [])),
-            "unconnected": len(d.get("unconnected_items", [])),
-            "types": counts(d.get("violations", [])),
-            "kicad_cli": cli}
-
-
-def counts(viols: list) -> dict:
-    out: dict[str, int] = {}
-    for v in viols:
-        out[v.get("type", "?")] = out.get(v.get("type", "?"), 0) + 1
-    return out
+    res = drc_guard.run_drc(pcb, cli, severity="error")
+    if "error" in res:
+        how = "crashed" if res.get("crash") else "failed"
+        raise RuntimeError(f"DRC of {Path(pcb).name} {how}: {res['error']}")
+    return {"errors": res["errors"], "unconnected": res["unconnected"],
+            "types": res["types"], "kicad_cli": cli}
 
 
 def gate_check(mode: str, pcb: str, netlist: str) -> dict:
@@ -54,80 +61,73 @@ def gate_check(mode: str, pcb: str, netlist: str) -> dict:
     script = SERVER / "tools" / "swig_gate_checks.py"
     if not kpy or not script.is_file():
         return {"issues": [f"gate check unavailable ({mode})"], "warnings": []}
-    r = subprocess.run([kpy, str(script), mode, pcb, netlist],
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300)
-    for line in reversed(r.stdout.strip().splitlines()):
-        if line.startswith("{"):
-            try:
-                d = json.loads(line)
-                return {"issues": d.get("issues", []),
-                        "warnings": d.get("warnings", [])}
-            except Exception:
-                break
+    r = tc.run([kpy, str(script), mode, pcb, netlist], timeout=GATE_TIMEOUT_S)
+    d = tc.last_json(r.stdout or "")
+    if d is not None:
+        return {"issues": d.get("issues", []), "warnings": d.get("warnings", [])}
     return {"issues": [f"gate check produced no result ({mode}): "
-                       f"{r.stderr[-300:]}"], "warnings": []}
+                       f"{(r.stderr or '')[-300:]}"], "warnings": []}
 
 
 def board_fix(pcb: str, netlist: str, mode: str) -> list:
     """Apply post-route board-level corrective actions (micro-gap heal,
-    IPC-2221 parallel vias) under KiCad's Python. Returns the applied log."""
+    IPC-2221 parallel vias, EP via farms) under KiCad's Python, from the DRC
+    report rp_kicad.drc wrote. Returns the applied log plus every unfixed
+    finding as an 'OPEN: ...' entry."""
     kpy = k._kicad_python()
     script = SERVER / "tools" / "swig_board_fixes.py"
-    drc_rpt = str(Path(pcb).with_suffix("")) + "_drc.json"
     if not kpy or not script.is_file():
         return []
-    r = subprocess.run([kpy, str(script), pcb, netlist, drc_rpt, mode],
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300)
-    for line in reversed(r.stdout.strip().splitlines()):
-        if line.startswith("{"):
-            try:
-                d = json.loads(line)
-                return d.get("applied", []) + \
-                    [f"OPEN: {o}" for o in d.get("open", [])]
-            except Exception:
-                break
-    return []
+    r = tc.run([kpy, str(script), pcb, netlist, str(drc_guard.report_path(pcb)), mode],
+               timeout=GATE_TIMEOUT_S)
+    d = tc.last_json(r.stdout or "")
+    if d is None:
+        return []
+    return list(d.get("applied", [])) + [f"OPEN: {o}" for o in d.get("open", [])]
 
 
 def render(pcb: str, tag: str, quality: str = "basic") -> list:
     """Render top/bottom PNGs next to the board so every gate exit leaves a
-    visual record (placement view at G3, final board at G5)."""
-    out = []
+    visual record (placement view at G3, final board at G5). Only the PNGs
+    THIS run wrote are listed; a failed render is a missing picture, never a
+    failed run."""
     base = str(Path(pcb).with_suffix(""))
     cli = board_cli(pcb)
+    out = []
     for side in ("top", "bottom"):
         png = f"{base}_{tag}_{side}.png"
-        try:
-            r = subprocess.run(
-                [cli, "pcb", "render", pcb, "-o", png,
-                 "--side", side, "--quality", quality,
-                 "--width", "1600", "--height", "1400"],
-                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300)
-            if r.returncode == 0 and Path(png).is_file():
-                out.append(png)
-        except Exception:
-            pass
+        if render_side(cli, pcb, png, side, quality):
+            out.append(png)
     return out
 
 
-def emc_stitch(pcb: str, emc: dict) -> dict:
+def render_side(cli: str, pcb: str, png: str, side: str, quality: str) -> bool:
+    """One kicad-cli pcb render; True when this run wrote `png` (an older PNG
+    is removed first) and kicad-cli neither failed nor printed an Error line."""
+    try:
+        Path(png).unlink(missing_ok=True)
+        r = tc.run([cli, "pcb", "render", pcb, "-o", png, "--side", side,
+                    "--quality", quality, "--width", "1600", "--height", "1400"],
+                   timeout=RENDER_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    output = (r.stdout or "") + (r.stderr or "")
+    return r.returncode == 0 and not ERROR_LINE.search(output) and Path(png).is_file()
+
+
+def emc_stitch(pcb: str, emc: dict, extra: list[str] | None = None) -> dict:
     """Run the EMC ground-stitching pass (perimeter via fence + interior
-    grid) on the routed board under KiCad's Python."""
+    grid) on the routed board under KiCad's Python; `extra` is appended to
+    its argv (the features' emc_args, rp_stage_layout.emc_stitch)."""
     kpy = k._kicad_python()
     script = SERVER / "tools" / "emc_stitch.py"
     if not kpy or not script.is_file():
         return {"ok": False, "reason": "emc_stitch unavailable"}
-    r = subprocess.run(
-        [kpy, str(script), pcb, str(emc.get("max_freq_hz", 0)),
-         "fence" if emc.get("fence_only") else "grid"],
-        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600)
-    for line in reversed(r.stdout.strip().splitlines()):
-        if line.startswith("{"):
-            try:
-                return json.loads(line)
-            except Exception:
-                break
-    return {"ok": False, "reason": r.stderr[-300:]}
+    r = tc.run([kpy, str(script), pcb, str(emc.get("max_freq_hz", 0)),
+                "fence" if emc.get("fence_only") else "grid", *(extra or [])],
+               timeout=EMC_TIMEOUT_S)
+    d = tc.last_json(r.stdout or "")
+    return d if d is not None else {"ok": False, "reason": (r.stderr or "")[-300:]}
 
 
 def courtyard_drc(pcb: str) -> dict:

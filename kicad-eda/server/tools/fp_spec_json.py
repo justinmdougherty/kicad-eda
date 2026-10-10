@@ -38,6 +38,9 @@ rows / cols, via and paste grids) and no coordinate run may exceed MAX_PADS,
 and a footprint whose pad entries (copper, paste windows, vias) could exceed
 it is refused before anything is built, so a typo such as ``"count": 1e8``
 cannot stall the server. Pad numbers (``start``, ``first``) are not sizes.
+Every number must fit a finite double (RFC 7493 I-JSON: |x| <= 1.8e308, no
+Infinity / NaN), and the built pads, body and courtyard must lie within
+KiCad's coordinate range, +/-KICAD_MAX_MM (int32 nanometres).
 The input is only read, never mutated. Stdlib-only and Python 3.11
 compatible: KiCad's bundled Python can import it.
 """
@@ -46,6 +49,7 @@ from __future__ import annotations
 import difflib
 import json
 import math
+import sys
 from typing import Any, Callable, Mapping
 
 import fp_author_templates as ft
@@ -57,6 +61,8 @@ NUMBERING_RULES: tuple[str, ...] = ("grid_ref", "linear", "table")
 ORDERS: tuple[str, ...] = ("col_major", "row_major")
 JEDEC_ROW_LETTERS = "ABCDEFGHJKLMNPRTUVWY"     # JEDEC JEP95 / IPC-7351: no I O Q S X Z
 MAX_PADS = 10_000                              # pad entries per footprint (largest BGAs ~3,000)
+KICAD_MAX_MM = 2147.483647                     # int32 nanometres: KiCad's coordinate range
+_FLOAT_MAX = sys.float_info.max
 
 Problems = list[str]
 Converter = Callable[[Any, str, Problems], Any]
@@ -98,13 +104,36 @@ def _json_type(value: Any) -> str:
     return type(value).__name__
 
 
+def _numeric(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_number(value: Any) -> bool:
+    """A JSON number that is a finite double (RFC 7493 I-JSON). An int is
+    compared exactly, never converted: float(10**400) raises OverflowError."""
+    if not _numeric(value):
+        return False
+    return abs(value) <= _FLOAT_MAX if isinstance(value, int) else math.isfinite(value)
+
+
+def _number_text(value: int | float) -> str:
+    """A number as a message prints it; a long integer by its magnitude, so a
+    huge one is neither printed in full nor passed to str() (4300-digit limit)."""
+    if isinstance(value, int) and abs(value) >= 10 ** 17:
+        sign = "-" if value < 0 else ""
+        return f"about {sign}1e{int(abs(value).bit_length() * math.log10(2))}"
+    return json.dumps(value)
+
+
 def _shown(value: Any) -> str:
     """``value`` as an error message shows it: its JSON type and, for scalars, the value."""
     kind = _json_type(value)
     if isinstance(value, str):
         return f"{kind} {value!r}"
-    if isinstance(value, bool) or kind == "number":
+    if isinstance(value, bool):
         return f"{kind} {json.dumps(value)}"
+    if kind == "number":
+        return f"{kind} {_number_text(value)}"
     return kind                                  # null, object, array: the type says it all
 
 
@@ -113,20 +142,25 @@ def _fail(problems: Problems, path: str, expected: str, value: Any) -> _Invalid:
     return _BAD
 
 
-def _is_number(value: Any) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value))
+def _not_a(expected: str, value: Any, path: str, problems: Problems) -> _Invalid:
+    """_fail for a field that takes a number: a number no finite double holds
+    (an integer past 1.8e308, Infinity, NaN) is named as out of range."""
+    if _numeric(value) and not _is_number(value):
+        problems.append(f"{path}: number {_number_text(value)} is outside the JSON double "
+                        f"range (finite, |x| <= {_FLOAT_MAX:.2g})")
+        return _BAD
+    return _fail(problems, path, expected, value)
 
 
 def _number(value: Any, path: str, problems: Problems) -> float | _Invalid:
-    return float(value) if _is_number(value) else _fail(problems, path, "a number", value)
+    return float(value) if _is_number(value) else _not_a("a number", value, path, problems)
 
 
 def _positive(value: Any, path: str, problems: Problems) -> float | _Invalid:
     if not _is_number(value):
-        return _fail(problems, path, "a number", value)
+        return _not_a("a number", value, path, problems)
     if value <= 0:
-        problems.append(f"{path}: must be > 0, got {json.dumps(value)}")
+        problems.append(f"{path}: must be > 0, got {_number_text(value)}")
         return _BAD
     return float(value)
 
@@ -134,9 +168,9 @@ def _positive(value: Any, path: str, problems: Problems) -> float | _Invalid:
 def _count(value: Any, path: str, problems: Problems) -> int | _Invalid:
     """A non-negative integer (an integral JSON float such as 4.0 is accepted)."""
     if not _is_number(value) or (isinstance(value, float) and not value.is_integer()):
-        return _fail(problems, path, "an integer", value)
+        return _not_a("an integer", value, path, problems)
     if value < 0:
-        problems.append(f"{path}: must be >= 0, got {json.dumps(value)}")
+        problems.append(f"{path}: must be >= 0, got {_number_text(value)}")
         return _BAD
     return int(value)
 
@@ -145,7 +179,7 @@ def _size(value: Any, path: str, problems: Problems) -> int | _Invalid:
     """A count that multiplies into pads: an integer 0..MAX_PADS."""
     n = _count(value, path, problems)
     if n is not _BAD and n > MAX_PADS:
-        problems.append(f"{path}: must be <= {MAX_PADS}, got {n}")
+        problems.append(f"{path}: must be <= {MAX_PADS}, got {_number_text(n)}")
         return _BAD
     return n
 
@@ -162,9 +196,9 @@ def _pad_name(value: Any, path: str, problems: Problems) -> str | _Invalid:
     """A pad name: a string, or a JSON integer written as its decimal string."""
     if isinstance(value, str):
         return value
-    if isinstance(value, int) and not isinstance(value, bool):
+    if isinstance(value, int) and _is_number(value):
         return str(value)
-    return _fail(problems, path, "a pad name (string or integer)", value)
+    return _not_a("a pad name (string or integer)", value, path, problems)
 
 
 def _optional_pad_name(value: Any, path: str, problems: Problems) -> str | None | _Invalid:
@@ -488,6 +522,32 @@ def _check_size(template: str, kwargs: Mapping[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Geometry range (checked on the built spec: runs and spans multiply out)
+# ---------------------------------------------------------------------------
+def _pad_reach(pad: ft.Pad) -> float:
+    """How far from the origin the pad can reach, whatever its rotation."""
+    return max(abs(pad.x), abs(pad.y)) + math.hypot(pad.w, pad.h) / 2
+
+
+def _body_reach(body: ft.Body) -> float:
+    return max(abs(body.x) + (body.w_max or body.w) / 2, abs(body.y) + (body.h_max or body.h) / 2)
+
+
+def _check_extent(spec: FootprintSpec) -> None:
+    """FpSpecJsonError when a pad, the body or the courtyard around them lies
+    outside KiCad's coordinate range (a NaN reach fails too)."""
+    excess = max(spec.courtyard_excess, 0.0)
+    items = [("body", _body_reach(spec.body)),
+             *((f"pad {p.number!r}", _pad_reach(p)) for p in spec.pads)]
+    far = [(what, reach + excess) for what, reach in items if not reach + excess <= KICAD_MAX_MM]
+    if far:
+        what, reach = far[0]
+        raise FpSpecJsonError([f"{what} reaches {reach:.6g} mm from the origin, beyond KiCad's "
+                               f"coordinate range of +/-{KICAD_MAX_MM} mm (courtyard "
+                               f"included; {len(far)} item(s) beyond)"])
+
+
+# ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
 def _check_template(template: Any) -> str:
@@ -518,18 +578,20 @@ def _params(template: str, params: Any) -> Any:
 def spec_from_json(template: str, params: Mapping[str, Any] | str) -> FootprintSpec:
     """The FootprintSpec ``template`` builds from ``params`` (a JSON object, or
     its text; see the module doc for the keys). Raises FpSpecJsonError naming
-    every problem (unknown, missing or mistyped keys, template errors); never
-    mutates ``params``."""
+    every problem (unknown, missing or mistyped keys, numbers out of range,
+    template errors, oversized geometry); never mutates ``params``."""
     _check_template(template)
+    raw = _params(template, params)
     problems: Problems = []
-    kwargs = _object(_params(template, params), "params", problems,
-                     {**_SCHEMAS[template], **_COMMON})
     try:
+        kwargs = _object(raw, "params", problems, {**_SCHEMAS[template], **_COMMON})
         if kwargs is _BAD:
             raise FpSpecJsonError(problems)
         _check_size(template, kwargs)
-        return _BUILDERS[template](kwargs, problems)
+        spec = _BUILDERS[template](kwargs, problems)
+        _check_extent(spec)
+        return spec
     except FpSpecJsonError as e:
         raise FpSpecJsonError([f"{template}: {p}" for p in e.problems]) from None
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, OverflowError) as e:   # a template's own refusal
         raise FpSpecJsonError([f"{template}: {e}"]) from e

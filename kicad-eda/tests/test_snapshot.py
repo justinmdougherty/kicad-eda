@@ -89,26 +89,30 @@ def _listing(folder: Path, skip: str = "\0") -> dict[str, bytes]:
 
 
 class Editors:
-    """A fake running KiCad for kicad_ipc.editor_holding: `held` maps a
-    normalised path to the editor kind holding it; `asked` records queries."""
+    """A fake running KiCad for kicad_ipc.connect: `held` maps a path to the
+    editor kind that has it open (none: no GUI); `connects` counts connections."""
 
     def __init__(self) -> None:
         self.held: dict[str, str] = {}
-        self.asked: list[str] = []
+        self.connects = 0
 
-    def __call__(self, path: str) -> str | None:
-        self.asked.append(path)
-        return self.held.get(ipc.norm_path(path))
+    def __call__(self) -> dict:
+        self.connects += 1
+        if not self.held:
+            return {"ipc_connected": False, "reason": "test: no KiCad GUI"}
+        return {"ipc_connected": True, "kicad_version": "9.0.4",
+                "open_documents": [{"type": kind, "path": path}
+                                   for path, kind in self.held.items()]}
 
 
-REAL_EDITOR_HOLDING = ipc.editor_holding
+REAL_CONNECT = ipc.connect
 
 
 @pytest.fixture(autouse=True)
-def editors(monkeypatch) -> Editors:
+def editors(monkeypatch: pytest.MonkeyPatch) -> Editors:
     """No unit test asks a real KiCad GUI what it holds (the live tests do)."""
     fake = Editors()
-    monkeypatch.setattr(ipc, "editor_holding", fake)
+    monkeypatch.setattr(ipc, "connect", fake)
     return fake
 
 
@@ -399,7 +403,7 @@ def test_restore_removes_the_leftover_lock_when_nothing_holds_the_board(tmp_path
     lock = tmp_path / "~netlist.kicad_pro.lck"
     res = tc.restore_snapshot(pcb)
     assert res["lock_removed"] is True and not lock.exists() and "lock_note" not in res
-    assert ipc.norm_path(pcb) in [ipc.norm_path(p) for p in editors.asked]
+    assert editors.connects == 1                    # one IPC connection for board AND project
 
 
 def test_restore_keeps_the_lock_while_a_session_or_an_editor_holds_the_board(
@@ -410,24 +414,25 @@ def test_restore_keeps_the_lock_while_a_session_or_an_editor_holds_the_board(
     registry(held)                                          # this process's board API session
     res = tc.restore_snapshot(held)
     assert res["lock_removed"] is False and "session" in res["lock_note"]
-    assert (tmp_path / "session" / "~netlist.kicad_pro.lck").is_file() and editors.asked == []
+    assert (tmp_path / "session" / "~netlist.kicad_pro.lck").is_file() and editors.connects == 0
     gui = _snapshotted_k11_board(tmp_path / "pcbnew")
-    editors.held[ipc.norm_path(gui)] = "pcb"                # open in a running PCB editor
+    editors.held[gui] = "pcb"                               # open in a running PCB editor
     res = tc.restore_snapshot(gui)
     assert res["lock_removed"] is False and "Pcbnew" in res["lock_note"]
     assert (tmp_path / "pcbnew" / "~netlist.kicad_pro.lck").is_file()
     project = _snapshotted_k11_board(tmp_path / "manager")
-    editors.held[ipc.norm_path(str(_sib(project, "", ".kicad_pro")))] = "project"
-    res = tc.restore_snapshot(project)
+    editors.held[str(_sib(project, "", ".kicad_pro"))] = "project"
+    res = tc.restore_snapshot(project)                      # the board is not open, its project is
     assert res["lock_removed"] is False and "project manager" in res["lock_note"]
     assert (tmp_path / "manager" / "~netlist.kicad_pro.lck").is_file()
+    assert editors.connects == 2                            # one connection per restore
 
 
 def test_restore_without_a_lock_asks_no_editor(tmp_path, editors) -> None:
     pcb = _snapshotted_k11_board(tmp_path)
     (tmp_path / "~netlist.kicad_pro.lck").unlink()
     res = tc.restore_snapshot(pcb)
-    assert res["lock_removed"] is False and "lock_note" not in res and editors.asked == []
+    assert res["lock_removed"] is False and "lock_note" not in res and editors.connects == 0
 
 
 def test_restore_reports_a_lock_it_cannot_remove(tmp_path, monkeypatch) -> None:
@@ -691,13 +696,13 @@ def _java_pids() -> set[int] | None:
     return owned_pids("java.exe")
 
 
-def _live_lm358(tmp_path: Path, monkeypatch) -> str:
+def _live_lm358(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     """A fresh registry, the real GUI probe, and examples/lm358_buffer built by
     KiCad 9's pcbnew in tmp_path (its 1 A outputs get net classes)."""
     _skip_unless_live()
     monkeypatch.setattr(bs, "_BOARDS", {})
     monkeypatch.setattr(bs, "_PROGRESS", {})
-    monkeypatch.setattr(ipc, "editor_holding", REAL_EDITOR_HOLDING)
+    monkeypatch.setattr(ipc, "connect", REAL_CONNECT)
     design = json.loads((EXAMPLES / "lm358_buffer" / "netlist.json").read_text(encoding="utf-8"))
     design["net_specs"] = {"OUT_A": {"voltage": 5, "current": 1.0},
                            "OUT_B": {"voltage": 5, "current": 1.0}}
@@ -741,7 +746,7 @@ def test_live_k11_save_snapshots_then_freerouting_routes_the_snapshot(tmp_path, 
         assert _kicad_cli_pids() <= before, "kicad-cli api-server leaked"
 
 
-def test_live_stall_then_two_fallbacks_keep_the_first_agent_copy(tmp_path, monkeypatch):
+def test_live_stall_then_two_fallbacks_keep_the_first_agent_copy(tmp_path, monkeypatch) -> None:
     """ROADMAP D5 end to end: headless route_check x5 on the unrouted board
     reports the stall, Freerouting routes the snapshot, the agent saves
     through KiCad 11 again, and a second fallback keeps the first agent copy

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Routed-board (G4) design-intent checks, run under KiCad's bundled Python.
 
-Moved out of swig_gate_checks.py unchanged (F3-13a); swig_gate_checks
-re-exports all three and its ``routed`` mode calls them:
+Moved out of swig_gate_checks.py with their behaviour unchanged (F3-13a; the
+only edits are two ruff fixes: an explicit zip(strict=False) and a loop
+variable bound as a default argument); swig_gate_checks re-exports all three
+and its ``routed`` mode calls them:
   - check_routed_widths: every net with a net-class width (resolved through
     netclass_read as KiCad does) is routed at >= that width outside pad-entry
     necks, and every prerouted power path survives the router;

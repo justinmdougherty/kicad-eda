@@ -20,15 +20,21 @@ kicad-cli; skipped without them): lm358 + the authored LG290P from a project
 library builds through board_build.build into another directory, every saved
 FPID carries its nickname, and kicad-cli DRC reports no lib_footprint_issues
 for the project library (and does once the materialized fp-lib-table is
-removed); stock libraries resolve through kicad-cli's global table, which a
-bare container lacks, so there only stock nicknames may be reported.
+removed); stock libraries resolve through kicad-cli's global table: where it
+declares them DRC reports no library issue at all, while a bare container
+lacks it, so there only stock nicknames may be reported. Relative netlist /
+board paths (the harness passes them as given) put the tables and the
+``.kicad_pro`` beside the board, and a missing output directory is refused
+in plain words before anything is written or spawned.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +44,7 @@ import pytest
 import board_build
 import board_pipeline_tools as bpt
 import board_route_tools as brt
+import kicad_env
 import kicad_ipc as ipc
 import libtable as lt
 import toolchain as tc
@@ -302,6 +309,41 @@ def test_a_project_fp_lib_table_without_a_block_resolves_too(world: World) -> No
     assert [Path(p).name for p in res["library_tables"]] == ["board.kicad_pro"]
 
 
+@pytest.mark.parametrize("out_pcb", ["", "proj/out/board.kicad_pcb"])
+def test_relative_paths_put_the_tables_and_project_beside_the_board(
+        world: World, monkeypatch: pytest.MonkeyPatch, out_pcb: str) -> None:
+    """The harness passes ctx.netlist / ctx.pcb as given (run_pipeline.py proj/netlist.json)."""
+    world.netlist(_design())
+    if out_pcb:
+        (world.project / "out").mkdir()
+    monkeypatch.chdir(world.root)
+    res = board_build.build("proj/netlist.json", 30, 20, out_pcb=out_pcb,
+                            footprints_dir=str(world.stock_fp))
+    assert res["ok"] is True and len(world.runs) == 1, res
+    given = out_pcb or str(Path("proj/netlist.json").with_suffix(".kicad_pcb"))
+    assert res["pcb"] == given and world.runs[0]["args"][3] == given
+    board = world.root / given
+    expected = [board.parent / "fp-lib-table", board.parent / "sym-lib-table",
+                board.with_suffix(".kicad_pro")]
+    assert {board.with_suffix(".kicad_pro").name, "fp-lib-table"} <= set(world.runs[0]["present"])
+    assert sorted(Path(p).resolve() for p in res["library_tables"]) == sorted(
+        p.resolve() for p in expected)
+    assert not (board.parent / "proj").exists() and "netclasses" in res
+    uri = _rows(board.parent / "fp-lib-table")[NICK].uri
+    assert Path(uri.replace("${KIPRJMOD}", str(board.parent))).resolve() == (
+        world.project / "libs" / f"{NICK}.pretty").resolve()
+
+
+@pytest.mark.parametrize("make", [_design, _stock_only], ids=["libraries", "stock only"])
+def test_a_missing_output_directory_refuses_in_plain_words(
+        world: World, make: Callable[[], dict]) -> None:
+    out = world.root / "nowhere" / "board.kicad_pcb"
+    res = world.build(world.netlist(make()), out)
+    assert res["ok"] is False and world.runs == [], res
+    assert res["reason"] == f"output directory {out.parent} does not exist (nothing was built)"
+    assert not out.parent.exists()
+
+
 def test_the_mcp_tool_goes_through_the_library_handling(world: World) -> None:
     netlist = world.netlist(_design())
     res = bpt.build_board_from_netlist(str(netlist), 30, 20,
@@ -456,6 +498,29 @@ def _drc_lib_issues(cli: str, pcb: Path) -> list[str]:
             if v.get("type") == "lib_footprint_issues"]
 
 
+def _global_fp_nicknames(cli: str) -> set[str]:
+    """The nicknames in kicad-cli's GLOBAL fp-lib-table (<config>/<major>.<minor>/;
+    config = $KICAD_CONFIG_HOME, else %APPDATA%/kicad, ~/Library/Preferences/kicad
+    or $XDG_CONFIG_HOME|~/.config/kicad); empty when it is absent or unreadable."""
+    version = kicad_env.cli_version(Path(cli))
+    if version is None:
+        return set()
+    major, minor, _ = kicad_env.parse_version(version)
+    home = os.environ.get("KICAD_CONFIG_HOME")
+    if not home:
+        if sys.platform == "win32":
+            home = str(Path(os.environ.get("APPDATA", Path.home())) / "kicad")
+        elif sys.platform == "darwin":
+            home = str(Path.home() / "Library" / "Preferences" / "kicad")
+        else:
+            home = str(Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "kicad")
+    table = Path(home) / f"{major}.{minor}" / "fp-lib-table"
+    try:
+        return {r.name for r in lt.read_table(table).rows} if table.is_file() else set()
+    except (OSError, lt.LibTableError):
+        return set()
+
+
 def test_live_project_footprints_build_with_nicknames_and_drc_finds_their_library(
         tmp_path: Path) -> None:
     from fixtures.swig_python import require_kicad_python
@@ -484,11 +549,14 @@ def test_live_project_footprints_build_with_nicknames_and_drc_finds_their_librar
     if not cli:
         pytest.skip("no kicad-cli for the built board")
     # The project library resolves through the materialized fp-lib-table. Stock
-    # nicknames resolve through kicad-cli's GLOBAL table, which a bare container
-    # (Docker K10) lacks: there each stock library is reported, never the project
-    # one. On a configured install (KiCad 9 here) the list is empty.
+    # nicknames resolve through kicad-cli's GLOBAL table: on an install whose
+    # global table declares them all (KiCad 9 here) DRC reports no library issue
+    # at all; a bare container (Docker K10) has none, so there each stock library
+    # is reported, never the project one.
     stock = {n.split(":", 1)[0] for n in names} - {NICK}
     issues = _drc_lib_issues(cli, pcb)
+    if stock <= _global_fp_nicknames(cli):
+        assert issues == [], issues
     named = [_LIB_NAMED.search(d) for d in issues]
     assert all(m is not None and m.group(1) in stock for m in named), issues
     shutil.move(build_dir / "fp-lib-table", tmp_path / "fp-lib-table.moved")

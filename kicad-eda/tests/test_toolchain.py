@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Callable
@@ -452,6 +453,18 @@ def test_run_decodes_child_output_as_utf8_with_replacement() -> None:
     assert done.stdout == "µm Ω ✓�" and done.stderr == "Fehler: Größe"
 
 
+def test_importing_toolchain_leaves_kicad_ipc_and_sys_path_alone() -> None:
+    """The pipeline imports toolchain: that must not load kicad_ipc (which puts
+    the vendored kipy at the front of sys.path) or drc_guard (server/tools)."""
+    code = ("import sys; sys.path.insert(0, sys.argv[1]); before = list(sys.path); "
+            "import toolchain; "
+            "print([m for m in ('kicad_ipc', 'drc_guard', 'kipy') if m in sys.modules]); "
+            "print(sys.path == before)")
+    done = tc.run([sys.executable, "-c", code, str(tc.SERVER_DIR)], timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["[]", "True"]
+
+
 # ----------------------------------------------------------------------------
 # drc_counts delegates to drc_guard.run_drc: never a stale or half-run report
 # ----------------------------------------------------------------------------
@@ -461,14 +474,13 @@ def _fake_run(monkeypatch: pytest.MonkeyPatch, *, report: dict | None = None, rc
     the report existed when it started; writes `report` (None: nothing)."""
     seen: list[dict] = []
 
-    def fake(args: list[str], **kw):
+    def fake(args: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
         out = Path(args[args.index("-o") + 1])
         seen.append({"args": list(args), "timeout": kw.get("timeout"),
                      "report_existed": out.exists()})
         if report is not None:
             out.write_text(json.dumps(report), encoding="utf-8")
-        return _done(stdout) if not rc else type("R", (), {"returncode": rc, "stdout": stdout,
-                                                          "stderr": ""})()
+        return subprocess.CompletedProcess(args, rc, stdout, "")
 
     monkeypatch.setattr(tc, "run", fake)
     return seen
@@ -633,7 +645,7 @@ def test_keep_agent_copy_undoes_every_step_when_one_fails(tmp_path, monkeypatch,
     real = shutil.copy2
     calls: list[str] = []
 
-    def flaky(src, dst, **kw):
+    def flaky(src: str | Path, dst: str | Path, **kw: bool) -> object:
         calls.append(str(dst))
         if len(calls) == failing_copy:
             raise OSError("disk full")
@@ -643,3 +655,17 @@ def test_keep_agent_copy_undoes_every_step_when_one_fails(tmp_path, monkeypatch,
     with pytest.raises(OSError, match="disk full"):
         tc.keep_agent_copy(pcb, move=move)
     assert _listing(tmp_path) == before and not _sib(pcb, ".agent.1", ".kicad_pcb").exists()
+
+
+@pytest.mark.parametrize("move", [True, False])
+def test_keep_agent_copy_never_overwrites_what_squats_on_an_agent_name(tmp_path,
+                                                                     move: bool) -> None:
+    pcb = _k11_set(tmp_path)
+    tc.keep_agent_copy(pcb, move=False)                        # an older copy to rotate
+    _sib(pcb, ".agent", ".kicad_prl").unlink()
+    _sib(pcb, ".agent", ".kicad_prl").mkdir()                  # not a file: never rotated
+    before = _listing(tmp_path)
+    with pytest.raises(FileExistsError, match="agent.kicad_prl exists; refusing to overwrite"):
+        tc.keep_agent_copy(pcb, move=move)
+    assert _listing(tmp_path) == before and not _sib(pcb, ".agent.1", ".kicad_pcb").exists()
+    assert _sib(pcb, ".agent", ".kicad_prl").is_dir()

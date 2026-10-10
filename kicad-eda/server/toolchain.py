@@ -43,7 +43,6 @@ from pathlib import Path
 from types import ModuleType
 
 import kicad_env as env
-import kicad_ipc as ipc
 
 SERVER_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = SERVER_DIR / "tools"
@@ -725,8 +724,12 @@ def _lock_holder(pcb: str) -> str | None:
     if sessions is not None and sessions.holds(pcb):
         return ("a board API session of this server holds the board (close_board it, then "
                 "delete the lock if KiCad reports the project as locked)")
+    # imported here, not at the top: kicad_ipc puts the vendored kipy at the
+    # front of sys.path, which no importer of toolchain (the pipeline) asked for
+    import kicad_ipc as ipc
+    gui = ipc.connect()                 # one connection answers for the board and its project
     for path in (pcb, str(_sibling(pcb, "", PROJECT_EXT))):
-        kind = ipc.editor_holding(path)
+        kind = ipc.holding_kind(gui, path)
         if kind:
             return f"{Path(path).name} is open in KiCad {ipc.EDITOR_NAMES.get(kind, kind)}"
     return None

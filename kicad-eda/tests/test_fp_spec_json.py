@@ -11,6 +11,8 @@ Unit tier (venv only, no KiCad):
   * clear errors: unknown keys (with path, suggestion and allowed keys), missing
     and mistyped keys (bool is not a number), every problem at once, unknown
     templates, template ValueErrors wrapped, bad JSON text;
+  * limits: MAX_PADS pad entries, numbers that fit a finite double (no raw
+    OverflowError), and geometry inside KiCad's +/-2147.483647 mm range;
   * the input is never mutated (deep copy compared; read-only mappings work);
   * stdlib-only imports (KiCad 9's Python 3.11 can import it).
 Live tier: KiCad 9's bundled Python imports the module (skipped without it).
@@ -400,6 +402,68 @@ def test_pad_numbers_are_not_sizes():
 
 
 # ---------------------------------------------------------------------------
+# Number range: a JSON number must fit a finite double (RFC 7493 I-JSON)
+# ---------------------------------------------------------------------------
+_BIG = 10 ** 400                                   # an exact JSON integer no double can hold
+_RANGE = "is outside the JSON double range (finite, |x| <= 1.8e+308)"
+_EDGE = {"side": "L", "at": 0, "positions": [0], "first": 1, "length": 1, "width": 0.5}
+
+
+@pytest.mark.parametrize(("template", "params", "msg"), [
+    ("sop", {**soic8_json(), "pitch": _BIG}, f"sop: params.pitch: number about 1e400 {_RANGE}"),
+    ("sop", {**soic8_json(), "pins": _BIG}, f"params.pins: number about 1e400 {_RANGE}"),
+    ("sop", {**soic8_json(), "body": {"w": 3.9, "h": -_BIG}},
+     f"params.body.h: number about -1e400 {_RANGE}"),
+    ("lga_grid", {"name": "E", "body": {"w": 3, "h": 3}, "edge_rows": [{**_EDGE, "first": _BIG}]},
+     f"params.edge_rows[0].first: number about 1e400 {_RANGE}"),
+    ("sop", {**soic8_json(), "pin1": _BIG}, f"params.pin1: number about 1e400 {_RANGE}"),
+    ("sop", {**soic8_json(), "name": _BIG},
+     "params.name: expected a string, got number about 1e400"),
+    ("sop", {**soic8_json(), "pins": 10 ** 5000},          # past Python's 4300-digit str() limit
+     f"params.pins: number about 1e5000 {_RANGE}"),
+    ("sop", {**soic8_json(), "pins": 10 ** 300}, "params.pins: must be <= 10000, got about 1e300"),
+    ("sop", json.dumps({**soic8_json(), "pitch": _BIG}),
+     f"params.pitch: number about 1e400 {_RANGE}"),
+    ("sop", json.dumps({**soic8_json(), "pitch": float("inf")}),
+     f"params.pitch: number Infinity {_RANGE}"),
+    ("sop", json.dumps({**soic8_json(), "span": float("nan")}),
+     f"params.span: number NaN {_RANGE}"),
+    ("sop", '{"pins": ' + "9" * 5000 + "}", "sop: params is not valid JSON"),
+], ids=["pitch", "pins", "negative", "first", "pin1", "string-field", "5000-digits", "size",
+        "text-int", "text-inf", "text-nan", "text-5000-digits"])
+def test_numbers_beyond_a_double_are_named(template, params, msg):
+    with pytest.raises(fj.FpSpecJsonError) as err:
+        fj.spec_from_json(template, params)
+    assert msg in str(err.value), str(err.value)
+    assert len(str(err.value)) < 400                     # the long number is not printed
+
+
+# ---------------------------------------------------------------------------
+# Geometry range: pads, body and courtyard fit KiCad's int32-nanometre space
+# ---------------------------------------------------------------------------
+_REACH = "from the origin, beyond KiCad's coordinate range of +/-2147.483647 mm"
+
+
+@pytest.mark.parametrize(("template", "params", "msg"), [
+    ("sop", {**soic8_json(), "pitch": 1e300}, f"sop: pad '1' reaches 1.5e+300 mm {_REACH}"),
+    ("sop", {**soic8_json(), "span": 1e300}, f"pad '1' reaches 5e+299 mm {_REACH}"),
+    ("sop", {**soic8_json(), "body": {"w": 5000, "h": 4.9}}, f"body reaches 2500.25 mm {_REACH}"),
+    ("sop", {**soic8_json(), "courtyard_excess": 3000}, "(courtyard included; 9 item(s) beyond)"),
+    ("pin_header", {"name": "H", "rows": 2, "pitch": 1e308}, f"reaches inf mm {_REACH}"),
+], ids=["pitch", "span", "body", "courtyard", "overflow-to-inf"])
+def test_geometry_beyond_kicads_coordinate_range_is_refused(template, params, msg):
+    with pytest.raises(fj.FpSpecJsonError) as err:
+        fj.spec_from_json(template, params)
+    assert msg in str(err.value), str(err.value)
+
+
+def test_a_large_footprint_inside_the_coordinate_range_builds():
+    assert fj.KICAD_MAX_MM == 2147.483647
+    spec = fj.spec_from_json("sop", {**soic8_json(), "span": 4000})
+    assert len(spec.pads) == 8 and max(abs(p.x) for p in spec.pads) < fj.KICAD_MAX_MM
+
+
+# ---------------------------------------------------------------------------
 # Never mutates its input
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(("template", "params"), [
@@ -423,8 +487,8 @@ def test_read_only_mappings_are_accepted():
 # ---------------------------------------------------------------------------
 # Importable by KiCad's bundled Python (stdlib only, 3.11)
 # ---------------------------------------------------------------------------
-STDLIB_OK = {"__future__", "difflib", "json", "math", "typing", "dataclasses", "collections",
-             "fp_author_templates"}
+STDLIB_OK = {"__future__", "difflib", "json", "math", "sys", "typing", "dataclasses",
+             "collections", "fp_author_templates"}
 
 
 def test_imports_are_stdlib_plus_fp_author_templates_only():

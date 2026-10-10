@@ -17,6 +17,8 @@ builder the library map (a temp *.json, deleted afterwards) as argv[3]. When
 no block or project table declares a footprint library, argv[3] stays the
 stock footprints directory (dir mode, as before). Every spawned build reports
 ``libraries`` (project_libs.sources) and ``library_tables`` (files written).
+Relative netlist / board paths (the harness passes them as given) work the
+same; a board directory that does not exist is refused before anything else.
 
 toolchain and kicad_ipc are imported AS MODULES and their functions looked up
 at call time, so tests that monkeypatch tc.run / ipc.write_guard reach this
@@ -55,6 +57,9 @@ def build(netlist: str, board_w: float, board_h: float,
     if not script.is_file():
         return {"ok": False, "reason": f"missing {script}"}
     out = out_pcb or str(Path(netlist).with_suffix(".kicad_pcb"))
+    if not Path(out).parent.is_dir():           # the builder never creates it
+        return {"ok": False, "reason": f"output directory {Path(out).parent} does not exist "
+                                       f"(nothing was built)"}
     fps = tc.footprints_dir(footprints_dir)
     if not fps:
         return {"ok": False, "reason": "footprints_dir not given and KiCad share dir not found"}
@@ -114,8 +119,11 @@ def materialize_libraries(libs: project_libs.ProjectLibs, design: dict, out_pcb:
     sym-lib-table / fp-lib-table (managed rows; stale ones are cleared) and,
     ``with_project``, write a minimal <stem>.kicad_pro when none exists, so
     kicad-cli reads those tables. The paths written, or the refusal envelope
-    (a clashing row in the board directory's table, an unwritable file)."""
-    pro = Path(out_pcb).with_suffix(".kicad_pro") if with_project else None
+    (a clashing row in the board directory's table, an unwritable file).
+    The project file goes by NAME: project_libs.materialize puts a relative
+    kicad_pro in the (absolute) board directory, so a relative ``out_pcb``
+    such as ``proj/netlist.kicad_pcb`` must not repeat its directory."""
+    pro = Path(out_pcb).with_suffix(".kicad_pro").name if with_project else None
     try:
         return project_libs.materialize(libs, design, Path(out_pcb).parent, kicad_pro=pro)
     except (ValueError, OSError) as e:          # libtable.LibTableError is a ValueError

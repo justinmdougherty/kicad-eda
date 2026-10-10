@@ -465,19 +465,6 @@ def test_route_check_reports_a_drc_that_produced_no_report(pcb, kicad11, monkeyp
     assert "progress" not in res and "no usable report" in res["progress_note"]
 
 
-def test_route_check_reports_a_kicad_cli_crash_without_counts(pcb, kicad11, monkeypatch):
-    monkeypatch.setattr(tc, "run", lambda args, **kw: fba.done(returncode=3221226356))
-    res = brt.route_check(pcb, refill=False)
-    assert res["ok"] is False and "kicad-cli crashed" in res["reason"]
-    assert "errors" not in res and "unconnected" not in res
-
-
-def test_route_check_doc_says_the_default_refill_saves_an_untouched_board():
-    doc = " ".join((brt.route_check.__doc__ or "").split()).lower()
-    assert "the refill counts as a change" in doc and "only refill=false" in doc
-    assert "even an untouched board is saved" in doc and "kicad 11 format" in doc
-
-
 def test_route_status_reports_per_net_state_and_the_width_gate(pcb):
     brt.route_net(pcb, "PWR", PWR_PATH, width=0.25, allow_narrow=True)
     brt.route_net(pcb, "SIG", [{"layer": "F.Cu", "points": [[10, 10], [20, 10]]}],

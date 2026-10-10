@@ -5,45 +5,48 @@ drive it, so these tests call them over the fake BoardApi of
 tests/fixtures/fake_board_api.py (no KiCad needed). Covers the pre-KiCad-11
 snapshot hook (first KiCad 11 save, KiCad 11 GUI open, a failed copy refuses
 the save), route_check's stall detection (rounds, best score, the stall
-verdict on counted AND uncounted rounds, a DRC that wrote nothing is never a
-round), the history surviving a reopen and restarting after a rewrite, and the
-compatibility names board_route_tools keeps for the registry.
+verdict on counted AND uncounted rounds, a DRC that wrote nothing or crashed
+is never a round, the docstring's refill/save rule), the history surviving a
+reopen and restarting after a rewrite, and the compatibility names
+board_route_tools keeps for the registry.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 import board_route_tools as brt
 import board_sessions as bs
+import kicad_env as env
 import toolchain as tc
 from fixtures import fake_board_api as fba
 from fixtures.fake_board_api import KICAD9_HEADER, KICAD11_HEADER, PWR_PATH, SIG_PATH
 
 
 @pytest.fixture(autouse=True)
-def fake_api(monkeypatch) -> type[fba.FakeBoardApi]:
+def fake_api(monkeypatch: pytest.MonkeyPatch) -> type[fba.FakeBoardApi]:
     """The board tools run over FakeBoardApi with an empty registry."""
     return fba.install(monkeypatch)
 
 
 @pytest.fixture
-def pcb(tmp_path) -> str:
+def pcb(tmp_path: Path) -> str:
     return fba.board_file(tmp_path)
 
 
 @pytest.fixture
-def kicad11(monkeypatch, tmp_path):
+def kicad11(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> env.KiCadInstall:
     """The only install: a 10.99 nightly (kicad-cli 11 reads the KiCad 11 file)."""
     return fba.kicad11(monkeypatch, tmp_path)
 
 
-def _done():
+def _done() -> subprocess.CompletedProcess:
     return fba.done()
 
 
-def _drc_writer(monkeypatch, report: dict) -> list[list[str]]:
+def _drc_writer(monkeypatch: pytest.MonkeyPatch, report: dict) -> list[list[str]]:
     return fba.drc_writer(monkeypatch, report)
 
 
@@ -55,7 +58,7 @@ def _api() -> fba.FakeBoardApi:
 # the pre-KiCad-11 snapshot (ROADMAP D5)
 # ============================================================================
 @pytest.fixture
-def k9_pcb(tmp_path) -> str:
+def k9_pcb(tmp_path: Path) -> str:
     """A board built by KiCad 9's pcbnew, with its project: what agent routing gets."""
     path = tmp_path / "board.kicad_pcb"
     path.write_text(KICAD9_HEADER, encoding="utf-8")
@@ -65,14 +68,14 @@ def k9_pcb(tmp_path) -> str:
 
 
 @pytest.fixture
-def k9_gui(tmp_path) -> str:
+def k9_gui(tmp_path: Path) -> str:
     """A KiCad 9-format board the (fake) running GUI has open."""
     path = tmp_path / "gui.kicad_pcb"
     path.write_text(KICAD9_HEADER, encoding="utf-8")
     return str(path)
 
 
-def _taken(monkeypatch) -> list[str]:
+def _taken(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Every toolchain.take_snapshot call (the real copy still runs)."""
     taken: list[str] = []
     real = tc.take_snapshot
@@ -80,11 +83,11 @@ def _taken(monkeypatch) -> list[str]:
     return taken
 
 
-def _clean_drc(monkeypatch) -> None:
+def _clean_drc(monkeypatch: pytest.MonkeyPatch) -> None:
     _drc_writer(monkeypatch, {"violations": [], "unconnected_items": []})
 
 
-def test_first_headless_save_snapshots_once_before_writing(k9_pcb, kicad11, monkeypatch):
+def test_first_headless_save_snapshots_once_before_writing(k9_pcb, kicad11, monkeypatch) -> None:
     taken = _taken(monkeypatch)
     _clean_drc(monkeypatch)
     snap = tc.pre_k11_snapshot_path(k9_pcb)
@@ -108,7 +111,7 @@ def test_first_headless_save_snapshots_once_before_writing(k9_pcb, kicad11, monk
 
 
 def test_save_board_and_close_board_snapshot_an_untouched_kicad9_file(k9_pcb, tmp_path,
-                                                                      monkeypatch):
+                                                                      monkeypatch) -> None:
     taken = _taken(monkeypatch)
     brt.open_board(k9_pcb)
     saved = brt.save_board(k9_pcb)                          # save_board always writes
@@ -122,7 +125,7 @@ def test_save_board_and_close_board_snapshot_an_untouched_kicad9_file(k9_pcb, tm
     assert taken == [k9_pcb, str(other)]
 
 
-def test_kicad11_gui_open_snapshots_and_later_saves_do_not(k9_gui, monkeypatch):
+def test_kicad11_gui_open_snapshots_and_later_saves_do_not(k9_gui, monkeypatch) -> None:
     taken = _taken(monkeypatch)
     opened = brt.open_board(k9_gui)                         # the user may Ctrl+S at any time
     snap = tc.pre_k11_snapshot_path(k9_gui)
@@ -136,7 +139,7 @@ def test_kicad11_gui_open_snapshots_and_later_saves_do_not(k9_gui, monkeypatch):
     assert again["ok"] and "pre_k11_snapshot_taken" not in again and taken == [k9_gui]
 
 
-def test_kicad9_sessions_never_snapshot(k9_gui, k9_pcb, kicad11, monkeypatch):
+def test_kicad9_sessions_never_snapshot(k9_gui, k9_pcb, kicad11, monkeypatch) -> None:
     fba.FakeBoardApi.version = "9.0.4"
     taken = _taken(monkeypatch)
     _clean_drc(monkeypatch)
@@ -147,7 +150,7 @@ def test_kicad9_sessions_never_snapshot(k9_gui, k9_pcb, kicad11, monkeypatch):
     assert taken == [] and Path(k9_pcb).read_text(encoding="utf-8") == KICAD9_HEADER
 
 
-def test_a_failed_snapshot_refuses_the_save(k9_pcb, kicad11, monkeypatch):
+def test_a_failed_snapshot_refuses_the_save(k9_pcb, kicad11, monkeypatch) -> None:
     def full(path: str) -> dict:
         raise OSError("No space left on device")
 
@@ -162,7 +165,7 @@ def test_a_failed_snapshot_refuses_the_save(k9_pcb, kicad11, monkeypatch):
     assert Path(k9_pcb).read_text(encoding="utf-8") == KICAD9_HEADER
 
 
-def test_a_failed_snapshot_at_gui_open_refuses_the_session(k9_gui, monkeypatch, fake_api):
+def test_a_failed_snapshot_at_gui_open_refuses_the_session(k9_gui, monkeypatch, fake_api) -> None:
     def denied(path: str) -> dict:
         raise PermissionError("access denied")
 
@@ -173,7 +176,7 @@ def test_a_failed_snapshot_at_gui_open_refuses_the_session(k9_gui, monkeypatch, 
     assert fake_api.opened[0].closed and brt.list_open_boards()["boards"] == []
 
 
-def test_the_snapshot_path_is_reported_by_the_read_and_list_tools(k9_pcb, monkeypatch):
+def test_the_snapshot_path_is_reported_by_the_read_and_list_tools(k9_pcb, monkeypatch) -> None:
     brt.open_board(k9_pcb)
     assert "pre_k11_snapshot" not in brt.board_overview(k9_pcb)
     brt.save_board(k9_pcb)
@@ -187,17 +190,18 @@ def test_the_snapshot_path_is_reported_by_the_read_and_list_tools(k9_pcb, monkey
 # ============================================================================
 # route_check stall detection (ROADMAP D5)
 # ============================================================================
-def _round(monkeypatch, pcb: str, errors: int, unconnected: int, **kw) -> dict:
+def _round(monkeypatch: pytest.MonkeyPatch, pcb: str, errors: int, unconnected: int,
+           **kw: bool) -> dict:
     fba.drc_round(monkeypatch, errors, unconnected)
     return brt.route_check(pcb, **kw)
 
 
-def _no_report(monkeypatch) -> None:
+def _no_report(monkeypatch: pytest.MonkeyPatch) -> None:
     """The next kicad-cli DRC exits 0 and writes nothing."""
     monkeypatch.setattr(tc, "run", lambda args, **kw: _done())
 
 
-def test_route_check_tracks_progress_and_flags_a_stall(pcb, kicad11, monkeypatch):
+def test_route_check_tracks_progress_and_flags_a_stall(pcb, kicad11, monkeypatch) -> None:
     first = _round(monkeypatch, pcb, 3, 2)
     assert first["progress"] == {"rounds": 1, "score": 5, "best": 5,
                                  "rounds_without_improvement": 0}
@@ -217,13 +221,13 @@ def test_route_check_tracks_progress_and_flags_a_stall(pcb, kicad11, monkeypatch
     assert better["progress"]["rounds_without_improvement"] == 0
 
 
-def test_a_clean_board_is_never_stalled(pcb, kicad11, monkeypatch):
+def test_a_clean_board_is_never_stalled(pcb, kicad11, monkeypatch) -> None:
     rounds = [_round(monkeypatch, pcb, 0, 0) for _ in range(5)]
     assert rounds[-1]["progress"]["rounds_without_improvement"] == 4
     assert rounds[-1]["ok"] is True and not any(r["stalled"] for r in rounds)
 
 
-def test_rounds_that_judged_a_stale_file_do_not_count(pcb, kicad11, monkeypatch):
+def test_rounds_that_judged_a_stale_file_do_not_count(pcb, kicad11, monkeypatch) -> None:
     brt.route_net(pcb, "SIG", SIG_PATH)                      # unsaved copper, no history yet
     first = _round(monkeypatch, pcb, 2, 0, refill=False, save=False)
     assert "progress" not in first and "stalled" not in first
@@ -239,7 +243,7 @@ def test_rounds_that_judged_a_stale_file_do_not_count(pcb, kicad11, monkeypatch)
 
 
 def test_a_drc_that_writes_nothing_is_no_round_even_beside_an_old_report(pcb, kicad11,
-                                                                         monkeypatch):
+                                                                         monkeypatch) -> None:
     assert _round(monkeypatch, pcb, 2, 0)["progress"]["rounds"] == 1
     report = Path(pcb).with_name("board_drc.json")           # the last round's report stays
     assert report.is_file()
@@ -251,7 +255,21 @@ def test_a_drc_that_writes_nothing_is_no_round_even_beside_an_old_report(pcb, ki
     assert _round(monkeypatch, pcb, 2, 0)["progress"]["rounds"] == 2
 
 
-def test_an_uncounted_round_still_reports_the_stall(pcb, kicad11, monkeypatch):
+def test_route_check_reports_a_kicad_cli_crash_without_counts(pcb, kicad11, monkeypatch) -> None:
+    monkeypatch.setattr(tc, "run", lambda args, **kw: fba.done(returncode=3221226356))
+    res = brt.route_check(pcb, refill=False)
+    assert res["ok"] is False and "kicad-cli crashed" in res["reason"]
+    assert "errors" not in res and "unconnected" not in res
+    assert "no usable report" in res["progress_note"] and bs._key(pcb) not in bs._PROGRESS
+
+
+def test_route_check_doc_says_the_default_refill_saves_an_untouched_board() -> None:
+    doc = " ".join((brt.route_check.__doc__ or "").split()).lower()
+    assert "the refill counts as a change" in doc and "only refill=false" in doc
+    assert "even an untouched board is saved" in doc and "kicad 11 format" in doc
+
+
+def test_an_uncounted_round_still_reports_the_stall(pcb, kicad11, monkeypatch) -> None:
     for _ in range(4):
         last = _round(monkeypatch, pcb, 3, 1)
     assert last["stalled"] is True
@@ -270,7 +288,7 @@ def test_an_uncounted_round_still_reports_the_stall(pcb, kicad11, monkeypatch):
 
 
 def test_progress_survives_a_reopen_and_restarts_after_a_rewrite(pcb, tmp_path, kicad11,
-                                                                 monkeypatch):
+                                                                 monkeypatch) -> None:
     for _ in range(4):
         last = _round(monkeypatch, pcb, 1, 1)
     assert last["stalled"] is True
@@ -284,13 +302,13 @@ def test_progress_survives_a_reopen_and_restarts_after_a_rewrite(pcb, tmp_path, 
 # ============================================================================
 # the registry module and the names board_route_tools keeps for it
 # ============================================================================
-def test_board_route_tools_reexports_the_session_entry_points():
+def test_board_route_tools_reexports_the_session_entry_points() -> None:
     assert brt.release_for_rewrite is bs.release_for_rewrite
     assert brt.close_all is bs.close_all and brt.status is bs.status
     assert brt._key is bs._key
 
 
-def test_the_old_registry_names_read_and_rebind_board_sessions(pcb):
+def test_the_old_registry_names_read_and_rebind_board_sessions(pcb) -> None:
     """Tests written before the split monkeypatch board_route_tools._BOARDS /
     _PROGRESS: both names are board_sessions' registry, read and rebound."""
     assert brt._BOARDS is bs._BOARDS and brt._PROGRESS is bs._PROGRESS
@@ -306,7 +324,7 @@ def test_the_old_registry_names_read_and_rebind_board_sessions(pcb):
     assert "_BOARDS" not in vars(brt) and "_PROGRESS" not in vars(brt)
 
 
-def test_holds_names_only_a_registered_board(pcb, tmp_path):
+def test_holds_names_only_a_registered_board(pcb, tmp_path) -> None:
     assert bs.holds(pcb) is False
     brt.open_board(pcb)
     assert bs.holds(pcb) is True and bs.holds(str(Path(pcb).parent / "." / "board.kicad_pcb"))

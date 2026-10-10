@@ -1,15 +1,15 @@
 """mechanical_tools: the F3 MCP surface (ROADMAP D2/D3) and tools/mech_export.py.
 
-Pure unit tier (.venv): toolchain.run / board_cli are faked, so no KiCad is
-discovered or run. A fake kicad-cli writes what the real one would (a DXF from
-dxf_io, a tiny STEP, a pos CSV) at the ``-o`` path, and every command line is
-asserted exactly. DXFs come from tests/fixtures/dxf_builders.py and dxf_io;
-the reference board is a handwritten .kicad_pcb with the T10 outline drawn at
-an offset and its aux origin on the datum (10, 30).
+Pure unit tier (.venv): toolchain.run / board_cli are faked, so no KiCad is discovered or
+run. A fake kicad-cli writes what the real one would (a DXF from dxf_io, a tiny STEP, a pos
+CSV) at the ``-o`` path, and every command line is asserted exactly. DXFs come from
+tests/fixtures/dxf_builders.py and dxf_io; the reference board is a handwritten .kicad_pcb
+with the T10 outline drawn at an offset and its aux origin on the datum (10, 30).
 """
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -92,10 +92,8 @@ def no_kicad(monkeypatch) -> None:
     monkeypatch.setattr(tc, "board_cli", lambda pcb="": CLI)
     monkeypatch.setattr(tc, "board_cli_note", lambda pcb="": None)
 
-    def no_run(*_a, **_k):
-        raise AssertionError("tc.run called without a FakeCli")
-
-    monkeypatch.setattr(tc, "run", no_run)
+    monkeypatch.setattr(tc, "run", lambda *_a, **_k: _raise(AssertionError("tc.run called "
+                                                                           "without a FakeCli")))
 
 
 def _cli(monkeypatch, **kw) -> FakeCli:
@@ -182,6 +180,10 @@ def _read(path: Path) -> dict:
 
 def _part(design: dict, ref: str) -> dict:
     return next(c for c in design["components"] if c["ref"] == ref)
+
+
+def _raise(exc: Exception):
+    raise exc
 
 
 # --- registry -----------------------------------------------------------------------------
@@ -273,11 +275,8 @@ def test_import_reads_parts_from_a_json_file_or_text(form, tmp_path):
     _t10_dxf(tmp_path / "t10.dxf")
     netlist = _netlist(tmp_path)
     parts = {"J1": [-5, 5], "U1": [0, -5, 45]}               # [x, y] keeps the current rot
-    if form == "file":
-        (tmp_path / "parts.json").write_text(json.dumps(parts), encoding="utf-8")
-        arg = "parts.json"
-    else:
-        arg = json.dumps(parts)
+    (tmp_path / "parts.json").write_text(json.dumps(parts), encoding="utf-8")
+    arg = "parts.json" if form == "file" else json.dumps(parts)
     res = mt.import_outline_dxf(str(netlist), "t10.dxf", mode="embed", parts=arg)
     assert res["ok"] is True, res
     design = _read(netlist)
@@ -329,11 +328,7 @@ def test_import_write_is_atomic(tmp_path, monkeypatch):
     _t10_dxf(tmp_path / "t10.dxf")
     netlist = _netlist(tmp_path)
     before = netlist.read_bytes()
-
-    def broken_replace(src, dst):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(mt.os, "replace", broken_replace)
+    monkeypatch.setattr(mt.os, "replace", lambda src, dst: _raise(OSError("disk full")))
     res = mt.import_outline_dxf(str(netlist), "t10.dxf", backup=False)
     assert res["ok"] is False and "disk full" in res["reason"]
     assert netlist.read_bytes() == before
@@ -342,8 +337,7 @@ def test_import_write_is_atomic(tmp_path, monkeypatch):
 
 def test_import_refuses_a_netlist_that_is_not_a_json_object(tmp_path):
     _t10_dxf(tmp_path / "t10.dxf")
-    netlist = tmp_path / "netlist.json"
-    netlist.write_text("[1, 2", encoding="utf-8")
+    (netlist := tmp_path / "netlist.json").write_text("[1, 2", encoding="utf-8")
     res = mt.import_outline_dxf(str(netlist), "t10.dxf")
     assert res["ok"] is False and "JSON" in res["reason"]
 
@@ -368,8 +362,7 @@ def test_write_outline_dxf_defaults_the_datum_to_the_bbox_bottom_left(tmp_path):
 
 
 def test_write_outline_dxf_needs_a_board_block(tmp_path):
-    netlist = _netlist(tmp_path, {})
-    res = mt.write_outline_dxf(str(netlist), str(tmp_path / "o.dxf"))
+    res = mt.write_outline_dxf(str(_netlist(tmp_path, {})), str(tmp_path / "o.dxf"))
     assert res["ok"] is False and "board" in res["reason"]
 
 
@@ -495,6 +488,61 @@ def test_export_pos_datum_of_an_empty_board_has_no_rows(monkeypatch, t10_pcb):
     assert res["ok"] is True and res["rows"] == 0
 
 
+# --- run_cli: only a file this run wrote counts; the previous one comes back on failure -------
+def _job(out: Path, text: str | None, rc: int = 0, log: str = "Done.\n", stamp=None):
+    def run(args: list[str], **kw) -> subprocess.CompletedProcess:
+        if text is not None:
+            out.write_text(text, encoding="utf-8")
+        if stamp is not None:                       # a coarse (FAT) clock: same tick, same size
+            os.utime(out, ns=stamp)
+        return subprocess.CompletedProcess(args, rc, log, "")
+    return run
+
+
+def test_run_cli_trusts_a_same_size_rewrite_within_one_mtime_tick(tmp_path):
+    (out := tmp_path / "o.dxf").write_text("same", encoding="utf-8")
+    st = out.stat()
+    run = mx.run_cli(_job(out, "same", stamp=(st.st_atime_ns, st.st_mtime_ns)), [CLI], out, "DXF")
+    assert run.ok, run.reason
+    assert [p.name for p in tmp_path.iterdir()] == ["o.dxf"]
+
+
+@pytest.mark.parametrize("text, rc, log", [(None, 0, "Done.\n"), ("partial", 0, "Error: x\n"),
+                                           ("partial", 2, ""), ("", 0, "")])
+def test_run_cli_failure_puts_the_previous_file_back(text, rc, log, tmp_path):
+    (out := tmp_path / "o.dxf").write_text("previous", encoding="utf-8")
+    run = mx.run_cli(_job(out, text, rc, log), [CLI], out, "DXF")
+    assert not run.ok and out.read_text(encoding="utf-8") == "previous"
+    assert [p.name for p in tmp_path.iterdir()] == ["o.dxf"]
+
+
+def test_run_cli_puts_the_previous_file_back_when_the_runner_raises(tmp_path):
+    (out := tmp_path / "o.dxf").write_text("previous", encoding="utf-8")
+    with pytest.raises(ValueError, match="embedded null"):
+        mx.run_cli(lambda *_a, **_k: _raise(ValueError("embedded null")), [CLI], out, "DXF")
+    assert out.read_text(encoding="utf-8") == "previous"
+    assert [p.name for p in tmp_path.iterdir()] == ["o.dxf"]
+
+
+@pytest.mark.parametrize("target, name, ok", [(os, "replace", False), (Path, "unlink", True)])
+def test_run_cli_reports_a_previous_file_it_cannot_move(target, name, ok, monkeypatch, tmp_path):
+    (out := tmp_path / "o.dxf").write_text("previous", encoding="utf-8")
+    monkeypatch.setattr(target, name, lambda *_a, **_k: _raise(OSError("locked")))
+    run = mx.run_cli(_job(out, "new"), [CLI], out, "DXF")
+    assert run.ok is ok and "locked" in (run.reason or "".join(run.warnings)), run
+    assert out.read_text(encoding="utf-8") == ("new" if ok else "previous")
+
+
+@pytest.mark.parametrize("out, why", [("t10.kicad_pcb", "board itself"), (".", "directory")])
+@pytest.mark.parametrize("export", [mt.export_outline_dxf, mt.export_step, mt.export_pos_datum])
+def test_an_export_never_writes_over_its_board_or_a_folder(export, out, why, monkeypatch, t10_pcb):
+    fake = _cli(monkeypatch, write=lambda out: out.write_text("junk", encoding="utf-8"))
+    before = t10_pcb.read_bytes()
+    res = export(str(t10_pcb), out)
+    assert res["ok"] is False and why in res["reason"] and fake.jobs == [], res
+    assert t10_pcb.read_bytes() == before
+
+
 # --- mech_export.step_bbox ------------------------------------------------------------------
 def test_step_bbox_uses_the_brep_vertices_not_every_point(tmp_path):
     path = tmp_path / "tiny.step"
@@ -549,10 +597,8 @@ def test_step_bbox_skips_a_circle_edge_with_unresolved_references(tmp_path):
 
 
 def test_step_bbox_of_a_full_circle_edge(tmp_path):
-    text = ARC_STEP.format(sense=".T.").replace("#30 = EDGE_CURVE('',#21,#23,",
-                                                "#30 = EDGE_CURVE('',#21,#21,")
-    path = tmp_path / "circle.step"
-    path.write_text(text, encoding="utf-8")
+    (path := tmp_path / "circle.step").write_text(ARC_STEP.format(sense=".T.").replace(
+        "#30 = EDGE_CURVE('',#21,#23,", "#30 = EDGE_CURVE('',#21,#21,"), encoding="utf-8")
     box = mx.step_bbox(path)
     assert box["x"] == pytest.approx([-5, 5]) and box["y"] == pytest.approx([-5, 5])
 
@@ -657,10 +703,12 @@ def test_validate_checks_fixed_parts_against_the_outline(part, code, severity, t
         assert "board frame" in found[0]["message"]
 
 
-def test_validate_default_corner_holes_need_positions_on_a_shaped_outline(tmp_path):
-    netlist = _netlist(tmp_path, dict(T10_BOARD), mounting_holes=True)
-    res = mt.validate_board_outline(str(netlist))
-    assert res["ok"] is False and "mounting_holes_positions" in _codes(res["errors"])
+@pytest.mark.parametrize("board, source", [(T10_BOARD, "loop"), ({"w": 60, "h": 40}, "rect")])
+def test_validate_default_corner_holes_need_a_rectangular_board(board, source, tmp_path):
+    res = mt.validate_board_outline(str(_netlist(tmp_path, dict(board), mounting_holes=True)))
+    rect = source == "rect"                      # a shaped outline needs explicit positions
+    assert res["ok"] is rect and res["source"] == source, res
+    assert ("mounting_holes_positions" in _codes(res["errors"])) is not rect
 
 
 def test_validate_mounting_holes_use_the_drill_circle(tmp_path):
@@ -669,12 +717,6 @@ def test_validate_mounting_holes_use_the_drill_circle(tmp_path):
     res = mt.validate_board_outline(str(netlist))
     issues = res["errors"] + res["warnings"]
     assert _codes(issues) == ["hole_edge"] and "2.2" in issues[0]["message"], issues
-
-
-def test_validate_rect_board_default_corner_holes_are_fine(tmp_path):
-    netlist = _netlist(tmp_path, {"w": 60, "h": 40}, mounting_holes=True)
-    res = mt.validate_board_outline(str(netlist))
-    assert res["ok"] is True and res["source"] == "rect", res
 
 
 def test_validate_reports_an_unresolvable_outline(tmp_path):
@@ -699,8 +741,7 @@ def test_validate_reports_fab_issues_and_dxf_warnings(tmp_path):
 
 
 def test_validate_without_a_board_block_is_ok_with_a_warning(tmp_path):
-    netlist = _netlist(tmp_path, {})
-    res = mt.validate_board_outline(str(netlist))
+    res = mt.validate_board_outline(str(_netlist(tmp_path, {})))
     assert res["ok"] is True and res["source"] == "none"
     assert _codes(res["warnings"]) == ["no_board_outline"]
 
@@ -750,10 +791,8 @@ def test_components_with_odd_refs_do_not_break_the_tools(tmp_path):
 
 
 def test_an_unexpected_type_error_is_still_not_ok(monkeypatch, tmp_path):
-    def boom(*_a, **_k):
-        raise TypeError("'int' object is not iterable")
-
-    monkeypatch.setattr(mx, "part_issues", boom)
+    monkeypatch.setattr(mx, "part_issues",
+                        lambda *_a, **_k: _raise(TypeError("'int' object is not iterable")))
     res = mt.validate_board_outline(str(_netlist(tmp_path, dict(T10_BOARD))))
     assert res["ok"] is False and res["reason"].startswith("malformed"), res
     assert "not iterable" in res["reason"]

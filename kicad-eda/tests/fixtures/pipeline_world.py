@@ -80,9 +80,18 @@ class World:
     """Scripted stand-ins for every external call run() makes. Each field is a
     list of results consumed one per call (the last repeats); `calls` records
     (name, args) in call order; `route_kw` records the keyword arguments of
-    every autoroute call (later harness modes pass dsn_seed / from_snapshot),
-    `route_args` its positional arguments; `lint_kw` / `analyze_kw` / `emc_extra`
-    what the feature hooks lint_kwargs / analysis_kwargs / emc_args added."""
+    every autoroute call (the near-miss alternates pass dsn_seed, later modes
+    from_snapshot; route_seeds() lists the dsn_seed of every call, 0 when not
+    passed), `route_args` its positional arguments; `lint_kw` / `analyze_kw` /
+    `emc_extra` what the feature hooks lint_kwargs / analysis_kwargs / emc_args
+    added. `routes_by_seed[s]`, when set, scripts the routes of dsn_seed s
+    instead of `routes`.
+
+    The fakes touch the board file the way the real tools do, so a test can
+    compare its bytes: a build writes "(built <scale>)", a route appends
+    "(routed)" ("(routed seed <s>)" for dsn_seed s > 0), a board fix that
+    applied something (not only 'OPEN:' findings) appends "(fixed <mode>)",
+    and a successful EMC stitch appends "(stitched)"."""
 
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self.dir = tmp_path
@@ -102,6 +111,7 @@ class World:
         self.thermal = [{"blockers": [], "warnings": []}]
         self.builds = [dict(OK_BUILD)]
         self.routes: list[Any] = [{"ok": True, "tracks": 7, "unconnected": 0}]
+        self.routes_by_seed: dict[int, list[Any]] = {}
         self.drcs = [CLEAN_DRC]
         self.gate_checks: dict[str, list] = {}
         self.fixes: dict[str, list] = {}
@@ -126,6 +136,10 @@ class World:
 
     def names(self) -> list[str]:
         return [name for name, _ in self.calls]
+
+    def route_seeds(self) -> list[int]:
+        """The dsn_seed of every autoroute call in order (0 when not passed)."""
+        return [kw.get("dsn_seed", 0) for kw in self.route_kw]
 
     def args_of(self, name: str) -> list[tuple]:
         return [args for n, args in self.calls if n == name]
@@ -186,11 +200,12 @@ class World:
         self._rec("route", passes, timeout)
         self.route_kw.append(dict(kw))
         self.route_args.append((pcb, passes, jar, timeout))
-        res = _next(self.routes)
+        seed = kw.get("dsn_seed", 0)
+        res = _next(self.routes_by_seed.get(seed) or self.routes)
         if isinstance(res, Exception):
             raise res
         with open(pcb, "a", encoding="utf-8") as f:
-            f.write("(routed)\n")
+            f.write(f"(routed seed {seed})\n" if seed else "(routed)\n")
         return dict(res)
 
     def fake_drc(self, pcb: str) -> dict:
@@ -203,7 +218,12 @@ class World:
 
     def fake_board_fix(self, pcb: str, netlist: str, mode: str) -> list:
         self._rec("board_fix", mode)
-        return list(_next(self.fixes.get(mode, [[]])))
+        out = list(_next(self.fixes.get(mode, [[]])))
+        if any(not str(item).startswith("OPEN:") for item in out):
+            # swig_board_fixes saves the board only when it applied something
+            with open(pcb, "a", encoding="utf-8") as f:
+                f.write(f"(fixed {mode})\n")
+        return out
 
     def fake_render(self, pcb: str, tag: str, quality: str = "basic") -> list:
         self._rec("render", tag)
@@ -212,7 +232,11 @@ class World:
     def fake_emc(self, pcb: str, emc: dict, extra: list[str] | None = None) -> dict:
         self._rec("emc", emc.get("max_freq_hz"))
         self.emc_extra.append(extra)
-        return dict(_next(self.emc))
+        res = dict(_next(self.emc))
+        if res.get("ok"):
+            with open(pcb, "a", encoding="utf-8") as f:
+                f.write("(stitched)\n")
+        return res
 
     def fake_fab(self, pcb: str, netlist: str = "") -> dict:
         self._rec("fab")

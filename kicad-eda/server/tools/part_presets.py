@@ -18,6 +18,14 @@ Footprint property is ``footprint`` (``"<nick>:<footprint name>"``). Pad
 number = pin number for every preset. ``get_preset(name, opt_in=False)``
 refuses an opt-in preset unless asked; ``preset_info(name)`` describes one.
 
+Netlist hints (F2-S1b): ``preset_hints(name)`` runs lga_strategy on the
+preset's own pad table and ground pads (PRESET_GND_PADS) with F2-S1's winning
+strategy (f): the LG290P (and the combined land pattern) get 40 generated GND
+escape vias as designer ``preroutes`` in the footprint frame; the LC29H has no
+inner grid and gets none. Place them at the part with
+``lga_strategy.apply_hints(design, hints, ref=...)``. ``preset_info`` carries
+the hints and a ``strategy`` note with F2-S1's measured numbers.
+
 Decision (F2-12): separate footprints by default. The LC29H and LG290P share
 a 12.2 x 16.0 mm body and the edge numbering of the supplies, UART1, I2C,
 RF_IN, RESET_N and 1PPS, but on one land pattern:
@@ -55,8 +63,8 @@ netlist.json path):
     >>> entry["stage"], entry["confidence"]
     ('parts', 'high')
 
-Footprints need only the stdlib (KiCad's Python 3.11 builds them); the symbol
-functions import sym_author (which needs sexpdata, the venv) when called.
+Footprints and hints need only the stdlib (KiCad's Python 3.11 builds them); the
+symbol functions import sym_author (which needs sexpdata, the venv) when called.
 """
 from __future__ import annotations
 
@@ -66,6 +74,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Mapping, NamedTuple
 
 import fp_author_templates as ft
+import lga_strategy as lga
 from fp_author_templates import Body, EdgeRow, FootprintSpec, Pad, has_copper, pad_bbox, r6
 
 if TYPE_CHECKING:                                # sym_author needs sexpdata (venv only)
@@ -317,6 +326,50 @@ def get_preset(name: str, *, opt_in: bool = False) -> Preset:
     return PRESETS[name]
 
 
+# ---------------------------------------------------------------------------
+# Netlist hints (F2-S1b): the inner GND pads, F2-S1's strategy (f)
+# ---------------------------------------------------------------------------
+GNSS_MAX_FREQ_HZ = 1.61e9           # emc.stitch spacing: the top GNSS band (F2-S1's emc)
+_LG290P_GND = frozenset(n for n, f in ft.LG290P_PAD_FUNCTIONS.items() if f == "GND")
+PRESET_GND_PADS: Mapping[str, frozenset[str]] = MappingProxyType({
+    "lg290p": _LG290P_GND,                                           # 10, 12, 13, 24-79
+    "lc29h": frozenset(row[0] for row in LC29H_PIN_TABLE if row[1] == "GND"),
+    "lg290p_lc29h": _LG290P_GND})            # the LC29H's GND pads 10, 12, 13, 24 included
+PRESET_STRATEGY: Mapping[str, str] = MappingProxyType({
+    "lg290p": (
+        "F2-S1 strategy (f), the winner: lga_strategy generates 40 GND vias 0.5/0.25 mm, one "
+        "per 2x2 channel of the 5 x 11 inner grid, each with two 0.25 mm F.Cu stubs to its "
+        "diagonal corner pads, as designer preroutes (netlist_hints; place them at the part "
+        "with lga_strategy.apply_hints). F2-S1, LG290P breakout: DRC 0 / unconnected 0 on "
+        "KiCad 9.0.4 (Freerouting 12.0 s) and 10.0.5 (15.3 s), against 35.1 s / 66.8 s for "
+        "the default planes (a); every F.Cu GND zone variant (b, e1, e2, e4) failed with 1-4 "
+        "unconnected. Keep the builder's planes (In1.Cu GND); never pour GND on F.Cu or B.Cu "
+        "before routing"),
+    "lc29h": (
+        "The LC29H has no inner pad grid (LCC-24; GND edge pads 10, 12, 13, 24), so F2-S1's "
+        "escape-via generator (strategy f) adds nothing: the GND pads route as ordinary pads "
+        "to the builder's In1.Cu GND plane, strategy (a), which F2-S1 measured at DRC 0 / "
+        "unconnected 0 on KiCad 9.0.4 and 10.0.5 on its LG290P breakout (F2-S1 built no "
+        "LC29H board)"),
+    "lg290p_lc29h": (
+        "The inner grid is the LG290P's, so the hints are lg290p's 40 escape vias (F2-S1 "
+        "strategy f: DRC 0 / unconnected 0 on KiCad 9.0.4, Freerouting 12.0 s, and 10.0.5, "
+        "15.3 s). On an LC29H build (StencilLC29H) the vias tie the bare inner pads to GND "
+        "under a body that has no pads there"),
+})
+
+
+def preset_hints(name: str, *, opt_in: bool = False, strategy: str = lga.WINNER,
+                 ref: str = "U1", fab: Mapping[str, float] | None = None) -> dict:
+    """lga_strategy.netlist_hints on the preset's own pads and PRESET_GND_PADS (footprint
+    frame, pad points on part ``ref``; a fresh dict every call). An opt-in preset needs
+    ``opt_in=True``, as in get_preset."""
+    preset = get_preset(name, opt_in=opt_in)
+    return lga.netlist_hints(preset.footprint_fn().pads, gnd_pads=sorted(PRESET_GND_PADS[name]),
+                             strategy=strategy, ref=ref, fab=fab,
+                             emc_max_freq_hz=GNSS_MAX_FREQ_HZ)
+
+
 def _combined_info() -> dict:
     return {
         "footprint": COMBINED_NAMES["lg290p"], "footprints": dict(COMBINED_NAMES),
@@ -335,9 +388,11 @@ def _combined_info() -> dict:
 
 def preset_info(name: str) -> dict:
     """What a preset is (a fresh dict): name, opt_in, footprint(s), symbol,
-    source, notes, and the LC29H pin notes or the combined conflicts."""
+    source, notes, netlist_hints (preset_hints), the F2-S1 strategy note, and
+    the LC29H pin notes or the combined conflicts."""
     get_preset(name, opt_in=True)
-    base = {"name": name, "opt_in": name in OPT_IN_PRESETS}
+    base = {"name": name, "opt_in": name in OPT_IN_PRESETS,
+            "netlist_hints": preset_hints(name, opt_in=True), "strategy": PRESET_STRATEGY[name]}
     if name == "lg290p":
         return {**base, "footprint": ft.LG290P_NAME, "symbol": "LG290P",
                 "source": ft.LG290P_SOURCE,

@@ -303,14 +303,21 @@ def test_router_failure_surfaces_at_g4_without_escalating(world):
 
 
 def test_near_miss_is_healed_in_place(world):
+    """A near miss on the same placement: the alternate DSN orders first (each
+    logged), then the verified heal; no re-placement."""
     world.routes = [{"tracks": 20, "unconnected": 2}]
     world.drcs = [CLEAN_DRC, {**CLEAN_DRC, "unconnected": 2}, CLEAN_DRC]
     world.fixes["heal"] = [["bridged 0.4 mm gap on N1"]]
     rep = _run(world)
     assert rep["PASS"] is True and len(world.args_of("build")) == 1
+    assert world.route_seeds() == [0, *rp_route.ALT_DSN_SEEDS]
     assert rep["autoroute"]["unconnected"] == 0
-    assert rep["remediation"] == [{"gate": "G4", "round": 1,
-                                   "applied": ["bridged 0.4 mm gap on N1"]}]
+    alternate = ("near miss: 2 unrouted with the canonical DSN order -> re-routed the placed "
+                 "board with alternate DSN order dsn_seed {}: 2 unrouted")
+    assert rep["remediation"] == [
+        {"gate": "G4", "round": 1, "applied": [alternate.format(1)]},
+        {"gate": "G4", "round": 1, "applied": [alternate.format(2)]},
+        {"gate": "G4", "round": 1, "applied": ["bridged 0.4 mm gap on N1"]}]
     snap = Path(str(world.pcb) + ".attempt").read_text(encoding="utf-8")
     assert snap == world.pcb.read_text(encoding="utf-8")
 

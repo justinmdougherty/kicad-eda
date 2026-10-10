@@ -17,8 +17,11 @@ x -10..50, y -10..30):
                -o <out> <pcb>
 Every child goes through the caller's runner (server/toolchain.run: stdin
 closed) with encoding='utf-8', errors='replace' and a timeout. Success is rc 0
-AND no ``Error:`` line (a wx timestamp prefix allowed) AND the output file
-written by this run (D0: rc 0 alone is not success).
+AND no ``Error:`` line (a wx timestamp prefix allowed) AND a non-empty output
+file written by this run (D0: rc 0 alone is not success): run_cli moves a
+previous output aside first (never an mtime comparison, which a coarse FAT
+clock can fool) and puts it back when the job fails. The output may not be a
+directory or the job's board itself.
 
 step_bbox: the bounding box of a STEP file's B-rep edges, read as text: every
 VERTEX_POINT's CARTESIAN_POINT plus the axis extremes of each CIRCLE edge
@@ -53,11 +56,14 @@ Venv only (kicad_import_pcb needs sexpdata); never imported by KiCad's Python.
 """
 from __future__ import annotations
 
+import contextlib
 import csv
 import math
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -166,12 +172,13 @@ def error_lines(text: str) -> list[str]:
 
 @dataclass(frozen=True)
 class CliRun:
-    """One kicad-cli job: its command, rc (None: never ran), output and the
-    reason it failed (None = success)."""
+    """One kicad-cli job: its command, rc (None: never ran), output, the
+    reason it failed (None = success) and warnings about its files."""
     command: tuple[str, ...]
     returncode: int | None
     output: str
     reason: str | None = None
+    warnings: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -204,33 +211,96 @@ def cli_help(runner: Runner, cli: str, verb: Sequence[str],
     return (text, None) if text.strip() else ("", f"it printed nothing (rc {proc.returncode})")
 
 
-def _stamp(path: Path) -> tuple[int, int] | None:
+def _size(path: Path) -> int:
     try:
-        st = path.stat()
+        return path.stat().st_size if path.is_file() else 0
     except OSError:
+        return 0
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _refusal(out: Path, what: str, board: str | Path | None) -> str | None:
+    """Why ``out`` must not be written (None: it may)."""
+    if out.is_dir():
+        return f"the {what} path {out} is a directory"
+    if board is not None and _same_file(out, Path(board)):
+        return f"the {what} path {out} is the board itself: give the {what} another path"
+    return None
+
+
+def _set_aside(out: Path) -> Path | None:
+    """Move a previous ``out`` to a sibling temp file, so only a file this run
+    writes can count (no mtime / size comparison, which a coarse clock can
+    fool); None when there is none. Raises OSError when it cannot be moved."""
+    if not out.exists():
         return None
-    return (st.st_mtime_ns, st.st_size)
+    fd, tmp = tempfile.mkstemp(prefix=out.name + ".", suffix=".prev", dir=out.parent)
+    os.close(fd)
+    try:
+        os.replace(out, tmp)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return Path(tmp)
+
+
+def _settle(out: Path, prev: Path | None, ok: bool, what: str) -> str | None:
+    """Drop the previous file after a good run, put it back over any partial
+    output after a failed one; the problem when that is not possible."""
+    try:
+        if prev is not None and ok:
+            prev.unlink()
+        elif prev is not None:
+            os.replace(prev, out)
+    except OSError as exc:
+        return f"the previous {what} is left at {prev} ({exc})"
+    return None
+
+
+def _failure(proc: subprocess.CompletedProcess, output: str, out: Path, what: str) -> str | None:
+    errors = error_lines(output)
+    if proc.returncode != 0:
+        return f"kicad-cli exited {proc.returncode}: {_tail(output)}"
+    if errors:
+        return "kicad-cli reported errors (rc 0 is not success): " + "; ".join(errors[:5])
+    if _size(out) == 0:
+        return f"kicad-cli wrote no {what} at {out}: {_tail(output)}"
+    return None
 
 
 def run_cli(runner: Runner, command: Sequence[str], expect: str | Path, what: str,
-            timeout: float = CLI_TIMEOUT_S) -> CliRun:
+            timeout: float = CLI_TIMEOUT_S, board: str | Path | None = None) -> CliRun:
     """Run one export job; ok only with rc 0, no ``Error:`` line and a
-    non-empty ``expect`` file written (created or changed) by this run."""
-    out = Path(expect)
-    before = _stamp(out)
-    proc, reason = _call(runner, command, timeout)
-    if proc is None:
-        return CliRun(tuple(command), None, "", reason)
-    output = (proc.stdout or "") + (proc.stderr or "")
-    errors = error_lines(output)
-    after = _stamp(out)
-    if proc.returncode != 0:
-        reason = f"kicad-cli exited {proc.returncode}: {_tail(output)}"
-    elif errors:
-        reason = "kicad-cli reported errors (rc 0 is not success): " + "; ".join(errors[:5])
-    elif after is None or after[1] == 0 or after == before:
-        reason = f"kicad-cli wrote no {what} at {out}: {_tail(output)}"
-    return CliRun(tuple(command), proc.returncode, output, reason)
+    non-empty ``expect`` file written by this run. A previous ``expect`` is
+    moved aside first and put back when the job fails; ``expect`` may not be
+    a directory or ``board`` (the job's input) itself."""
+    out, cmd = Path(expect), tuple(command)
+    if (refused := _refusal(out, what, board)) is not None:
+        return CliRun(cmd, None, "", refused)
+    try:
+        prev = _set_aside(out)
+    except OSError as exc:
+        return CliRun(cmd, None, "", f"could not move the previous {what} at {out} aside "
+                                     f"({exc}); is it open in another program?")
+    try:
+        proc, reason = _call(runner, command, timeout)
+    except BaseException:                       # an unexpected error: the previous file back
+        _settle(out, prev, False, what)
+        raise
+    output = "" if proc is None else (proc.stdout or "") + (proc.stderr or "")
+    reason = reason or _failure(proc, output, out, what)
+    left = _settle(out, prev, reason is None, what)
+    if left is not None and reason is not None:
+        reason = f"{reason}; {left}"
+    return CliRun(cmd, None if proc is None else proc.returncode, output, reason,
+                  () if left is None or reason is not None else (left,))
 
 
 def log_warnings(output: str, limit: int = 10) -> list[str]:

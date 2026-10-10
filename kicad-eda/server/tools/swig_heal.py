@@ -1,42 +1,35 @@
 #!/usr/bin/env python3
 """G4 micro-gap healer at the net-class width — runs under KiCad's Python.
 
-swig_board_fixes.py (modes heal / all) calls heal_micro_gaps(board, drc,
-class_widths) for the DRC "unconnected items" pairs a route left behind:
+swig_board_fixes.py (heal / all) calls heal_micro_gaps(board, drc, widths) on
+the DRC "unconnected items" a route left. Per break: BRIDGE (nearest anchors
+<= MAX_GAP on a shared layer, one track), else LINK the two islands (straight,
+L, then a BFS maze route — on a plane net that repairs the fill void the DSN
+plane abstraction hid), else STITCH a via on a layer-locked anchor and link
+from it (the via is taken back when nothing lands).
 
-  bridge  the nearest same-net anchors <= MAX_GAP apart on a shared layer get
-          one straight track (router / SES artifact);
-  link    else the two islands are linked anchor to anchor: straight, then L,
-          then a coarse BFS maze route (threads via fanout fields; on a plane
-          net it repairs the fill void the DSN plane abstraction hid);
-  stitch  else a same-net via on a layer-locked anchor buys layer freedom and
-          the link is laid from it (the via is taken back when nothing lands).
-
-Widths: on a net bound to a net class every heal track is max(attach width,
-class width) — check_routed_widths blocks sub-width open-field copper — and
-an unclassed net keeps the old widths (bridge = narrowest attach, link 0.3
-mm). Keep-out = width / 2 + the board's min clearance + 0.05 mm. A break with
-no clear path at that width gets NO copper and an open entry instead
-('<net>: no clear path at the <w> mm class width'), so the harness escalates.
+Widths: a classed net heals at max(attach width, class width) (G4's
+check_routed_widths blocks sub-width open-field copper); an unclassed net
+keeps the old widths (bridge = narrowest attach, link 0.3 mm). Keep-out =
+width / 2 + board min clearance + 0.05 mm. No clear path at that width = NO
+copper and the open entry '<net>: no clear path at the <w> mm class width'.
 
 Islands: pcbnew cannot list a connectivity cluster from Python on both
-supported versions (probed: 9.0.4 CONNECTIVITY_DATA.GetConnectedItems and
-GetNetItems need a std::vector<KICAD_T> SWIG cannot build; 10.0.5 only has
-the default-types overload), so a net's copper is grouped by a geometric
-union-find: a track end, pad centre or via centre lying on another item's
-copper (pad bbox, track body, via disc) on a shared layer joins the two; a
-filled zone outline joins the pads, track ends and vias it covers and the
-same-net outlines it overlaps. Each DRC item (by uuid, else by position)
-maps to its island; DRC pairs naming the same two islands are one break,
-healed at most once, and a break an earlier link already joined is skipped.
+versions (probed: 9.0.4 GetConnectedItems / GetNetItems need a
+std::vector<KICAD_T> SWIG cannot build), so a geometric union-find groups a
+net's copper: a track end, pad centre or via centre on another item's copper
+(pad bbox, track body, via disc) on a shared layer joins them; a zone fill
+outline joins the pads, track ends and vias it covers and overlapping fills.
+DRC items map to islands (uuid, else position); pairs naming the same two
+islands are one break, and a break an earlier link joined is skipped.
 
-Determinism: island pairs sort by (net, island key = min (x, y) over member
-items), anchors by (x, y, layer), anchor pairs by (distance, coordinates);
-nothing depends on board iteration order or on the DRC listing order (the
-board's random uuids reorder both). Every path is re-validated with
-swig_copper.clear_path at the link keep-out before anything is added — a
-maze path's off-grid first and last segments included; a bad connector is
-re-routed onto the grid line the maze validated, else the path is rejected.
+Determinism: island pairs sort by (net, island key = min (x, y) of members),
+anchors by (x, y, layer), anchor pairs by (distance, coordinates) — never by
+board or DRC listing order (random uuids reorder both). Every path is
+re-validated with swig_copper.clear_path at the link keep-out before it is
+laid; a maze path's off-grid first / last segment is re-routed onto the grid
+line the maze validated, else the path is rejected. The on-board guard (F3-16)
+keeps every heal on the board, off cutouts and out of the edge clearance.
 """
 from __future__ import annotations
 
@@ -97,9 +90,7 @@ class Break(NamedTuple):
     items: tuple               # ((uuid, (x, y)), (uuid, (x, y)))
 
 
-# ---------------------------------------------------------------------------
-# DRC report -> same-net breaks
-# ---------------------------------------------------------------------------
+# --- DRC report -> same-net breaks -----------------------------------------
 def drc_breaks(drc: dict) -> list[Break]:
     """Same-net two-item 'unconnected items' pairs of a kicad-cli DRC report."""
     out = []
@@ -108,19 +99,14 @@ def drc_breaks(drc: dict) -> list[Break]:
         nets = [NET_IN_DESC.search(i.get("description", "")) for i in items]
         if len(items) != 2 or not all(nets) or nets[0].group(1) != nets[1].group(1):
             continue
-        ends = tuple((str(i.get("uuid", "")), _pos(i)) for i in items)
-        out.append(Break(nets[0].group(1), ends))
+        pos = [i.get("pos") or {} for i in items]
+        out.append(Break(nets[0].group(1), tuple(
+            (str(i.get("uuid", "")), (float(p.get("x", 0)), float(p.get("y", 0))))
+            for i, p in zip(items, pos, strict=True))))
     return out
 
 
-def _pos(item: dict) -> XY:
-    p = item.get("pos") or {}
-    return float(p.get("x", 0)), float(p.get("y", 0))
-
-
-# ---------------------------------------------------------------------------
-# Elements (pure geometry)
-# ---------------------------------------------------------------------------
+# --- Elements (pure geometry) ----------------------------------------------
 def pad_element(uuid: str, centre: XY, box: Box, layers: frozenset,
                 pth: bool = False) -> Element:
     return Element("pad", uuid, tuple(box), None if pth else frozenset(layers),
@@ -144,24 +130,17 @@ def fill_element(uuid: str, layer: int, box: Box, contains: Callable,
                    tuple(samples))
 
 
-def _in_box(box: Box, p: XY, reach: float) -> bool:
-    return (box[0] - reach <= p[0] <= box[2] + reach
-            and box[1] - reach <= p[1] <= box[3] + reach)
-
-
 def _boxes_meet(a: Box, b: Box) -> bool:
     return (a[0] <= b[2] + 2 * TOL and b[0] <= a[2] + 2 * TOL
             and a[1] <= b[3] + 2 * TOL and b[1] <= a[3] + 2 * TOL)
 
 
-def _layers_meet(a: frozenset | None, b: frozenset | None) -> bool:
-    return a is None or b is None or bool(a & b)
-
-
 def covers(e: Element, p: XY, reach: float = TOL) -> bool:
     """True when point p lies on e's copper (within reach mm)."""
     if e.kind == "pad":
-        return _in_box(e.box, p, reach)
+        box = e.box
+        return (box[0] - reach <= p[0] <= box[2] + reach
+                and box[1] - reach <= p[1] <= box[3] + reach)
     if e.kind == "track":
         return cu.seg_dist(p, e.pts[0], e.pts[1]) <= e.w / 2 + reach
     if e.kind == "via":
@@ -192,7 +171,7 @@ def _fill_joined(fill: Element, other: Element) -> bool:
 def joined(e: Element, f: Element) -> bool:
     """Same-net copper e and f touch (KiCad anchor rule: a track end, pad
     centre or via centre of one lies on the other's copper)."""
-    if not _layers_meet(e.layers, f.layers):
+    if not (e.layers is None or f.layers is None or e.layers & f.layers):
         return False
     if e.kind == "fill" or f.kind == "fill":
         return _fill_joined(e, f) if e.kind == "fill" else _fill_joined(f, e)
@@ -230,22 +209,16 @@ def anchor_key(a: Anchor) -> tuple:
     return a.x, a.y, -1 if a.layer is None else a.layer, a.w
 
 
-def _pad_layer(e: Element) -> int | None:
-    if e.layers is None:
-        return None                       # PTH barrel: any layer
-    for layer in (pcbnew.F_Cu, pcbnew.B_Cu):
-        if layer in e.layers:
-            return layer
-    return min(e.layers) if e.layers else -1
-
-
 def element_anchors(e: Element) -> list[Anchor]:
+    """Where a heal track may attach: track ends (their layer), via centres and
+    PTH pads (any layer), SMD pad centres (F.Cu, else B.Cu, else their layer)."""
     if e.kind == "track":
         return [Anchor(p[0], p[1], next(iter(e.layers)), e.w) for p in e.pts]
-    if e.kind == "via":
-        return [Anchor(e.pts[0][0], e.pts[0][1], None, e.w)]
-    if e.kind == "pad" and _pad_layer(e) != -1:
-        return [Anchor(e.pts[0][0], e.pts[0][1], _pad_layer(e), PAD_W)]
+    if e.kind == "via" or (e.kind == "pad" and e.layers is None):
+        return [Anchor(e.pts[0][0], e.pts[0][1], None, e.w or PAD_W)]
+    if e.kind == "pad" and e.layers:
+        layer = next((x for x in (pcbnew.F_Cu, pcbnew.B_Cu) if x in e.layers), min(e.layers))
+        return [Anchor(e.pts[0][0], e.pts[0][1], layer, PAD_W)]
     return []
 
 
@@ -266,7 +239,7 @@ def islands(elements: list) -> list[Island]:
     out = [Island(min(_key_point(elements[i]) for i in members),
                   _anchor_set(elements[i] for i in members), tuple(members))
            for members in groups.values()]
-    return sorted(out, key=lambda isl: (isl.key, isl.anchors))
+    return sorted(out, key=lambda isl: (isl.key, [anchor_key(a) for a in isl.anchors]))
 
 
 def locate(elements: list, uuid: str, pos: XY) -> int | None:
@@ -289,9 +262,7 @@ def _box_gap(box: Box, p: XY) -> float:
     return math.hypot(dx, dy)
 
 
-# ---------------------------------------------------------------------------
-# Ordering and widths (pure)
-# ---------------------------------------------------------------------------
+# --- Ordering and widths (pure) --------------------------------------------
 def _d(a: Anchor, b: Anchor) -> float:
     return math.hypot(a.x - b.x, a.y - b.y)
 
@@ -358,9 +329,7 @@ def connector_variants(raw: list) -> list:
     return [_dedupe(h + list(raw[1:-1]) + t) for t in tails for h in heads]
 
 
-# ---------------------------------------------------------------------------
-# Board adapter (pcbnew)
-# ---------------------------------------------------------------------------
+# --- Board adapter (pcbnew) ------------------------------------------------
 def _xy(v) -> XY:
     return cu.to(v.x), cu.to(v.y)
 
@@ -370,10 +339,7 @@ def _box(bb) -> Box:
 
 
 def _uuid(item) -> str:
-    try:
-        return item.m_Uuid.AsString()
-    except AttributeError:
-        return ""
+    return item.m_Uuid.AsString()
 
 
 def _fill_elements(zone, uuid: str) -> list[Element]:
@@ -390,15 +356,11 @@ def _fill_elements(zone, uuid: str) -> list[Element]:
             ol = polys.COutline(i)
             n = ol.PointCount()
             samples = [_xy(ol.CPoint(k)) for k in range(0, n, max(1, n // FILL_SAMPLES))]
-            out.append(fill_element(uuid, layer, _box(ol.BBox()),
-                                    _contains(polys, i), samples))
+
+            def contains(p: XY, acc: float, polys=polys, i=i) -> bool:
+                return polys.Contains(pcbnew.VECTOR2I(cu.mm(p[0]), cu.mm(p[1])), i, cu.mm(acc))
+            out.append(fill_element(uuid, layer, _box(ol.BBox()), contains, samples))
     return out
-
-
-def _contains(polys, index: int) -> Callable:
-    def contains(p: XY, acc: float) -> bool:
-        return polys.Contains(pcbnew.VECTOR2I(cu.mm(p[0]), cu.mm(p[1])), index, cu.mm(acc))
-    return contains
 
 
 def net_elements(board: pcbnew.BOARD, nc: int) -> list[Element]:
@@ -437,9 +399,11 @@ class NetCtx(NamedTuple):
     elements: tuple
     islands: tuple
     island_of: dict            # element index -> island index
+    edge: cu.BoardEdge | None = None    # the on-board guard (None: unguarded)
 
 
-def net_ctx(board: pcbnew.BOARD, name: str, class_widths: dict) -> NetCtx | None:
+def net_ctx(board: pcbnew.BOARD, name: str, class_widths: dict,
+            edge: cu.BoardEdge | None = None) -> NetCtx | None:
     net = board.FindNet(name)
     if net is None:
         return None
@@ -450,17 +414,20 @@ def net_ctx(board: pcbnew.BOARD, name: str, class_widths: dict) -> NetCtx | None
     zlayers = tuple(sorted({lay for z in zones for lay in z.GetLayerSet().CuStack()}))
     return NetCtx(name, net, nc, netclass_read.class_width(class_widths, name), bool(zones),
                   zlayers, cu.min_clearance(board) + KEEP_MARGIN, elements, isl,
-                  {i: k for k, island in enumerate(isl) for i in island.members})
+                  {i: k for k, island in enumerate(isl) for i in island.members}, edge)
 
 
-def _clear(board: pcbnew.BOARD, ctx: NetCtx, path: list, keep: float, layer: int,
-           step: float) -> bool:
-    return all(cu.clear_path(board, ctx.nc, p, q, keep, layer, step=step)
-               for p, q in zip(path, path[1:]))
+def _clear(board: pcbnew.BOARD, ctx: NetCtx, path: list, w: float, layer: int,
+           steps: tuple = (SCREEN_STEP, VALIDATE_STEP)) -> bool:
+    """A w-wide path at the link keep-out from foreign copper and on the board,
+    sampled at each step in turn (a coarse screen, then the fine validation)."""
+    keep, on_board = w / 2 + ctx.clearance, cu.edge_keep(ctx.edge, w / 2)
+    return all(cu.clear_path(board, ctx.nc, p, q, keep, layer, step=step, on_board=on_board)
+               for step in steps for p, q in itertools.pairwise(path))
 
 
 def _lay(board: pcbnew.BOARD, ctx: NetCtx, path: list, w: float, layer: int) -> None:
-    for p, q in zip(path, path[1:]):
+    for p, q in itertools.pairwise(path):
         if cu.dist(p, q) < 1e-3:
             continue
         t = pcbnew.PCB_TRACK(board)
@@ -480,22 +447,19 @@ def _layers_for(ctx: NetCtx, la: int | None, lb: int | None) -> tuple:
     return (la,) if la == lb else ()
 
 
-# ---------------------------------------------------------------------------
-# Remedies
-# ---------------------------------------------------------------------------
+# --- Remedies --------------------------------------------------------------
 def _route(board: pcbnew.BOARD, ctx: NetCtx, a: Anchor, b: Anchor, layer: int, w: float,
            maze: bool) -> tuple | None:
     """(path, used maze) for a w-wide same-net link a -> b on layer, every
     segment validated at the link keep-out; None when nothing is clear."""
-    keep = w / 2 + ctx.clearance
     pa, pb = (a.x, a.y), (b.x, b.y)
     for shape in ([pa, pb], [pa, (pa[0], pb[1]), pb], [pa, (pb[0], pa[1]), pb]):
-        if (_clear(board, ctx, shape, keep, layer, SCREEN_STEP)
-                and _clear(board, ctx, shape, keep, layer, VALIDATE_STEP)):
+        if _clear(board, ctx, shape, w, layer):
             return _dedupe(shape), False
-    raw = cu.bfs_path(board, ctx.nc, pa, pb, layer, keep) if maze else None
+    raw = cu.bfs_path(board, ctx.nc, pa, pb, layer, w / 2 + ctx.clearance,
+                      on_board=cu.edge_keep(ctx.edge, w / 2)) if maze else None
     for path in connector_variants(raw) if raw else ():
-        if _clear(board, ctx, path, keep, layer, VALIDATE_STEP):
+        if _clear(board, ctx, path, w, layer, (VALIDATE_STEP,)):
             return path, True
     return None
 
@@ -507,9 +471,7 @@ def _try_bridge(board: pcbnew.BOARD, ctx: NetCtx, a: Anchor, b: Anchor) -> str |
     layer = next((x for x in (a.layer, b.layer) if x is not None), pcbnew.F_Cu)
     w = bridge_width(ctx.cls_w, a, b)
     path = [(a.x, a.y), (b.x, b.y)]
-    keep = w / 2 + ctx.clearance
-    if not (_clear(board, ctx, path, keep, layer, SCREEN_STEP)
-            and _clear(board, ctx, path, keep, layer, VALIDATE_STEP)):
+    if not _clear(board, ctx, path, w, layer):
         return None
     _lay(board, ctx, path, w, layer)
     return (f"healed {gap:.2f} mm same-net gap on {ctx.name} "
@@ -556,11 +518,13 @@ def _link_from(board: pcbnew.BOARD, ctx: NetCtx, va: Anchor, other: tuple) -> tu
 
 def _try_stitch(board: pcbnew.BOARD, ctx: NetCtx, a: tuple, b: tuple) -> str | None:
     w_nm, drill = via_template(board, ctx.nc)
+    on_board = cu.edge_keep(ctx.edge, cu.to(w_nm) / 2)
     for side, other in ((a, b), (b, a)):
         spots = sorted((p for p in side if p.layer is not None),
                        key=lambda p: (min(_d(p, q) for q in other), anchor_key(p)))
         for pa in spots[:STITCH_SPOTS]:
-            if not cu.clear_spot(board, ctx.nc, (pa.x, pa.y), cu.to(w_nm) / 2 + VIA_KEEP):
+            if not cu.clear_spot(board, ctx.nc, (pa.x, pa.y), cu.to(w_nm) / 2 + VIA_KEEP,
+                                 on_board=on_board):
                 continue
             via = cu.add_via(board, ctx.net, (pa.x, pa.y), w_nm, drill)
             found = _link_from(board, ctx, Anchor(pa.x, pa.y, None, cu.to(w_nm)), other)
@@ -575,12 +539,6 @@ def _try_stitch(board: pcbnew.BOARD, ctx: NetCtx, a: tuple, b: tuple) -> str | N
     return None
 
 
-def open_entry(ctx: NetCtx) -> str:
-    if ctx.cls_w is None:
-        return f"{ctx.name}: no clear path at the {LINK_W:.3f} mm default width"
-    return f"{ctx.name}: no clear path at the {ctx.cls_w:.3f} mm class width"
-
-
 def heal_pair(board: pcbnew.BOARD, ctx: NetCtx, a: Island, b: Island) -> tuple:
     """(applied message, None) or (None, open entry) for one island pair."""
     if not (a.anchors and b.anchors):
@@ -588,16 +546,21 @@ def heal_pair(board: pcbnew.BOARD, ctx: NetCtx, a: Island, b: Island) -> tuple:
     pairs = anchor_pairs(a.anchors, b.anchors)
     msg = (_try_bridge(board, ctx, *pairs[0]) or _try_links(board, ctx, pairs)
            or _try_stitch(board, ctx, a.anchors, b.anchors))
-    return (msg, None) if msg else (None, open_entry(ctx))
+    if msg:
+        return msg, None
+    if ctx.cls_w is None:
+        return None, f"{ctx.name}: no clear path at the {LINK_W:.3f} mm default width"
+    return None, f"{ctx.name}: no clear path at the {ctx.cls_w:.3f} mm class width"
 
 
-def _island_pairs(board: pcbnew.BOARD, drc: dict, class_widths: dict) -> tuple:
+def _island_pairs(board: pcbnew.BOARD, drc: dict, class_widths: dict,
+                  edge: cu.BoardEdge | None) -> tuple:
     """({net: NetCtx}, sorted [(net, island a, island b)], [open entries])."""
     ctxs: dict = {}
     todo, inside = set(), set()
     for brk in drc_breaks(drc):
         if brk.net not in ctxs:
-            ctxs[brk.net] = net_ctx(board, brk.net, class_widths)
+            ctxs[brk.net] = net_ctx(board, brk.net, class_widths, edge)
         ctx = ctxs[brk.net]
         found = [locate(list(ctx.elements), u, p) for u, p in brk.items] if ctx else [None]
         if None in found:
@@ -610,10 +573,11 @@ def _island_pairs(board: pcbnew.BOARD, drc: dict, class_widths: dict) -> tuple:
     return ctxs, sorted(todo), sorted(inside)
 
 
-def heal_micro_gaps(board: pcbnew.BOARD, drc: dict, class_widths: dict) -> tuple:
+def heal_micro_gaps(board: pcbnew.BOARD, drc: dict, class_widths: dict,
+                    on_board: cu.BoardEdge | None = None) -> tuple:
     """Heal the DRC report's same-net breaks: (applied messages, open entries).
-    class_widths: netclass_read.net_class_widths() of the board's project."""
-    ctxs, todo, open_ = _island_pairs(board, drc, class_widths)
+    class_widths: netclass_read.net_class_widths(); on_board: swig_copper.board_edge."""
+    ctxs, todo, open_ = _island_pairs(board, drc, class_widths, on_board)
     applied: list[str] = []
     parent: dict = {}
 

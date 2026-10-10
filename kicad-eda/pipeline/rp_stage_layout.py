@@ -1,8 +1,11 @@
 """Harness stage G4 (layout / board review): judge the routed board, run the
-board-fix corrective-action loop, then the opt-in EMC stitching post-pass.
-Feature hooks (rp_hooks): g4_inputs and g4_verdict at both judgements (the
-first and the EMC re-judge), emc_args."""
+board-fix corrective-action loop, then the opt-in EMC stitching post-pass,
+which is a transaction: a stitch that makes G4 fail is undone byte for byte.
+Feature hooks (rp_hooks): g4_inputs and g4_verdict at every judgement (the
+first, the EMC re-judge and the re-judge of a rolled-back board), emc_args."""
 from __future__ import annotations
+
+from pathlib import Path
 
 import rp_paths  # noqa: F401  first: puts server/ and server/tools/ on sys.path
 import gates
@@ -11,6 +14,7 @@ import rp_hooks
 import rp_kicad
 
 G4_FIX_ROUNDS = 2                                # corrective-action rounds at G4
+EMC_ROLLED_BACK = "EMC stitching rolled back: "
 
 
 @rp_context.stage
@@ -22,15 +26,17 @@ def stage_g4(ctx: rp_context.RunContext) -> bool:
     return rp_context.record_gate(ctx, ctx.g4)
 
 
-def judge_g4(ctx: rp_context.RunContext, refresh_unconnected: bool = False) -> None:
-    """DRC + routed-width check + G4 verdict on the current board."""
+def judge_g4(ctx: rp_context.RunContext, refresh_unconnected: bool = False,
+             notes: tuple[str, ...] = ()) -> None:
+    """DRC + routed-width check + G4 verdict (with `notes` as warnings) on the
+    current board."""
     ctx.drc_rep = rp_kicad.drc(ctx.pcb)
     ctx.report["drc"] = ctx.drc_rep
     if refresh_unconnected:
         ctx.route_rep = {**ctx.route_rep, "unconnected": ctx.drc_rep["unconnected"]}
         ctx.report["autoroute"] = ctx.route_rep
     ctx.routed_check = rp_kicad.gate_check("routed", ctx.pcb, ctx.netlist)
-    ctx.g4 = g4_verdict(ctx)
+    ctx.g4 = g4_verdict(ctx, notes)
 
 
 def g4_verdict(ctx: rp_context.RunContext, notes: tuple[str, ...] = ()) -> dict:
@@ -69,24 +75,48 @@ def emc_stitch(ctx: rp_context.RunContext, emc: dict) -> dict:
 def stage_emc(ctx: rp_context.RunContext) -> None:
     """EMC post-pass (opt-in via netlist "emc": {"stitch": true, ...}):
     perimeter GND via fence + interior stitching grid (Ott/Montrose, lambda/20
-    pitch from max_freq_hz), then re-DRC — the pass is clearance-aware but
-    the gate trusts measurements, not intentions. Never on a cached board."""
+    pitch from max_freq_hz), then DRC + the routed gate again — the pass is
+    clearance-aware but the gate trusts measurements, not intentions. A
+    transaction: the board is snapshotted first; a stitch that makes G4 fail
+    is undone byte for byte (the passing board is re-judged, with a warning),
+    and a failed stitch leaves the judged board as it was. Never on a cached
+    board."""
     emc = ctx.design.get("emc") or {}
     if not (ctx.g4["passed"] and emc.get("stitch") and not ctx.use_cache):
         return
+    board = Path(ctx.pcb)
+    snapshot = board.read_bytes()
     er = emc_stitch(ctx, emc)
     ctx.report["emc"] = er
-    notes = []
-    if er.get("ok"):
-        notes.append(f"EMC stitching: {er.get('vias_added')} GND vias "
-                     f"(fence {er.get('fence')}, interior "
-                     f"{er.get('interior')}, pitch {er.get('pitch_mm')} mm)")
-        ctx.drc_rep = rp_kicad.drc(ctx.pcb)
-        ctx.report["drc"] = ctx.drc_rep
-    else:
-        notes.append(f"EMC stitching FAILED: {er.get('reason')}")
-    if emc.get("teardrops"):
-        notes.append("teardrops requested but KiCad's teardrop generator "
-                     "has no headless API — generate in the GUI "
-                     "(Edit > Edit Teardrops) before fab if required")
-    ctx.g4 = g4_verdict(ctx, tuple(notes))
+    teardrops = (teardrop_note(),) if emc.get("teardrops") else ()
+    if not er.get("ok"):
+        restore_board(board, snapshot)
+        ctx.g4 = g4_verdict(ctx, (f"EMC stitching FAILED: {er.get('reason')}", *teardrops))
+        return
+    judge_g4(ctx, notes=(f"EMC stitching: {er.get('vias_added')} GND vias "
+                         f"(fence {er.get('fence')}, interior {er.get('interior')}, "
+                         f"pitch {er.get('pitch_mm')} mm)", *teardrops))
+    if not ctx.g4["passed"]:
+        rollback_emc(ctx, board, snapshot, teardrops)
+
+
+def rollback_emc(ctx: rp_context.RunContext, board: Path, snapshot: bytes,
+                 notes: tuple[str, ...]) -> None:
+    """The stitched board failed G4: put the pre-stitch board back byte for
+    byte and re-judge it (a fresh DRC report on disk), with a warning naming
+    what the stitch broke."""
+    broke = "; ".join(ctx.g4["blockers"])
+    restore_board(board, snapshot)
+    ctx.report["emc"] = {**ctx.report["emc"], "rolled_back": True}
+    judge_g4(ctx, notes=(f"{EMC_ROLLED_BACK}the stitched board failed G4 ({broke}); the "
+                         f"pre-stitch board was restored byte for byte", *notes))
+
+
+def restore_board(board: Path, snapshot: bytes) -> None:
+    if not board.is_file() or board.read_bytes() != snapshot:
+        board.write_bytes(snapshot)
+
+
+def teardrop_note() -> str:
+    return ("teardrops requested but KiCad's teardrop generator has no headless API — "
+            "generate in the GUI (Edit > Edit Teardrops) before fab if required")

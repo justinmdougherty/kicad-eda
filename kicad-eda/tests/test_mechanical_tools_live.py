@@ -7,7 +7,9 @@ footprints), so the aux origin sits on the datum. Then, in the datum (Fusion) fr
   * export_outline_dxf: the DXF read back matches the board's Edge.Cuts within
     0.01 mm (Hausdorff), and the pre-build write_outline_dxf exchange file agrees;
   * export_step(board_only=True): the STEP spans x -10..50, y -10..30 (T10 VERIFIED);
-  * export_pos_datum runs (an empty board writes a header-only CSV).
+  * export_pos_datum runs (an empty board writes a header-only CSV);
+  * exporting again into the same paths replaces the files (run_cli moves the
+    previous one aside) and leaves no temp files.
 
 Skips cleanly without a KiCad Python that imports pcbnew (swig_python fixture).
 """
@@ -113,3 +115,18 @@ def test_export_pos_datum_runs_on_the_empty_board(t10):
     assert res["ok"] is True, res
     assert res["rows"] == 0 and out.read_text(encoding="utf-8").startswith("Ref,")
     assert res["command"][1:6] == ["pcb", "export", "pos", "--use-drill-file-origin", "--units"]
+
+
+def test_exporting_again_replaces_the_files_and_leaves_no_temp_files(t10, tmp_path):
+    # run_cli moves the previous file aside, so the real kicad-cli writes a fresh one
+    for _ in range(2):
+        dxf = mt.export_outline_dxf(str(t10), str(tmp_path / "again.dxf"))
+        pos = mt.export_pos_datum(str(t10), str(tmp_path / "again.csv"))
+        assert dxf["ok"] is True and pos["ok"] is True, (dxf, pos)
+        assert dxf["warnings"] == [] and dxf["hausdorff_mm"] <= 0.01
+    if _has_step_export(t10):
+        for _ in range(2):
+            step = mt.export_step(str(t10), str(tmp_path / "again.step"), board_only=True)
+            assert step["ok"] is True and step["bbox"]["x"] == pytest.approx([-10, 50], abs=0.05)
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names in (["again.csv", "again.dxf"], ["again.csv", "again.dxf", "again.step"])

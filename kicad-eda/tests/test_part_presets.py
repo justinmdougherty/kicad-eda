@@ -14,9 +14,13 @@ Unit tier (venv only, no KiCad):
     1, 4, 5, 6, 7, 15, 16 are N/C on its symbol;
   * the module docstring's decisions.append_decision example runs (doctest);
   * footprints build without sexpdata (KiCad-python safe), symbols need it.
+  * netlist hints (F2-S1b): every preset carries lga_strategy's hints on its own
+    pad table (lg290p and the combined one: F2-S1's 40 escape vias; lc29h: none,
+    no inner grid) and a strategy note naming F2-S1's measured numbers.
 Live tier (skipped without KiCad): each preset footprint passes
 kicad_parse_problems on the oldest kicad-cli and pcbnew_load; each preset
-symbol passes sym_author.validate_library; KiCad 9's Python imports the module.
+symbol passes sym_author.validate_library; KiCad 9's Python imports the module
+and builds the hints.
 """
 from __future__ import annotations
 
@@ -32,6 +36,7 @@ import decisions
 import fp_author as fa
 import fp_author_templates as ft
 import kicad_env as env
+import lga_strategy as lga
 import part_presets as pp
 import sym_author as sa
 
@@ -294,6 +299,75 @@ def test_combined_symbol_puts_the_conflicting_pins_on_no_connect():
 
 
 # ---------------------------------------------------------------------------
+# Netlist hints (F2-S1b): lga_strategy on each preset's own pad table
+# ---------------------------------------------------------------------------
+LG290P_GND = {"10", "12", "13", *(str(n) for n in range(24, 80))}
+
+
+def test_presets_carry_lga_netlist_hints():
+    assert pp.PRESET_GND_PADS == {"lg290p": LG290P_GND, "lc29h": {"10", "12", "13", "24"},
+                                  "lg290p_lc29h": LG290P_GND}
+    lg = pp.preset_hints("lg290p")
+    assert lg == lga.netlist_hints(ft.lg290p().pads, gnd_pads=sorted(LG290P_GND))
+    assert set(lg) == {"preroutes", "notes"} and len(lg["preroutes"]) == 80
+    assert {tuple(p["via_size"]) for p in lg["preroutes"][::2]} == {(0.5, 0.25)}
+    lc = pp.preset_hints("lc29h")                       # LCC-24: no inner grid, nothing made
+    assert set(lc) == {"notes"} and any("no 2x2 ground-pad channel" in n for n in lc["notes"])
+    for stencil in pp.STENCILS:                         # the copper is the same in both
+        pads = pp.lg290p_lc29h(stencil=stencil).pads
+        assert lga.netlist_hints(pads, gnd_pads=LG290P_GND)["preroutes"] == lg["preroutes"]
+    assert pp.preset_hints("lg290p_lc29h", opt_in=True)["preroutes"] == lg["preroutes"]
+    with pytest.raises(pp.PresetError, match="is opt-in"):
+        pp.preset_hints("lg290p_lc29h")
+
+
+def test_preset_hints_take_strategy_ref_and_fab():
+    e3 = pp.preset_hints("lg290p", strategy="e3", ref="U4")
+    assert e3["emc"] == {"stitch": True, "max_freq_hz": pp.GNSS_MAX_FREQ_HZ}
+    assert {p["path"][0][1] for p in e3["preroutes"]} == {"U4"}
+    wide = pp.preset_hints("lg290p", fab={"min_track_width": 0.3})
+    assert {p["width"] for p in wide["preroutes"]} == {0.3}
+    assert set(pp.preset_hints("lc29h", strategy="b")) == {"planes", "notes"}
+
+
+def test_preset_hints_place_f2s1s_winning_preroutes_at_u1():
+    """F2-S1's winner netlist = the lg290p hints placed at U1 (21, 16)."""
+    placed = lga.place_hints(pp.preset_hints("lg290p"), origin=(21.0, 16.0))["preroutes"]
+    assert placed[0] == {"net": "GND", "width": 0.25, "layer": "F.Cu",
+                         "path": [["pad", "U1", "25"], ["xy", 18.9, 9.7], ["pad", "U1", "37"]],
+                         "vias": [[18.9, 9.7]], "via_size": [0.5, 0.25]}
+    assert placed[-1] == {"net": "GND", "width": 0.25, "layer": "F.Cu",
+                          "path": [["pad", "U1", "78"], ["xy", 23.1, 22.3], ["pad", "U1", "68"]]}
+
+
+def test_preset_info_carries_the_hints_and_a_strategy_note():
+    for name in pp.PRESETS:
+        info = pp.preset_info(name)
+        assert info["netlist_hints"] == pp.preset_hints(name, opt_in=True), name
+        for part in ("F2-S1", "DRC 0 / unconnected 0", "9.0.4", "10.0.5"):
+            assert part in info["strategy"], (name, part)
+    lg = pp.preset_info("lg290p")["strategy"]
+    for part in ("40 GND vias 0.5/0.25", "5 x 11", "12.0 s", "15.3 s", "35.1", "66.8",
+                 "apply_hints", "never pour GND on F.Cu"):
+        assert part in lg, part
+    assert "no inner pad grid" in pp.preset_info("lc29h")["strategy"]
+    assert "StencilLC29H" in pp.preset_info("lg290p_lc29h")["strategy"]
+    info = pp.preset_info("lg290p")
+    info["netlist_hints"]["preroutes"].clear()                     # a fresh copy every call
+    assert len(pp.preset_info("lg290p")["netlist_hints"]["preroutes"]) == 80
+
+
+def test_hints_build_without_sexpdata():
+    code = ("import sys; sys.modules['sexpdata'] = None; sys.path.insert(0, sys.argv[1]); "
+            "import part_presets as pp, json; print(json.dumps([len(pp.preset_hints("
+            "n, opt_in=True).get('preroutes', [])) for n in pp.PRESETS]))")
+    r = subprocess.run([sys.executable, "-c", code, str(TOOLS)], capture_output=True,
+                       stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace", timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout.strip().splitlines()[-1]) == [80, 0, 80]
+
+
+# ---------------------------------------------------------------------------
 # The decision example (module docstring) and the KiCad-python-safe import
 # ---------------------------------------------------------------------------
 def test_the_docstring_decision_example_runs(tmp_path):
@@ -375,9 +449,11 @@ def test_live_kicad9_python_imports_the_presets():
         pytest.skip("no KiCad 9 bundled Python (3.11) to import part_presets with")
     code = ("import json, sys; sys.path.insert(0, sys.argv[1]); import part_presets as pp; "
             "print(json.dumps([sys.version_info[:2], "
-            "[len(p.footprint_fn().pads) for p in pp.PRESETS.values()]]))")
+            "[len(p.footprint_fn().pads) for p in pp.PRESETS.values()], "
+            "pp.preset_hints('lg290p')]))")
     r = subprocess.run([str(python), "-c", code, str(TOOLS)], capture_output=True,
                        stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace", timeout=60)
     assert r.returncode == 0, r.stderr
-    version, counts = json.loads(r.stdout.strip().splitlines()[-1])
+    version, counts, hints = json.loads(r.stdout.strip().splitlines()[-1])
     assert version[:2] >= [3, 11] and counts == [79, 24, 103]
+    assert hints == pp.preset_hints("lg290p")

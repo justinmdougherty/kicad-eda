@@ -12,7 +12,9 @@ from __future__ import annotations
 import copy
 import json
 import math
+import subprocess
 from pathlib import Path
+from typing import Any, Iterable, Mapping
 
 import pytest
 
@@ -101,7 +103,7 @@ class FakeBoardApi:
         return cls.unavailable is None
 
     @classmethod
-    def resolve_mode(cls, path, mode: str = "auto") -> str:
+    def resolve_mode(cls, path: str | Path, mode: str = "auto") -> str:
         """A board whose FILE name contains 'gui' is open in the (fake)
         running GUI (the directory name does not count: tmp_path carries the
         test's name)."""
@@ -112,7 +114,7 @@ class FakeBoardApi:
         return mode
 
     @classmethod
-    def open(cls, path, mode: str = "auto") -> "FakeBoardApi":
+    def open(cls, path: str | Path, mode: str = "auto") -> "FakeBoardApi":
         if "boom" in str(path):
             raise BoardApiError("could not start `kicad-cli api-server`: boom")
         return cls(str(path), cls.resolve_mode(path, mode))
@@ -178,7 +180,7 @@ class FakeBoardApi:
         self._serial += 1
         return f"{prefix}{self._serial}"
 
-    def add_tracks(self, net: str, segments) -> list[dict]:
+    def add_tracks(self, net: str, segments: Iterable[Mapping[str, Any]]) -> list[dict]:
         self._check_net(net)
         segments = [dict(s) for s in segments]
         self.calls.append(("add_tracks", net, segments))
@@ -189,7 +191,7 @@ class FakeBoardApi:
         self.is_modified = True
         return [dict(t) for t in made]
 
-    def add_vias(self, net: str, vias) -> list[dict]:
+    def add_vias(self, net: str, vias: Iterable[Mapping[str, Any]]) -> list[dict]:
         self._check_net(net)
         vias = [dict(v) for v in vias]
         self.calls.append(("add_vias", net, vias))
@@ -199,7 +201,7 @@ class FakeBoardApi:
         self.is_modified = True
         return [dict(v) for v in made]
 
-    def remove(self, ids) -> int:
+    def remove(self, ids: Iterable[str]) -> int:
         wanted = [str(i) for i in ids]
         known = {t["id"] for t in self._tracks} | {v["id"] for v in self._vias}
         unknown = [i for i in wanted if i not in known]
@@ -266,16 +268,16 @@ def kicad11(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> env.KiCadInstall
     return inst
 
 
-def done(stdout: str = "", returncode: int = 0):
+def done(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProcess:
     """A finished child process as toolchain.run returns it."""
-    return type("R", (), {"returncode": returncode, "stdout": stdout, "stderr": ""})()
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
 
 
 def drc_writer(monkeypatch: pytest.MonkeyPatch, report: dict) -> list[list[str]]:
     """tc.run that records argv and writes `report` where kicad-cli would."""
     calls: list[list[str]] = []
 
-    def fake_run(args, **kw):
+    def fake_run(args: list[str], **kw: Any) -> subprocess.CompletedProcess:
         calls.append(list(args))
         Path(args[args.index("-o") + 1]).write_text(json.dumps(report), encoding="utf-8")
         return done()

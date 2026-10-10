@@ -119,7 +119,7 @@ def test_islands_join_pads_track_ends_t_junctions_and_vias(heal):
     elements = _net_a(heal)
     roots = heal.island_roots(elements)
     groups = {}
-    for e, r in zip(elements, roots):
+    for e, r in zip(elements, roots, strict=True):
         groups.setdefault(r, set()).add(e.uuid)
     assert sorted(map(sorted, groups.values())) == [["P1", "T1", "T2", "V1"], ["P2"], ["P3"]]
 
@@ -138,7 +138,7 @@ def test_fill_outlines_join_what_they_contain(heal):
                 heal.via_element("V9", (10.2, 5), 0.6),
                 heal.track_element("T9", (12, 5), (10.1, 5), 0.25, 2)]
     groups = {}
-    for e, r in zip(elements, heal.island_roots(elements)):
+    for e, r in zip(elements, heal.island_roots(elements), strict=True):
         groups.setdefault(r, set()).add(e.uuid)
     # the B.Cu track ends inside the via (any layer); the via ring touches the fill
     assert sorted(map(sorted, groups.values())) == [["G1", "T9", "V9", "Z1"], ["G2"]]
@@ -308,7 +308,8 @@ def _track(tid: str, net: str, a: tuple, b: tuple, w: float, layer: str = "F") -
 
 
 TWO_ISLANDS = {"nets": ["VIN"],
-               "pads": [_pad_spec("U1", "1", "VIN", (10, 15)), _pad_spec("U2", "1", "VIN", (20, 15))],
+               "pads": [_pad_spec("U1", "1", "VIN", (10, 15)),
+                        _pad_spec("U2", "1", "VIN", (20, 15))],
                "tracks": [_track("t1", "VIN", (10, 15), (13, 15), 0.6),
                           _track("t2", "VIN", (20, 15), (18, 15), 0.6)]}
 CORRIDOR = {**TWO_ISLANDS, "nets": ["VIN", "GND", "SHIELD"],
@@ -316,8 +317,10 @@ CORRIDOR = {**TWO_ISLANDS, "nets": ["VIN", "GND", "SHIELD"],
                 _track("w1", "GND", (16, 4), (16, 14.4), 0.2),     # the maze window is
                 _track("w2", "SHIELD", (16, 15.6), (16, 26), 0.2)]}  # the pair bbox +- 5 mm
 THREE_ISLANDS = {"nets": ["VIN", "GND"],
-                 "pads": [_pad_spec("A", "1", "VIN", (8, 15)), _pad_spec("B", "1", "VIN", (14, 10)),
-                          _pad_spec("B", "2", "VIN", (14, 20)), _pad_spec("C", "1", "VIN", (24, 15)),
+                 "pads": [_pad_spec("A", "1", "VIN", (8, 15)),
+                          _pad_spec("B", "1", "VIN", (14, 10)),
+                          _pad_spec("B", "2", "VIN", (14, 20)),
+                          _pad_spec("C", "1", "VIN", (24, 15)),
                           _pad_spec("C", "2", "GND", (26, 15))],
                  "tracks": [_track("b", "VIN", (14, 10), (14, 20), 0.5),
                             _track("c", "VIN", (24, 15), (20, 15), 0.5)]}
@@ -351,6 +354,7 @@ BOARDS = {
     "c_fwd": (THREE_ISLANDS, {"VIN": 0.5}),
     "c_rev": ({**THREE_ISLANDS, "reverse": True}, {"VIN": 0.5}),
     "d_dup": (DUP_BREAK, {"VIN": 0.5}),
+    "d_tri": (THREE_ISLANDS, {"VIN": 0.5}),
     "e_maze": (MAZE, {"VIN": 0.3}),
     "g_bridge": (SHORT_GAP, {"VIN": 0.5}),
     "h_stitch": (LAYER_LOCKED, {}),
@@ -529,6 +533,27 @@ def test_live_d_two_drc_pairs_for_one_break_get_one_link(kicad, boards):
     assert result == {"applied": ["VIN: linked disconnected clusters (7.00 mm apart) on F.Cu "
                                   "at the 0.500 mm class width"], "open": []}
     assert added == [["VIN", "F.Cu", 0.5, [[10.0, 15.0], [17.0, 15.0]]]]
+    assert post["unconnected_items"] == []
+
+
+def test_live_d_a_pair_an_earlier_link_joined_is_skipped(kicad, boards):
+    """Three DRC pairs over three islands (A-B, B-C, A-C): two links, the
+    third pair is already joined by them."""
+    _pcb, uuids = boards["d_tri"]
+
+    def triangle(report: dict) -> dict:
+        a, b, c = (_drc_item(f"Pad 1 [VIN] of {ref} on F.Cu", x, y, uuids[f"{ref}.1"])
+                   for ref, x, y in (("A", 8, 15), ("B", 14, 10), ("C", 24, 15)))
+        pairs = [{"items": [b, c]}, {"items": [a, c]}, {"items": [a, b]}]
+        return {**report, "unconnected_items": pairs}
+
+    result, added, post, _b, _a = _heal_board(kicad, boards, "d_tri", drc_edit=triangle)
+    assert result == {"applied": [
+        "VIN: linked disconnected clusters (7.81 mm apart) on F.Cu at the 0.500 mm class width",
+        "VIN: linked disconnected clusters (12.00 mm apart) on F.Cu at the 0.500 mm class width"],
+        "open": []}
+    assert sorted(added) == [["VIN", "F.Cu", 0.5, [[8.0, 15.0], [14.0, 10.0]]],
+                             ["VIN", "F.Cu", 0.5, [[8.0, 15.0], [20.0, 15.0]]]]
     assert post["unconnected_items"] == []
 
 

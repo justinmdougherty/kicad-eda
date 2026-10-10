@@ -29,7 +29,8 @@ of an earlier pin of the same unit (sym_author stacks every power pin of a
 name on the first one, e.g. the LG290P's 59 GND pads). KiCad joins them in
 the schematic, but the board takes pad nets from the netlist, so a floating
 stacked pin's floating_detail entry carries ``stacked_on`` and a ``hint``
-that suggests netting the symbol's pin_groups at once.
+that suggests netting the whole pin group at once (its pads listed; for a
+sym_author part, the pin_groups entry of that name).
 """
 from __future__ import annotations
 
@@ -235,25 +236,28 @@ def _pad_ranges(pads: Iterable[str]) -> str:
 
 def _stack_hint(entry: dict, maps: PinMaps, net_of: dict) -> dict:
     """{} for a pin that is not stacked; else {stacked_on, hint}: net the
-    whole pin group (the symbol's pins of that name, as sym_author's
-    pin_groups lists them; unnamed: the pads of that stack) at once."""
+    whole pin group at once -- the symbol's pads of that name (what a
+    sym_author part returns as pin_groups[name]; a stock part has no such
+    output, so the pads are always listed) or, unnamed, that stack's pads."""
     ref, pad, name = entry["ref"], entry["pad"], entry["name"]
     stacks = maps.stacked.get(ref, {})
     anchor = stacks.get(pad)
     if anchor is None:
         return {}
+    net = net_of.get((ref, anchor)) or entry["same_name_net"]
+    target = f"net {net}" if net else "one net"
+    head = f"hidden pin stacked on {ref}.{anchor}"
     if name is not None:
         group = [p for p, n in maps.names.get(ref, {}).items() if n == name]
-        label = f"pin_groups['{name}']"
+        todo = (f"{head} ('{name}'): put every pad named '{name}' ({_pad_ranges(group)}) "
+                f"on {target} (a sym_author part returns them as pin_groups['{name}'])")
     else:
         group = [anchor, *(p for p, a in stacks.items() if a == anchor)]
-        label = f"the stack at {ref}.{anchor}"
-    net = net_of.get((ref, anchor)) or entry["same_name_net"]
-    named = f" ('{name}')" if name is not None else ""
+        todo = (f"{head}: put every pad of the stack at {ref}.{anchor} "
+                f"({_pad_ranges(group)}) on {target}")
     return {"stacked_on": anchor, "hint": (
-        f"hidden pin stacked on {ref}.{anchor}{named}: put every pad of {label} "
-        f"({_pad_ranges(group)}) on {f'net {net}' if net else 'one net'}; KiCad joins "
-        f"stacked pins in the schematic, but the board takes pad nets from the netlist")}
+        f"{todo}; KiCad joins stacked pins in the schematic, but the board takes pad nets "
+        f"from the netlist")}
 
 
 def _floating(comps: list, maps: PinMaps, net_of: dict, no_connect: set) -> tuple[list, list]:
