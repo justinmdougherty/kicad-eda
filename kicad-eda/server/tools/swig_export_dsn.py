@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Export a .kicad_pcb to Specctra DSN (Freerouting input). KiCad bundled python.
 
-    swig_export_dsn.py <board.kicad_pcb> <out.dsn>
+    swig_export_dsn.py <board.kicad_pcb> <out.dsn> [<stackup.json>]
 
 Called by board_autoroute.export_dsn (the MCP tool autoroute_board), which
 treats an existing <out.dsn> as a successful export. Prints ONE JSON line:
 
     {"ok": true, "dsn": path, "outline_rewrite": report | "skipped: ...",
-     "polygon": [reasons], "warnings": [...]}
+     "polygon": [reasons], "warnings": [...][, "dsn_policy": report]}
     {"ok": false, "dsn": path, "pcb": path, "stage": "usage" | "load" |
-     "export" | "outline_rewrite" | "internal", "error": msg, "dsn_removed": bool}
+     "export" | "outline_rewrite" | "dsn_policy" | "internal", "error": msg,
+     "dsn_removed": bool}
 
 rc 0 = ok, 1 = failed, 2 = usage. Steps (F3-17):
   1. board_outline.load_board: a missing or unreadable board is a JSON error
@@ -37,8 +38,11 @@ Failures:
     ok false, rc 1, and the DSN is removed so no caller routes it. The same
     for a failed export or any other error after it.
 
-Later (D7-19): the DSN layer policy post-processes the text after the outline
-rewrite, in run(), before the one write.
+D7-19: with argv[3] (the physical-design artifact <stem>.stackup.json, or a
+bare layer policy), dsn_layers.postprocess applies the DSN layer policy after
+the outline rewrite, before the one write; its report is "dsn_policy". A bad
+or stale policy is ok false at stage "dsn_policy" (the DSN is removed).
+Without argv[3] the output is exactly as before.
 
 Stdlib + pcbnew only, Python 3.11 (KiCad 9.0.4's bundled Python). Without
 pcbnew (the dev venv) the module imports and load / export refuse.
@@ -64,11 +68,12 @@ except ImportError:          # the dev venv: load / export refuse, the rest is t
     pcbnew = None
 
 import board_outline as bo  # noqa: E402
+import dsn_layers  # noqa: E402
 import dsn_outline as do  # noqa: E402
 import dsn_sexpr  # noqa: E402
 import outline as ol  # noqa: E402
 
-USAGE = "usage: swig_export_dsn.py <board.kicad_pcb> <out.dsn>"
+USAGE = "usage: swig_export_dsn.py <board.kicad_pcb> <out.dsn> [<stackup.json>]"
 RECT_SKIP = "skipped: rectangular board"
 UNREADABLE_SKIP = "skipped: the board outline cannot be read"
 INSET_SKIP = "skipped: the outline cannot be shrunk by delta"
@@ -219,18 +224,33 @@ def outline_rewrite(board: object, text: str) -> tuple[str, dict]:
     return new, {"outline_rewrite": report, "polygon": reasons, "warnings": warnings}
 
 
+# --- the DSN layer policy (D7-19) ----------------------------------------------------------
+def layer_policy(text: str, policy_path: str | None) -> tuple[str, dict]:
+    """(text after the DSN layer policy of `policy_path`, {"dsn_policy":
+    report}); without a policy (text, {}) unchanged. ExportError('dsn_policy')
+    for an unreadable, bad or stale policy."""
+    if policy_path is None:
+        return text, {}
+    try:
+        new, report = dsn_layers.postprocess(text, dsn_layers.load_policy_file(policy_path))
+    except dsn_layers.DsnLayersError as e:
+        raise ExportError("dsn_policy", str(e)) from e
+    return new, {"dsn_policy": report}
+
+
 # --- entry points --------------------------------------------------------------------------
-def run(pcb: str, dsn: str) -> dict:
-    """Load, export, rewrite a polygon board's outline; the ok-true result.
-    Raises ExportError; once the export was attempted it has removed the DSN
-    (a load failure never touches it: swapped arguments must not delete a
-    board)."""
+def run(pcb: str, dsn: str, policy: str | None = None) -> dict:
+    """Load, export, rewrite a polygon board's outline, apply the optional DSN
+    layer policy; the ok-true result. Raises ExportError; once the export was
+    attempted it has removed the DSN (a load failure never touches it:
+    swapped arguments must not delete a board)."""
     board = load(pcb)
     try:
         export(board, dsn)
         raw = read_dsn(dsn)
         text, info = outline_rewrite(board, raw)
-        # D7-19: the DSN layer policy post-processes `text` here, before the one write
+        text, policy_info = layer_policy(text, policy)
+        info = {**info, **policy_info}
         if text is not raw:
             write_atomic(dsn, text)
     except Exception as e:
@@ -243,24 +263,28 @@ def run(pcb: str, dsn: str) -> dict:
 
 
 def usage_error(argv: list[str]) -> str | None:
-    """Why `argv` is not <board.kicad_pcb> <out.dsn>, or None."""
-    if len(argv) != 2:
+    """Why `argv` is not <board.kicad_pcb> <out.dsn> [<stackup.json>], or None."""
+    if len(argv) not in (2, 3):
         return f"{USAGE} (got {len(argv)} argument(s))"
-    pcb, dsn = argv
+    pcb, dsn = argv[:2]
     if os.path.abspath(pcb) == os.path.abspath(dsn) or dsn.lower().endswith(".kicad_pcb"):
         return f"{USAGE}: the DSN path {dsn!r} would overwrite a board"
+    if len(argv) == 3 and os.path.abspath(argv[2]) in (os.path.abspath(pcb),
+                                                       os.path.abspath(dsn)):
+        return f"{USAGE}: the stackup JSON {argv[2]!r} is the board or the DSN"
     return None
 
 
 def main(argv: list[str]) -> int:
-    """argv = [board.kicad_pcb, out.dsn]; prints ONE JSON line; rc 0 / 1 / 2."""
+    """argv = [board.kicad_pcb, out.dsn[, stackup.json]]; prints ONE JSON
+    line; rc 0 / 1 / 2."""
     why = usage_error(argv)
     if why:
         print(json.dumps({"ok": False, "stage": "usage", "error": why}))
         return RC_USAGE
-    pcb, dsn = argv
+    pcb, dsn = argv[:2]
     try:
-        result = run(pcb, dsn)
+        result = run(pcb, dsn, argv[2] if len(argv) == 3 else None)
     except Exception as e:
         if not isinstance(e, ExportError):          # before the export: nothing to remove
             traceback.print_exc(file=sys.stderr)

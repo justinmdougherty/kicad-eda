@@ -87,7 +87,7 @@ def test_a_pass_run_writes_decisions_and_a_review_with_every_section_in_order(wo
 
 
 def test_the_report_carries_the_keys_the_review_renders(world):
-    rep = world.run()
+    rep = world.run(route="auto")
     assert rep["board_file"] == {"path": str(world.pcb), "format_version": 20241229,
                                  "generator": "pcbnew", "generator_version": "9.0"}
     assert rep["routing"] == {"method": "freerouting", "requested": "auto",
@@ -111,8 +111,8 @@ def test_an_existing_pre_k11_snapshot_is_reported(world):
 
 
 def test_the_routing_decision_is_recorded_once_per_run_and_names_the_cache(world):
-    first = world.run()
-    second = world.run()                                 # nothing moved: a route cache hit
+    first = world.run(route="auto")
+    second = world.run(route="auto")                 # nothing moved: a route cache hit
     assert first["routing"]["method"] == "freerouting"
     assert second["route_cache"] == "hit" and second["routing"]["method"] == "route cache"
     routing = [e for e in _log(world) if e["stage"] == "routing"]

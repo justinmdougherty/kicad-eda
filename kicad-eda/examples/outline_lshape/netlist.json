@@ -1,0 +1,42 @@
+{
+ "name": "outline_lshape",
+ "title": "Outline e2e: USB-C powered LM358 dual buffer on an L-shaped 60 x 45 board (top-right 28 x 20 notch)",
+ "board": {
+  "outline": {"loop": [[0, 0], [32, 0], [32, 19, -0.41421356237309503], [33, 20], [60, 20], [60, 45], [0, 45]]}
+ },
+ "assumptions": [
+  {"id": "usb.shield", "topic": "USB-C shield", "value": "J1.SH left unconnected (no_connect)",
+   "rationale": "KiCad 9 numbers the HRO TYPE-C-31-M-12 shield pads and the USB2.0_16P shield pin S1, KiCad 10 numbers both SH, and a host with both installs reads the symbol from one and the footprint from the other; netting the shield under either name fails on one of them. A product ties the shield to GND (directly or through an RC)",
+   "confidence": "med", "override": "nets"}
+ ],
+ "copper_layers": 4,
+ "stackup": {"rationale": "4 layers: In1.Cu GND and In2.Cu +3V3 reach both arms of the L, so the USB-C in the upper arm and the op-amp in the lower band share one ground reference"},
+ "mounting_holes": {"positions": [[4, 4], [10, 41], [56, 41], [56, 24]]},
+ "components": [
+  {"ref": "J1", "lib_id": "Connector:USB_C_Receptacle_USB2.0_16P", "value": "USB-C", "footprint": "Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12", "at": [27.6, 10, 90]},
+  {"ref": "C4", "lib_id": "Device:C", "value": "10uF", "footprint": "Capacitor_SMD:C_0805_2012Metric", "side": "B", "at": [16, 12, 45]},
+  {"ref": "J2", "lib_id": "Connector_Generic:Conn_01x06", "value": "IO", "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x06_P2.54mm_Vertical", "edge": "left"},
+  {"ref": "U1", "lib_id": "Regulator_Linear:AP2112K-3.3", "value": "AP2112K-3.3", "footprint": "Package_TO_SOT_SMD:SOT-23-5"},
+  {"ref": "C1", "lib_id": "Device:C", "value": "1uF", "footprint": "Capacitor_SMD:C_0603_1608Metric"},
+  {"ref": "C2", "lib_id": "Device:C", "value": "1uF", "footprint": "Capacitor_SMD:C_0603_1608Metric"},
+  {"ref": "U2", "lib_id": "Amplifier_Operational:LM358", "value": "LM358", "footprint": "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm"},
+  {"ref": "C3", "lib_id": "Device:C", "value": "100nF", "footprint": "Capacitor_SMD:C_0603_1608Metric"},
+  {"ref": "R1", "lib_id": "Device:R", "value": "5.1k", "footprint": "Resistor_SMD:R_0603_1608Metric"},
+  {"ref": "R2", "lib_id": "Device:R", "value": "5.1k", "footprint": "Resistor_SMD:R_0603_1608Metric"},
+  {"ref": "R3", "lib_id": "Device:R", "value": "1k", "footprint": "Resistor_SMD:R_0603_1608Metric"},
+  {"ref": "D1", "lib_id": "Device:LED", "value": "PWR", "footprint": "LED_SMD:LED_0603_1608Metric"}
+ ],
+ "nets": {
+  "VBUS": [["J1", "A4"], ["J1", "A9"], ["J1", "B4"], ["J1", "B9"], ["U1", "1"], ["U1", "3"], ["C1", "1"], ["C4", "1"]],
+  "GND": [["J1", "A1"], ["J1", "A12"], ["J1", "B1"], ["J1", "B12"], ["U1", "2"], ["C1", "2"], ["C2", "2"], ["C3", "2"], ["C4", "2"], ["R1", "2"], ["R2", "2"], ["D1", "1"], ["U2", "4"], ["J2", "6"]],
+  "+3V3": [["U1", "5"], ["C2", "1"], ["C3", "1"], ["U2", "8"], ["R3", "1"], ["J2", "1"]],
+  "CC1": [["J1", "A5"], ["R1", "1"]],
+  "CC2": [["J1", "B5"], ["R2", "1"]],
+  "LED_A": [["R3", "2"], ["D1", "2"]],
+  "IN_A": [["J2", "2"], ["U2", "3"]],
+  "OUT_A": [["U2", "1"], ["U2", "2"], ["J2", "3"]],
+  "IN_B": [["J2", "4"], ["U2", "5"]],
+  "OUT_B": [["U2", "7"], ["U2", "6"], ["J2", "5"]]
+ },
+ "no_connect": [["J1", "SH"], ["J1", "A6"], ["J1", "A7"], ["J1", "A8"], ["J1", "B6"], ["J1", "B7"], ["J1", "B8"], ["U1", "4"]]
+}

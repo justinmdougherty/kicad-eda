@@ -328,7 +328,8 @@ def test_script_is_stdlib_plus_pcbnew_py311_and_small() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
     tree = ast.parse(source, feature_version=(3, 11))
     assert len(source.splitlines()) < 800
-    ours = {"kicad_quiet", "pcbnew", "board_outline", "dsn_outline", "dsn_sexpr", "outline"}
+    ours = {"kicad_quiet", "pcbnew", "board_outline", "dsn_layers", "dsn_outline", "dsn_sexpr",
+            "outline"}
     stdlib = {"__future__", "json", "math", "os", "sys", "tempfile", "traceback",
               "collections", "pathlib", "typing"}
     mods = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)

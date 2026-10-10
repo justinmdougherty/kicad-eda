@@ -1,0 +1,9 @@
+{
+  "expect": "FAIL",
+  "gate": "G3",
+  "blocker_contains": "C9: courtyard overlaps cutout 1",
+  "post_checks": [
+    {"script": "pipeline/e2e_outline_check.py", "python": "kicad",
+     "args": ["{pcb}", "{netlist}", "--caught", "C9"]}
+  ]
+}

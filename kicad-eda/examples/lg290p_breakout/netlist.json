@@ -1,0 +1,3035 @@
+{
+  "name": "lg290p_breakout",
+  "title": "Quectel LG290P RTK GNSS breakout (u.FL, 3.3 V LDO, UART/PPS header)",
+  "require_sourcing": true,
+  "assumptions": [
+    {
+      "id": "board.copper_layers",
+      "topic": "copper layer count",
+      "value": 4,
+      "rationale": "the 55 inner GND pads of the LGA-79 escape through vias to an unbroken In1.Cu GND plane that is also the reference of the 50 ohm RF_IN / ANT feed; In2.Cu carries +3V3 (the builder's default planes). On 2 layers the escape vias and the routing would share one bottom pour (ROADMAP D7: layer count per design)",
+      "confidence": "high",
+      "override": "copper_layers"
+    },
+    {
+      "id": "gnss.inner_gnd",
+      "topic": "LG290P inner GND pads",
+      "value": "F2-S1 strategy (f): 40 generated escape vias, the netlist_hints of author_footprint(preset='lg290p') placed at U1",
+      "rationale": "F2-S1 measured DRC 0 / unconnected 0 on KiCad 9.0.4 and 10.0.5 with the fastest routing; every F.Cu GND zone poured before routing failed",
+      "confidence": "high",
+      "override": "preroutes"
+    },
+    {
+      "id": "mech.lid",
+      "topic": "enclosure height",
+      "value": "2.8 mm over the whole top side, J2 exempt",
+      "rationale": "the LG290P body is 2.6 mm (2.8 mm max): nothing else may stand taller",
+      "confidence": "med",
+      "override": "height_zones"
+    },
+    {
+      "id": "mech.keep_clear",
+      "topic": "module keep-clear",
+      "value": "3 mm around the LG290P body",
+      "rationale": "LG290P Hardware Design: keep other components >= 3 mm from the module; written as a max_height 0 height zone that exempts U1",
+      "confidence": "high",
+      "override": "height_zones"
+    },
+    {
+      "id": "power.input",
+      "topic": "supply",
+      "value": "5 V on J2 pin 1 -> AP2112K-3.3 LDO -> +3V3",
+      "rationale": "the host powers the breakout through its UART/PPS header; V_BCKP is fed from +3V3 through BAT54J with a 4.7 uF hold-up cap",
+      "confidence": "med",
+      "override": "net_specs.VIN"
+    },
+    {
+      "id": "rf.antenna",
+      "topic": "GNSS antenna",
+      "value": "active antenna on u.FL J1",
+      "rationale": "VDD_RF biases it through 10 ohm + 68 nH, a 100 pF cap blocks DC to RF_IN and an 0402 ESD diode guards the connector (LG290P active-antenna reference)",
+      "confidence": "med",
+      "override": "components"
+    }
+  ],
+  "class": 2,
+  "stackup": {
+    "h": 0.2,
+    "er": 4.2
+  },
+  "board": {
+    "w": 48.0,
+    "h": 32.0
+  },
+  "components": [
+    {
+      "ref": "U1",
+      "lib_id": "lg290p_breakout_parts:LG290P",
+      "value": "LG290P",
+      "footprint": "lg290p_breakout_parts:Quectel_LG290P",
+      "x": 21.0,
+      "y": 16.0,
+      "rot": 0.0,
+      "height": 2.8,
+      "mpn": "LG290P03AA"
+    },
+    {
+      "ref": "J1",
+      "lib_id": "Connector:Conn_Coaxial",
+      "value": "U.FL",
+      "footprint": "Connector_Coaxial:U.FL_Hirose_U.FL-R-SMT-1_Vertical",
+      "x": 4.0,
+      "y": 21.9,
+      "rot": 180,
+      "interior": true,
+      "height": 1.25,
+      "mpn": "U.FL-R-SMT-1(10)"
+    },
+    {
+      "ref": "C1",
+      "lib_id": "Device:C",
+      "value": "100pF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "x": 9.0,
+      "y": 21.9,
+      "rot": 0.0,
+      "mpn": "GRM1555C1H101JA01D"
+    },
+    {
+      "ref": "D1",
+      "lib_id": "Device:D_TVS",
+      "value": "ESD_0402",
+      "footprint": "Diode_SMD:D_0402_1005Metric",
+      "x": 7.6,
+      "y": 24.2,
+      "rot": 0.0,
+      "mpn": "PESD0402-140"
+    },
+    {
+      "ref": "L1",
+      "lib_id": "Device:L",
+      "value": "68nH",
+      "footprint": "Inductor_SMD:L_0402_1005Metric",
+      "x": 7.6,
+      "y": 19.4,
+      "rot": 0.0,
+      "mpn": "LQG15HS68NJ02D"
+    },
+    {
+      "ref": "R1",
+      "lib_id": "Device:R",
+      "value": "10",
+      "footprint": "Resistor_SMD:R_0402_1005Metric",
+      "x": 10.3,
+      "y": 17.6,
+      "rot": 0.0,
+      "mpn": "RC0402FR-0710RL"
+    },
+    {
+      "ref": "C2",
+      "lib_id": "Device:C",
+      "value": "100nF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "x": 7.6,
+      "y": 16.9,
+      "rot": 0.0,
+      "mpn": "GRM155R71C104KA88D"
+    },
+    {
+      "ref": "U2",
+      "lib_id": "Regulator_Linear:AP2112K-3.3",
+      "value": "AP2112K-3.3",
+      "footprint": "Package_TO_SOT_SMD:SOT-23-5",
+      "x": 35.5,
+      "y": 7.0,
+      "rot": 0.0,
+      "mpn": "AP2112K-3.3TRG1"
+    },
+    {
+      "ref": "C3",
+      "lib_id": "Device:C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0603_1608Metric",
+      "x": 35.5,
+      "y": 3.0,
+      "rot": 0.0,
+      "mpn": "GRM188R61E105KA12D"
+    },
+    {
+      "ref": "C4",
+      "lib_id": "Device:C",
+      "value": "1uF",
+      "footprint": "Capacitor_SMD:C_0603_1608Metric",
+      "x": 40.5,
+      "y": 7.0,
+      "rot": 0.0,
+      "mpn": "GRM188R61E105KA12D"
+    },
+    {
+      "ref": "C5",
+      "lib_id": "Device:C",
+      "value": "10uF",
+      "footprint": "Capacitor_SMD:C_0805_2012Metric",
+      "x": 34.0,
+      "y": 11.0,
+      "rot": 0.0,
+      "mpn": "GRM21BR61E106KA73L"
+    },
+    {
+      "ref": "C6",
+      "lib_id": "Device:C",
+      "value": "100nF",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "x": 33.0,
+      "y": 13.5,
+      "rot": 0.0,
+      "mpn": "GRM155R71C104KA88D"
+    },
+    {
+      "ref": "D2",
+      "lib_id": "Device:D_Schottky",
+      "value": "BAT54J",
+      "footprint": "Diode_SMD:D_SOD-323",
+      "x": 38.5,
+      "y": 11.0,
+      "rot": 0.0,
+      "mpn": "BAT54J"
+    },
+    {
+      "ref": "C7",
+      "lib_id": "Device:C",
+      "value": "4.7uF",
+      "footprint": "Capacitor_SMD:C_0603_1608Metric",
+      "x": 36.0,
+      "y": 13.5,
+      "rot": 0.0,
+      "mpn": "GRM188R61C475KAAJD"
+    },
+    {
+      "ref": "R2",
+      "lib_id": "Device:R",
+      "value": "1k",
+      "footprint": "Resistor_SMD:R_0603_1608Metric",
+      "x": 33.0,
+      "y": 18.0,
+      "rot": 0.0,
+      "mpn": "RC0603FR-071KL"
+    },
+    {
+      "ref": "D3",
+      "lib_id": "Device:LED",
+      "value": "PWR",
+      "footprint": "LED_SMD:LED_0603_1608Metric",
+      "x": 37.0,
+      "y": 18.0,
+      "rot": 0.0,
+      "mpn": "LTST-C191KGKT"
+    },
+    {
+      "ref": "R3",
+      "lib_id": "Device:R",
+      "value": "1k",
+      "footprint": "Resistor_SMD:R_0603_1608Metric",
+      "x": 33.0,
+      "y": 21.0,
+      "rot": 0.0,
+      "mpn": "RC0603FR-071KL"
+    },
+    {
+      "ref": "D4",
+      "lib_id": "Device:LED",
+      "value": "PPS",
+      "footprint": "LED_SMD:LED_0603_1608Metric",
+      "x": 37.0,
+      "y": 21.0,
+      "rot": 0.0,
+      "mpn": "LTST-C191KSKT"
+    },
+    {
+      "ref": "R4",
+      "lib_id": "Device:R",
+      "value": "1k",
+      "footprint": "Resistor_SMD:R_0603_1608Metric",
+      "x": 33.0,
+      "y": 24.0,
+      "rot": 0.0,
+      "mpn": "RC0603FR-071KL"
+    },
+    {
+      "ref": "D5",
+      "lib_id": "Device:LED",
+      "value": "RTK",
+      "footprint": "LED_SMD:LED_0603_1608Metric",
+      "x": 37.0,
+      "y": 24.0,
+      "rot": 0.0,
+      "mpn": "LTST-C191KRKT"
+    },
+    {
+      "ref": "J2",
+      "lib_id": "Connector_Generic:Conn_01x06",
+      "value": "UART_PPS",
+      "footprint": "Connector_PinHeader_2.54mm:PinHeader_1x06_P2.54mm_Vertical",
+      "x": 45.5,
+      "y": 16.0,
+      "rot": 0.0,
+      "mpn": "61300611121"
+    }
+  ],
+  "nets": {
+    "GND": [
+      [
+        "U1",
+        "10"
+      ],
+      [
+        "U1",
+        "12"
+      ],
+      [
+        "U1",
+        "13"
+      ],
+      [
+        "U1",
+        "24"
+      ],
+      [
+        "U1",
+        "25"
+      ],
+      [
+        "U1",
+        "26"
+      ],
+      [
+        "U1",
+        "27"
+      ],
+      [
+        "U1",
+        "28"
+      ],
+      [
+        "U1",
+        "29"
+      ],
+      [
+        "U1",
+        "30"
+      ],
+      [
+        "U1",
+        "31"
+      ],
+      [
+        "U1",
+        "32"
+      ],
+      [
+        "U1",
+        "33"
+      ],
+      [
+        "U1",
+        "34"
+      ],
+      [
+        "U1",
+        "35"
+      ],
+      [
+        "U1",
+        "36"
+      ],
+      [
+        "U1",
+        "37"
+      ],
+      [
+        "U1",
+        "38"
+      ],
+      [
+        "U1",
+        "39"
+      ],
+      [
+        "U1",
+        "40"
+      ],
+      [
+        "U1",
+        "41"
+      ],
+      [
+        "U1",
+        "42"
+      ],
+      [
+        "U1",
+        "43"
+      ],
+      [
+        "U1",
+        "44"
+      ],
+      [
+        "U1",
+        "45"
+      ],
+      [
+        "U1",
+        "46"
+      ],
+      [
+        "U1",
+        "47"
+      ],
+      [
+        "U1",
+        "48"
+      ],
+      [
+        "U1",
+        "49"
+      ],
+      [
+        "U1",
+        "50"
+      ],
+      [
+        "U1",
+        "51"
+      ],
+      [
+        "U1",
+        "52"
+      ],
+      [
+        "U1",
+        "53"
+      ],
+      [
+        "U1",
+        "54"
+      ],
+      [
+        "U1",
+        "55"
+      ],
+      [
+        "U1",
+        "56"
+      ],
+      [
+        "U1",
+        "57"
+      ],
+      [
+        "U1",
+        "58"
+      ],
+      [
+        "U1",
+        "59"
+      ],
+      [
+        "U1",
+        "60"
+      ],
+      [
+        "U1",
+        "61"
+      ],
+      [
+        "U1",
+        "62"
+      ],
+      [
+        "U1",
+        "63"
+      ],
+      [
+        "U1",
+        "64"
+      ],
+      [
+        "U1",
+        "65"
+      ],
+      [
+        "U1",
+        "66"
+      ],
+      [
+        "U1",
+        "67"
+      ],
+      [
+        "U1",
+        "68"
+      ],
+      [
+        "U1",
+        "69"
+      ],
+      [
+        "U1",
+        "70"
+      ],
+      [
+        "U1",
+        "71"
+      ],
+      [
+        "U1",
+        "72"
+      ],
+      [
+        "U1",
+        "73"
+      ],
+      [
+        "U1",
+        "74"
+      ],
+      [
+        "U1",
+        "75"
+      ],
+      [
+        "U1",
+        "76"
+      ],
+      [
+        "U1",
+        "77"
+      ],
+      [
+        "U1",
+        "78"
+      ],
+      [
+        "U1",
+        "79"
+      ],
+      [
+        "J1",
+        "2"
+      ],
+      [
+        "D1",
+        "2"
+      ],
+      [
+        "C2",
+        "2"
+      ],
+      [
+        "U2",
+        "2"
+      ],
+      [
+        "C3",
+        "2"
+      ],
+      [
+        "C4",
+        "2"
+      ],
+      [
+        "C5",
+        "2"
+      ],
+      [
+        "C6",
+        "2"
+      ],
+      [
+        "C7",
+        "2"
+      ],
+      [
+        "D3",
+        "1"
+      ],
+      [
+        "D4",
+        "1"
+      ],
+      [
+        "D5",
+        "1"
+      ],
+      [
+        "J2",
+        "2"
+      ]
+    ],
+    "VIN": [
+      [
+        "J2",
+        "1"
+      ],
+      [
+        "U2",
+        "1"
+      ],
+      [
+        "U2",
+        "3"
+      ],
+      [
+        "C3",
+        "1"
+      ]
+    ],
+    "+3V3": [
+      [
+        "U2",
+        "5"
+      ],
+      [
+        "C4",
+        "1"
+      ],
+      [
+        "C5",
+        "1"
+      ],
+      [
+        "C6",
+        "1"
+      ],
+      [
+        "U1",
+        "23"
+      ],
+      [
+        "D2",
+        "2"
+      ],
+      [
+        "R2",
+        "1"
+      ]
+    ],
+    "V_BCKP": [
+      [
+        "D2",
+        "1"
+      ],
+      [
+        "C7",
+        "1"
+      ],
+      [
+        "U1",
+        "22"
+      ]
+    ],
+    "ANT": [
+      [
+        "J1",
+        "1"
+      ],
+      [
+        "C1",
+        "1"
+      ],
+      [
+        "L1",
+        "1"
+      ],
+      [
+        "D1",
+        "1"
+      ]
+    ],
+    "RF_IN": [
+      [
+        "C1",
+        "2"
+      ],
+      [
+        "U1",
+        "11"
+      ]
+    ],
+    "VBIAS": [
+      [
+        "L1",
+        "2"
+      ],
+      [
+        "R1",
+        "1"
+      ],
+      [
+        "C2",
+        "1"
+      ]
+    ],
+    "VDD_RF": [
+      [
+        "R1",
+        "2"
+      ],
+      [
+        "U1",
+        "9"
+      ]
+    ],
+    "TXD1": [
+      [
+        "U1",
+        "20"
+      ],
+      [
+        "J2",
+        "3"
+      ]
+    ],
+    "RXD1": [
+      [
+        "U1",
+        "21"
+      ],
+      [
+        "J2",
+        "4"
+      ]
+    ],
+    "PPS": [
+      [
+        "U1",
+        "3"
+      ],
+      [
+        "J2",
+        "5"
+      ],
+      [
+        "R3",
+        "1"
+      ]
+    ],
+    "RESET_N": [
+      [
+        "U1",
+        "8"
+      ],
+      [
+        "J2",
+        "6"
+      ]
+    ],
+    "RTK_STAT": [
+      [
+        "U1",
+        "14"
+      ],
+      [
+        "R4",
+        "1"
+      ]
+    ],
+    "PWR_LED": [
+      [
+        "R2",
+        "2"
+      ],
+      [
+        "D3",
+        "2"
+      ]
+    ],
+    "PPS_LED": [
+      [
+        "R3",
+        "2"
+      ],
+      [
+        "D4",
+        "2"
+      ]
+    ],
+    "RTK_LED": [
+      [
+        "R4",
+        "2"
+      ],
+      [
+        "D5",
+        "2"
+      ]
+    ]
+  },
+  "no_connect": [
+    [
+      "U1",
+      "1"
+    ],
+    [
+      "U1",
+      "2"
+    ],
+    [
+      "U1",
+      "5"
+    ],
+    [
+      "U1",
+      "17"
+    ],
+    [
+      "U1",
+      "4"
+    ],
+    [
+      "U1",
+      "7"
+    ],
+    [
+      "U1",
+      "15"
+    ],
+    [
+      "U1",
+      "19"
+    ],
+    [
+      "U1",
+      "6"
+    ],
+    [
+      "U1",
+      "16"
+    ],
+    [
+      "U1",
+      "18"
+    ],
+    [
+      "U2",
+      "4"
+    ]
+  ],
+  "net_specs": {
+    "VIN": {
+      "voltage": 5.0,
+      "current": 0.2
+    },
+    "+3V3": {
+      "voltage": 3.3,
+      "current": 0.15
+    },
+    "V_BCKP": {
+      "voltage": 3.3,
+      "current": 0.001
+    },
+    "ANT": {
+      "impedance": 50
+    },
+    "RF_IN": {
+      "impedance": 50
+    }
+  },
+  "height_zones": [
+    {
+      "name": "enclosure lid 2.8 mm",
+      "side": "F",
+      "x": 0,
+      "y": 0,
+      "w": 48.0,
+      "h": 32.0,
+      "max_height": 2.8,
+      "exempt": [
+        "J2"
+      ]
+    },
+    {
+      "name": "LG290P 3 mm keep-clear",
+      "side": "both",
+      "x": 11.9,
+      "y": 5.0,
+      "w": 18.2,
+      "h": 22.0,
+      "max_height": 0.0,
+      "exempt": [
+        "U1"
+      ]
+    }
+  ],
+  "libraries": {
+    "footprints": {
+      "lg290p_breakout_parts": "libs/lg290p_breakout_parts.pretty"
+    },
+    "symbols": {
+      "lg290p_breakout_parts": "libs/lg290p_breakout_parts.kicad_sym"
+    }
+  },
+  "preroutes": [
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "25"
+        ],
+        [
+          "xy",
+          18.9,
+          9.7
+        ],
+        [
+          "pad",
+          "U1",
+          "37"
+        ]
+      ],
+      "vias": [
+        [
+          18.9,
+          9.7
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "36"
+        ],
+        [
+          "xy",
+          18.9,
+          9.7
+        ],
+        [
+          "pad",
+          "U1",
+          "26"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "36"
+        ],
+        [
+          "xy",
+          20.3,
+          9.7
+        ],
+        [
+          "pad",
+          "U1",
+          "48"
+        ]
+      ],
+      "vias": [
+        [
+          20.3,
+          9.7
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "47"
+        ],
+        [
+          "xy",
+          20.3,
+          9.7
+        ],
+        [
+          "pad",
+          "U1",
+          "37"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "47"
+        ],
+        [
+          "xy",
+          21.7,
+          9.7
+        ],
+        [
+          "pad",
+          "U1",
+          "59"
+        ]
+      ],
+      "vias": [
+        [
+          21.7,
+          9.7
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "58"
+        ],
+        [
+          "xy",
+          21.7,
+          9.7
+        ],
+        [
+          "pad",
+          "U1",
+          "48"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "58"
+        ],
+        [
+          "xy",
+          23.1,
+          9.7
+        ],
+        [
+          "pad",
+          "U1",
+          "70"
+        ]
+      ],
+      "vias": [
+        [
+          23.1,
+          9.7
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "69"
+        ],
+        [
+          "xy",
+          23.1,
+          9.7
+        ],
+        [
+          "pad",
+          "U1",
+          "59"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "26"
+        ],
+        [
+          "xy",
+          18.9,
+          11.1
+        ],
+        [
+          "pad",
+          "U1",
+          "38"
+        ]
+      ],
+      "vias": [
+        [
+          18.9,
+          11.1
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "37"
+        ],
+        [
+          "xy",
+          18.9,
+          11.1
+        ],
+        [
+          "pad",
+          "U1",
+          "27"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "37"
+        ],
+        [
+          "xy",
+          20.3,
+          11.1
+        ],
+        [
+          "pad",
+          "U1",
+          "49"
+        ]
+      ],
+      "vias": [
+        [
+          20.3,
+          11.1
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "48"
+        ],
+        [
+          "xy",
+          20.3,
+          11.1
+        ],
+        [
+          "pad",
+          "U1",
+          "38"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "48"
+        ],
+        [
+          "xy",
+          21.7,
+          11.1
+        ],
+        [
+          "pad",
+          "U1",
+          "60"
+        ]
+      ],
+      "vias": [
+        [
+          21.7,
+          11.1
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "59"
+        ],
+        [
+          "xy",
+          21.7,
+          11.1
+        ],
+        [
+          "pad",
+          "U1",
+          "49"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "59"
+        ],
+        [
+          "xy",
+          23.1,
+          11.1
+        ],
+        [
+          "pad",
+          "U1",
+          "71"
+        ]
+      ],
+      "vias": [
+        [
+          23.1,
+          11.1
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "70"
+        ],
+        [
+          "xy",
+          23.1,
+          11.1
+        ],
+        [
+          "pad",
+          "U1",
+          "60"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "27"
+        ],
+        [
+          "xy",
+          18.9,
+          12.5
+        ],
+        [
+          "pad",
+          "U1",
+          "39"
+        ]
+      ],
+      "vias": [
+        [
+          18.9,
+          12.5
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "38"
+        ],
+        [
+          "xy",
+          18.9,
+          12.5
+        ],
+        [
+          "pad",
+          "U1",
+          "28"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "38"
+        ],
+        [
+          "xy",
+          20.3,
+          12.5
+        ],
+        [
+          "pad",
+          "U1",
+          "50"
+        ]
+      ],
+      "vias": [
+        [
+          20.3,
+          12.5
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "49"
+        ],
+        [
+          "xy",
+          20.3,
+          12.5
+        ],
+        [
+          "pad",
+          "U1",
+          "39"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "49"
+        ],
+        [
+          "xy",
+          21.7,
+          12.5
+        ],
+        [
+          "pad",
+          "U1",
+          "61"
+        ]
+      ],
+      "vias": [
+        [
+          21.7,
+          12.5
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "60"
+        ],
+        [
+          "xy",
+          21.7,
+          12.5
+        ],
+        [
+          "pad",
+          "U1",
+          "50"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "60"
+        ],
+        [
+          "xy",
+          23.1,
+          12.5
+        ],
+        [
+          "pad",
+          "U1",
+          "72"
+        ]
+      ],
+      "vias": [
+        [
+          23.1,
+          12.5
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "71"
+        ],
+        [
+          "xy",
+          23.1,
+          12.5
+        ],
+        [
+          "pad",
+          "U1",
+          "61"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "28"
+        ],
+        [
+          "xy",
+          18.9,
+          13.9
+        ],
+        [
+          "pad",
+          "U1",
+          "40"
+        ]
+      ],
+      "vias": [
+        [
+          18.9,
+          13.9
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "39"
+        ],
+        [
+          "xy",
+          18.9,
+          13.9
+        ],
+        [
+          "pad",
+          "U1",
+          "29"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "39"
+        ],
+        [
+          "xy",
+          20.3,
+          13.9
+        ],
+        [
+          "pad",
+          "U1",
+          "51"
+        ]
+      ],
+      "vias": [
+        [
+          20.3,
+          13.9
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "50"
+        ],
+        [
+          "xy",
+          20.3,
+          13.9
+        ],
+        [
+          "pad",
+          "U1",
+          "40"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "50"
+        ],
+        [
+          "xy",
+          21.7,
+          13.9
+        ],
+        [
+          "pad",
+          "U1",
+          "62"
+        ]
+      ],
+      "vias": [
+        [
+          21.7,
+          13.9
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "61"
+        ],
+        [
+          "xy",
+          21.7,
+          13.9
+        ],
+        [
+          "pad",
+          "U1",
+          "51"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "61"
+        ],
+        [
+          "xy",
+          23.1,
+          13.9
+        ],
+        [
+          "pad",
+          "U1",
+          "73"
+        ]
+      ],
+      "vias": [
+        [
+          23.1,
+          13.9
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "72"
+        ],
+        [
+          "xy",
+          23.1,
+          13.9
+        ],
+        [
+          "pad",
+          "U1",
+          "62"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "29"
+        ],
+        [
+          "xy",
+          18.9,
+          15.3
+        ],
+        [
+          "pad",
+          "U1",
+          "41"
+        ]
+      ],
+      "vias": [
+        [
+          18.9,
+          15.3
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "40"
+        ],
+        [
+          "xy",
+          18.9,
+          15.3
+        ],
+        [
+          "pad",
+          "U1",
+          "30"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "40"
+        ],
+        [
+          "xy",
+          20.3,
+          15.3
+        ],
+        [
+          "pad",
+          "U1",
+          "52"
+        ]
+      ],
+      "vias": [
+        [
+          20.3,
+          15.3
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "51"
+        ],
+        [
+          "xy",
+          20.3,
+          15.3
+        ],
+        [
+          "pad",
+          "U1",
+          "41"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "51"
+        ],
+        [
+          "xy",
+          21.7,
+          15.3
+        ],
+        [
+          "pad",
+          "U1",
+          "63"
+        ]
+      ],
+      "vias": [
+        [
+          21.7,
+          15.3
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "62"
+        ],
+        [
+          "xy",
+          21.7,
+          15.3
+        ],
+        [
+          "pad",
+          "U1",
+          "52"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "62"
+        ],
+        [
+          "xy",
+          23.1,
+          15.3
+        ],
+        [
+          "pad",
+          "U1",
+          "74"
+        ]
+      ],
+      "vias": [
+        [
+          23.1,
+          15.3
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "73"
+        ],
+        [
+          "xy",
+          23.1,
+          15.3
+        ],
+        [
+          "pad",
+          "U1",
+          "63"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "30"
+        ],
+        [
+          "xy",
+          18.9,
+          16.7
+        ],
+        [
+          "pad",
+          "U1",
+          "42"
+        ]
+      ],
+      "vias": [
+        [
+          18.9,
+          16.7
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "41"
+        ],
+        [
+          "xy",
+          18.9,
+          16.7
+        ],
+        [
+          "pad",
+          "U1",
+          "31"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "41"
+        ],
+        [
+          "xy",
+          20.3,
+          16.7
+        ],
+        [
+          "pad",
+          "U1",
+          "53"
+        ]
+      ],
+      "vias": [
+        [
+          20.3,
+          16.7
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "52"
+        ],
+        [
+          "xy",
+          20.3,
+          16.7
+        ],
+        [
+          "pad",
+          "U1",
+          "42"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "52"
+        ],
+        [
+          "xy",
+          21.7,
+          16.7
+        ],
+        [
+          "pad",
+          "U1",
+          "64"
+        ]
+      ],
+      "vias": [
+        [
+          21.7,
+          16.7
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "63"
+        ],
+        [
+          "xy",
+          21.7,
+          16.7
+        ],
+        [
+          "pad",
+          "U1",
+          "53"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "63"
+        ],
+        [
+          "xy",
+          23.1,
+          16.7
+        ],
+        [
+          "pad",
+          "U1",
+          "75"
+        ]
+      ],
+      "vias": [
+        [
+          23.1,
+          16.7
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "74"
+        ],
+        [
+          "xy",
+          23.1,
+          16.7
+        ],
+        [
+          "pad",
+          "U1",
+          "64"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "31"
+        ],
+        [
+          "xy",
+          18.9,
+          18.1
+        ],
+        [
+          "pad",
+          "U1",
+          "43"
+        ]
+      ],
+      "vias": [
+        [
+          18.9,
+          18.1
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "42"
+        ],
+        [
+          "xy",
+          18.9,
+          18.1
+        ],
+        [
+          "pad",
+          "U1",
+          "32"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "42"
+        ],
+        [
+          "xy",
+          20.3,
+          18.1
+        ],
+        [
+          "pad",
+          "U1",
+          "54"
+        ]
+      ],
+      "vias": [
+        [
+          20.3,
+          18.1
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "53"
+        ],
+        [
+          "xy",
+          20.3,
+          18.1
+        ],
+        [
+          "pad",
+          "U1",
+          "43"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "53"
+        ],
+        [
+          "xy",
+          21.7,
+          18.1
+        ],
+        [
+          "pad",
+          "U1",
+          "65"
+        ]
+      ],
+      "vias": [
+        [
+          21.7,
+          18.1
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "64"
+        ],
+        [
+          "xy",
+          21.7,
+          18.1
+        ],
+        [
+          "pad",
+          "U1",
+          "54"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "64"
+        ],
+        [
+          "xy",
+          23.1,
+          18.1
+        ],
+        [
+          "pad",
+          "U1",
+          "76"
+        ]
+      ],
+      "vias": [
+        [
+          23.1,
+          18.1
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "75"
+        ],
+        [
+          "xy",
+          23.1,
+          18.1
+        ],
+        [
+          "pad",
+          "U1",
+          "65"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "32"
+        ],
+        [
+          "xy",
+          18.9,
+          19.5
+        ],
+        [
+          "pad",
+          "U1",
+          "44"
+        ]
+      ],
+      "vias": [
+        [
+          18.9,
+          19.5
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "43"
+        ],
+        [
+          "xy",
+          18.9,
+          19.5
+        ],
+        [
+          "pad",
+          "U1",
+          "33"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "43"
+        ],
+        [
+          "xy",
+          20.3,
+          19.5
+        ],
+        [
+          "pad",
+          "U1",
+          "55"
+        ]
+      ],
+      "vias": [
+        [
+          20.3,
+          19.5
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "54"
+        ],
+        [
+          "xy",
+          20.3,
+          19.5
+        ],
+        [
+          "pad",
+          "U1",
+          "44"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "54"
+        ],
+        [
+          "xy",
+          21.7,
+          19.5
+        ],
+        [
+          "pad",
+          "U1",
+          "66"
+        ]
+      ],
+      "vias": [
+        [
+          21.7,
+          19.5
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "65"
+        ],
+        [
+          "xy",
+          21.7,
+          19.5
+        ],
+        [
+          "pad",
+          "U1",
+          "55"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "65"
+        ],
+        [
+          "xy",
+          23.1,
+          19.5
+        ],
+        [
+          "pad",
+          "U1",
+          "77"
+        ]
+      ],
+      "vias": [
+        [
+          23.1,
+          19.5
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "76"
+        ],
+        [
+          "xy",
+          23.1,
+          19.5
+        ],
+        [
+          "pad",
+          "U1",
+          "66"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "33"
+        ],
+        [
+          "xy",
+          18.9,
+          20.9
+        ],
+        [
+          "pad",
+          "U1",
+          "45"
+        ]
+      ],
+      "vias": [
+        [
+          18.9,
+          20.9
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "44"
+        ],
+        [
+          "xy",
+          18.9,
+          20.9
+        ],
+        [
+          "pad",
+          "U1",
+          "34"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "44"
+        ],
+        [
+          "xy",
+          20.3,
+          20.9
+        ],
+        [
+          "pad",
+          "U1",
+          "56"
+        ]
+      ],
+      "vias": [
+        [
+          20.3,
+          20.9
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "55"
+        ],
+        [
+          "xy",
+          20.3,
+          20.9
+        ],
+        [
+          "pad",
+          "U1",
+          "45"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "55"
+        ],
+        [
+          "xy",
+          21.7,
+          20.9
+        ],
+        [
+          "pad",
+          "U1",
+          "67"
+        ]
+      ],
+      "vias": [
+        [
+          21.7,
+          20.9
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "66"
+        ],
+        [
+          "xy",
+          21.7,
+          20.9
+        ],
+        [
+          "pad",
+          "U1",
+          "56"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "66"
+        ],
+        [
+          "xy",
+          23.1,
+          20.9
+        ],
+        [
+          "pad",
+          "U1",
+          "78"
+        ]
+      ],
+      "vias": [
+        [
+          23.1,
+          20.9
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "77"
+        ],
+        [
+          "xy",
+          23.1,
+          20.9
+        ],
+        [
+          "pad",
+          "U1",
+          "67"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "34"
+        ],
+        [
+          "xy",
+          18.9,
+          22.3
+        ],
+        [
+          "pad",
+          "U1",
+          "46"
+        ]
+      ],
+      "vias": [
+        [
+          18.9,
+          22.3
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "45"
+        ],
+        [
+          "xy",
+          18.9,
+          22.3
+        ],
+        [
+          "pad",
+          "U1",
+          "35"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "45"
+        ],
+        [
+          "xy",
+          20.3,
+          22.3
+        ],
+        [
+          "pad",
+          "U1",
+          "57"
+        ]
+      ],
+      "vias": [
+        [
+          20.3,
+          22.3
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "56"
+        ],
+        [
+          "xy",
+          20.3,
+          22.3
+        ],
+        [
+          "pad",
+          "U1",
+          "46"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "56"
+        ],
+        [
+          "xy",
+          21.7,
+          22.3
+        ],
+        [
+          "pad",
+          "U1",
+          "68"
+        ]
+      ],
+      "vias": [
+        [
+          21.7,
+          22.3
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "67"
+        ],
+        [
+          "xy",
+          21.7,
+          22.3
+        ],
+        [
+          "pad",
+          "U1",
+          "57"
+        ]
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "67"
+        ],
+        [
+          "xy",
+          23.1,
+          22.3
+        ],
+        [
+          "pad",
+          "U1",
+          "79"
+        ]
+      ],
+      "vias": [
+        [
+          23.1,
+          22.3
+        ]
+      ],
+      "via_size": [
+        0.5,
+        0.25
+      ]
+    },
+    {
+      "net": "GND",
+      "width": 0.25,
+      "layer": "F.Cu",
+      "path": [
+        [
+          "pad",
+          "U1",
+          "78"
+        ],
+        [
+          "xy",
+          23.1,
+          22.3
+        ],
+        [
+          "pad",
+          "U1",
+          "68"
+        ]
+      ]
+    }
+  ]
+}

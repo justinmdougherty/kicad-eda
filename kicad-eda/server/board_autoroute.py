@@ -7,8 +7,8 @@ run() is the body of the MCP tool board_pipeline_tools.autoroute_board (the
 tool keeps its name, signature and docstring there as a thin wrapper).
 Split out of board_pipeline_tools.py by X-09; later owners locate code here by
 function name (freerouting_args, route, unreadable, autoroute_preflight,
-seed_refusal, run, fallback_from_snapshot, autoroute, export_dsn,
-canonical_dsn, parse_ses_import).
+seed_refusal, run, fallback_from_snapshot, autoroute, route_once,
+export_dsn, canonical_dsn, parse_ses_import).
 
 F5-02: KiCad writes footprints, vias and zones in random-UUID order and
 Freerouting 1.9.0 is order-sensitive, so the exported DSN is rewritten in
@@ -24,10 +24,14 @@ put on sys.path at import time (canonical_dsn puts it there when it runs).
 F5-14 (F5-05 spike; 1.9.0 stays): every Freerouting child is kept off the
 network, in its own work dir and, on Windows, on a private desktop via this
 module as a script (`board_autoroute.py --hidden-desktop -- <argv>`).
+
+D7-23a (ADR D7.9): the artifact's DSN layer policy, the SES import's argv[3]
+and the T10 plane-class re-route come from board_physics.
 """
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
@@ -36,6 +40,7 @@ import tempfile
 from pathlib import Path
 
 import board_build
+import board_physics
 import kicad_ipc as ipc
 import toolchain as tc
 
@@ -183,14 +188,17 @@ def seed_refusal(dsn_seed: object) -> dict | None:
     return None
 
 
-def run(pcb: str, max_passes: int = 100, jar: str = "",
-        route_timeout: int = 300, from_snapshot: bool = False, dsn_seed: int = 0) -> dict:
-    """autoroute_board's body: dsn_seed check, preflight, write guard, session
-    release, the optional snapshot restore, then autoroute() (see the tool's
-    docstring in board_pipeline_tools)."""
+def run(pcb: str, max_passes: int = 100, jar: str = "", route_timeout: int = 300,
+        from_snapshot: bool = False, dsn_seed: int = 0, stackup_json: str = "") -> dict:
+    """autoroute_board's body: dsn_seed check, the stackup artifact, preflight,
+    write guard, session release, the optional snapshot restore, then
+    autoroute() (see the tool's docstring in board_pipeline_tools)."""
     bad_seed = seed_refusal(dsn_seed)
     if bad_seed:
         return bad_seed
+    policy = board_physics.route_policy(pcb, stackup_json)        # D7-23a: {} without one
+    if policy.get("ok") is False:
+        return policy
     pre = autoroute_preflight(pcb, jar, from_snapshot)
     if isinstance(pre, dict):
         return pre
@@ -204,7 +212,7 @@ def run(pcb: str, max_passes: int = 100, jar: str = "",
     fallback = fallback_from_snapshot(pcb) if from_snapshot else {}
     if fallback.get("ok") is False:
         return {**fallback, **held}
-    routed = autoroute(pcb, kpy, java, fj, max_passes, route_timeout, dsn_seed)
+    routed = autoroute(pcb, kpy, java, fj, max_passes, route_timeout, dsn_seed, policy)
     return {**routed, **held, **fallback}
 
 
@@ -226,15 +234,20 @@ def fallback_from_snapshot(pcb: str) -> dict:
             "moved": restored["moved"]}
 
 
-def export_dsn(kpy: str, pcb: str, dsn: str, dsn_seed: int) -> dict:
+def export_dsn(kpy: str, pcb: str, dsn: str, dsn_seed: int, policy: dict | None = None,
+               variant: str | None = None) -> dict:
     """swig_export_dsn.py writes `dsn` (any older copy removed first, so a
-    failed export can never route a stale DSN), then canonical_dsn rewrites
-    it: {dsn_sha256} or the {ok: False, step: "dsn" | "dsn_canon"} refusal."""
+    failed export can never route a stale DSN), the D7 layer policy (if any)
+    and canonical_dsn rewrite it: {dsn_sha256[, dsn_policy]} or the {ok: False,
+    step: "dsn" | "dsn_canon"} refusal."""
     Path(dsn).unlink(missing_ok=True)
     d = tc.run([kpy, str(tc.TOOLS_DIR / "swig_export_dsn.py"), pcb, dsn], timeout=120)
     if not Path(dsn).is_file():
         return {"ok": False, "step": "dsn", "stderr": (d.stdout + d.stderr)[-1200:]}
-    return canonical_dsn(dsn, dsn_seed)
+    layered = board_physics.apply_dsn_policy(dsn, policy or {}, variant)     # D7-23a
+    if layered.get("ok") is False:
+        return layered
+    return {**canonical_dsn(dsn, dsn_seed), **layered}
 
 
 def canonical_dsn(dsn: str, dsn_seed: int) -> dict:
@@ -254,23 +267,34 @@ def canonical_dsn(dsn: str, dsn_seed: int) -> dict:
 
 
 def autoroute(pcb: str, kpy: str, java: str, fj: str, max_passes: int,
-              route_timeout: int, dsn_seed: int = 0) -> dict:
-    """DSN export -> canonical DSN order -> Freerouting -> SES import + refill
-    -> DRC unconnected count. Every result after the canonical DSN carries
-    dsn_sha256 and dsn_seed."""
+              route_timeout: int, dsn_seed: int = 0, policy: dict | None = None) -> dict:
+    """route_once, through board_physics.plane_fallback (D7-23a: the T10
+    re-route with the unrestricted plane classes, ADR D7.9)."""
+    attempt = functools.partial(route_once, pcb, kpy, java, fj, max_passes, route_timeout,
+                                dsn_seed, policy or {})
+    return board_physics.plane_fallback(pcb, policy or {}, attempt)
+
+
+def route_once(pcb: str, kpy: str, java: str, fj: str, max_passes: int, route_timeout: int,
+               dsn_seed: int, policy: dict, variant: str | None = None) -> dict:
+    """DSN export (+ layer policy) -> canonical DSN order -> Freerouting -> SES
+    import + refill -> DRC unconnected count. Every result after the canonical
+    DSN carries dsn_sha256 and dsn_seed (and dsn_policy with a policy)."""
     base = str(Path(pcb).with_suffix(""))
     dsn, ses = base + ".dsn", base + ".ses"
-    exported = export_dsn(kpy, pcb, dsn, dsn_seed)
+    exported = export_dsn(kpy, pcb, dsn, dsn_seed, policy, variant)
     if exported.get("ok") is False:
         return exported
-    stamp = {"dsn_sha256": exported["dsn_sha256"], "dsn_seed": dsn_seed}
+    stamp = {"dsn_sha256": exported["dsn_sha256"], "dsn_seed": dsn_seed,
+             **{k: v for k, v in exported.items() if k == "dsn_policy"}}
     # remove any stale SES so a router timeout can't import a previous result
     Path(ses).unlink(missing_ok=True)
     routed = route(java, fj, dsn, ses, max_passes, route_timeout)
     if not routed["ok"]:
         return {"ok": False, "step": "route", **{k: v for k, v in routed.items() if k != "ok"},
                 **stamp}
-    im = tc.run([kpy, str(tc.TOOLS_DIR / "swig_import_ses.py"), pcb, ses], timeout=180)
+    im = tc.run([kpy, str(tc.TOOLS_DIR / "swig_import_ses.py"), pcb, ses,
+                 *board_physics.ses_args(policy)], timeout=180)
     imp = parse_ses_import(im.stdout)
     if not imp["ok"]:
         return {"ok": False, "step": "import", "pcb": pcb, "dsn": dsn, "ses": ses,

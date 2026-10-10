@@ -29,6 +29,7 @@ from pathlib import Path
 import board_autoroute
 import board_build
 import board_fab
+import board_physics
 import kicad_env as env
 import kicad_ipc as ipc
 import toolchain as tc
@@ -115,7 +116,12 @@ def build_board_from_netlist(netlist: str, board_w: float = 0, board_h: float = 
     pack_scale (>1) loosens auto-placement spacing to give a deterministic
     router more room on a re-route. A board-API session (open_board) that
     still holds out_pcb is closed first (released_boards), or the build is
-    refused while it has unsaved changes (blocking_board)."""
+    refused while it has unsaved changes (blocking_board). A netlist that
+    declares a stackup or copper_layers (or has <netlist stem>.stackup.json)
+    gets that physical-design artifact resolved first when missing or stale
+    (ADR D7.4: also <board stem>.kicad_dru and, for another board stem, a
+    byte-identical <board stem>.stackup.json; result "physics"); its errors
+    refuse the build."""
     return board_build.build(netlist, board_w, board_h, out_pcb=out_pcb,
                              footprints_dir=footprints_dir, placement=placement,
                              pack_scale=pack_scale)
@@ -123,12 +129,19 @@ def build_board_from_netlist(netlist: str, board_w: float = 0, board_h: float = 
 
 def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
                     route_timeout: int = 300, from_snapshot: bool = False,
-                    dsn_seed: int = 0) -> dict:
+                    dsn_seed: int = 0, stackup_json: str = "") -> dict:
     """Autoroute a board with Freerouting: export Specctra DSN, route, import the
-    SES session back, and refill zones. Every copper layer is routable in the
-    exported DSN (no per-layer restriction yet), so Freerouting may also lay
-    signal tracks on the inner plane layers; the refilled planes clear around
-    them. A board with a non-rectangular outline (arcs, cutouts, more than 4
+    SES session back, and refill zones. With the stackup artifact
+    (<board stem>.stackup.json beside the board, written by
+    build_board_from_netlist, or stackup_json) the DSN follows the layer roles
+    (ADR D7.9): other nets stay off the plane layers, impedance nets on their
+    solved layers (one with SMD pads outside them stops at step "dsn"), the SES
+    import pours GND by role; the result carries dsn_policy. When that leaves a
+    pad of a plane net unconnected the board is re-routed ONCE with the plane
+    nets unrestricted (dsn_policy.fallback, decision_drafts). Without an
+    artifact every copper layer is routable, as before ("physics" says so):
+    Freerouting may lay signal tracks on the inner plane layers too.
+    A board with a non-rectangular outline (arcs, cutouts, more than 4
     vertices or slanted edges) gets its DSN boundary shrunk and its cutout
     keepouts grown so the routed copper keeps the board's copper-to-edge
     clearance; a rectangular board keeps the outline KiCad exported. The
@@ -153,19 +166,25 @@ def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
     file is closed first (released_boards); one with unsaved changes refuses."""
     return board_autoroute.run(pcb, max_passes=max_passes, jar=jar,
                                route_timeout=route_timeout, from_snapshot=from_snapshot,
-                               dsn_seed=dsn_seed)
+                               dsn_seed=dsn_seed, stackup_json=stackup_json)
 
 
 def export_fab_package(pcb: str, out_dir: str = "", zip_name: str = "",
-                       netlist: str = "") -> dict:
+                       netlist: str = "", stackup_json: str = "") -> dict:
     """Export a complete fabrication + assembly package — Gerbers, drill,
     pick-and-place — then zip it for the fab house. When `netlist` is given,
     also writes the SMT-assembly pair the fab needs to BUILD the board, in
     JLCPCB format: BOM.csv (Comment/Designator/Footprint/LCSC Part #, grouped
     line items; per-component "lcsc"/"mpn" netlist keys are carried through)
-    and CPL.csv (Designator/Mid X/Mid Y/Layer/Rotation). Requires kicad-cli
-    (the one of the KiCad that wrote the board, board_cli(pcb))."""
-    return board_fab.export(pcb, out_dir=out_dir, zip_name=zip_name, netlist=netlist)
+    and CPL.csv (Designator/Mid X/Mid Y/Layer/Rotation). With the stackup
+    artifact (<board stem>.stackup.json, or stackup_json) the zip also carries
+    the stackup (ADR D7.12): the job file's inner copper numbering fixed and
+    checked, <stem>_ipc2581.xml (> 2 copper, non-FR-4 or impedance builds),
+    <stem>_stackup.csv and <stem>_fab_notes.md ("fab_stackup"; a problem is
+    ok False). Requires kicad-cli (the one of the KiCad that wrote the board,
+    board_cli(pcb))."""
+    return board_fab.export(pcb, out_dir=out_dir, zip_name=zip_name, netlist=netlist,
+                            stackup_json=stackup_json)
 
 
 def check_design_gates(pcb: str, netlist: str, stage: str = "placement") -> dict:
@@ -230,7 +249,8 @@ def _stitch_preflight(pcb: str) -> tuple[str, Path] | dict:
 
 def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.0,
                          er: float = 4.2, interior: bool = True,
-                         via_diameter_mm: float = 0.6, via_drill_mm: float = 0.3) -> dict:
+                         via_diameter_mm: float = 0.6, via_drill_mm: float = 0.3,
+                         stackup_json: str = "") -> dict:
     """Add a DRC-safe GND via fence + interior stitching grid to a ROUTED board
     (EMC: ties the ground planes/pours, contains edge fields, keeps the return
     path under the signal). Vias land only where they clear all non-GND copper and
@@ -239,13 +259,20 @@ def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.
     autoroute_board, BEFORE export_fab_package. Runs under KiCad's bundled Python;
     a board that pcbnew cannot read (KiCad 11 format) is refused. A board-API
     session still holding the file is closed first (released_boards); one with
-    unsaved changes refuses (blocking_board) before the board is touched."""
+    unsaved changes refuses (blocking_board) before the board is touched. With
+    the stackup artifact (<board stem>.stackup.json, or stackup_json) the
+    stitching follows the layer roles (ADR D7.8 R22/R26: a single-sided board is
+    refused, a via needs fill on >= 2 GND layers, er comes from the substrate
+    under F.Cu); without one it runs as before ("physics" says so)."""
     pre = _stitch_preflight(pcb)
     if isinstance(pre, dict):
         return pre
     kpy, script = pre
     if not Path(pcb).is_file():
         raise ValueError(f"PCB not found: {pcb}")
+    roles = board_physics.stitch_args(pcb, stackup_json)          # D7-23a: --stackup=<artifact>
+    if isinstance(roles, dict):
+        return roles
     guard = ipc.write_guard(pcb)
     if guard:
         return guard
@@ -255,9 +282,10 @@ def add_ground_stitching(pcb: str, gnd_net: str = "GND", max_freq_hz: float = 0.
         return held
     # emc_stitch.py argv: <pcb> <max_freq_hz> <mode> [gnd_net] [er] [via_dia_mm] [via_drill_mm]
     argv = [str(script), pcb, str(max_freq_hz)]
-    extra = [gnd_net, str(er), str(via_diameter_mm), str(via_drill_mm)]
+    extra = [gnd_net, str(er), str(via_diameter_mm), str(via_drill_mm), *roles]
     modes = ("full", "fence") if interior else ("fence",)
-    return {**_stitch_transaction(pcb, kpy, argv, extra, modes), **held}
+    return {**_stitch_transaction(pcb, kpy, argv, extra, modes), **held,
+            **board_physics.stitch_record(roles)}
 
 
 def _stitch_transaction(pcb: str, kpy: str, argv: list[str], extra: list[str],

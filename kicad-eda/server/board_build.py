@@ -34,6 +34,10 @@ builder unchanged; one > 0 that differs from the board block / outline bbox
 by more than SIZE_TOL_MM is reported as ignored. Every spawned build reports
 ``outline`` = the builder's own record + {source, fingerprint, sidecar}.
 
+Stackup (ADR D7.4, D7-23a): board_physics.ensure_artifact right before the
+SWIG child (artifact, managed DRU, board-stem mirror; errors refuse) and
+KICAD_EDA_STACKUP for it; apply_netclasses takes the plane nets from its roles.
+
 toolchain and kicad_ipc are imported AS MODULES and their functions looked up
 at call time, so tests that monkeypatch tc.run / ipc.write_guard reach this
 code. server/tools is put on sys.path lazily (apply_netclasses, project_libs,
@@ -52,6 +56,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING
 
+import board_physics
 import kicad_ipc as ipc
 import project_libs
 import toolchain as tc
@@ -110,8 +115,9 @@ def build(netlist: str, board_w: float = 0, board_h: float = 0,
 def build_released(kpy: str, argv: list[str], libs: project_libs.ProjectLibs, design: dict,
                    board: OutlinePlan, pack_scale: float) -> dict:
     """build's writes once no editor or session holds the board (argv[1:3] =
-    netlist, out): the library tables, the outline sidecar, the SWIG child,
-    then the net classes. A refusal on the way spawns nothing."""
+    netlist, out): the library tables, the outline sidecar, the stackup
+    artifact, the SWIG child, then the net classes. A refusal on the way spawns
+    nothing."""
     netlist, out = argv[1], argv[2]
     declared = declared_libraries(libs)
     tables = materialize_libraries(libs, design, out, bool(declared))
@@ -122,13 +128,17 @@ def build_released(kpy: str, argv: list[str], libs: project_libs.ProjectLibs, de
     if isinstance(placed, dict):
         return placed
     sidecar, stale = placed
+    physics = board_physics.ensure_artifact(netlist, out, design=design)     # D7-23a
+    if physics.get("ok") is False:
+        return physics
     res = run_with_libraries(kpy, argv, libs, FOOTPRINTS in declared,
-                             builder_env(pack_scale, sidecar))
+                             board_physics.builder_env(builder_env(pack_scale, sidecar), physics))
     res = {**res, "pcb": out, "libraries": project_libs.sources(libs, design),
-           "library_tables": tables, "outline": outline_record(res, resolved, sidecar)}
+           "library_tables": tables, "outline": outline_record(res, resolved, sidecar), **physics}
     res = with_warnings(res, [*notes, *stale])
     if res["ok"]:
-        res = {**res, **apply_netclasses(netlist, out, res.get("zones", []))}
+        res = {**res, **apply_netclasses(netlist, out, res.get("zones", []),
+                                         physics["physics"]["artifact"])}
     return res
 
 
@@ -333,14 +343,16 @@ def release_board_session(pcb: str) -> dict:
     return board_route_tools.release_for_rewrite(pcb)
 
 
-def apply_netclasses(netlist: str, out_pcb: str, zones: list[str]) -> dict:
+def apply_netclasses(netlist: str, out_pcb: str, zones: list[str],
+                     artifact: str | None = None) -> dict:
     """Resolve electrical intent (net_specs + reliability class) into IPC-2221
     net classes and write them into the .kicad_pro so BOTH the Specctra DSN
     export (Freerouting routes power copper wider) and kicad-cli DRC honor
     per-net widths/clearances. Default class 3 (high-reliability) unless the
     netlist overrides "class". A netlist WITH net_specs whose classes cannot be
     written fails the build (ok False) — a board routed at default widths must
-    never pass silently. A netlist without net_specs only reports the slip."""
+    never pass silently. A netlist without net_specs only reports the slip.
+    With the stackup `artifact` (D7-21) its roles give the plane nets."""
     design = json.loads(Path(netlist).read_text(encoding="utf-8"))
     has_specs = bool(design.get("net_specs"))
     try:
@@ -352,10 +364,10 @@ def apply_netclasses(netlist: str, out_pcb: str, zones: list[str]) -> dict:
         # are exempt from track-width classing — the plane or the prerouted
         # copper carries the current, and a width class would make the net's
         # signal taps unreachable for the router
-        planes = tuple(z.split(":", 1)[1] for z in zones if ":" in z)
+        planes = () if artifact else tuple(z.split(":", 1)[1] for z in zones if ":" in z)
         planes += tuple(p["net"] for p in design.get("preroutes", []))
         nc = netclass_writer.apply_to_project(
-            pro, design, int(design.get("class", 3)), plane_nets=planes)
+            pro, design, int(design.get("class", 3)), plane_nets=planes, artifact=artifact)
     except Exception as e:
         nc = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
     summary = {"profile": nc.get("class_profile"), "written": nc.get("classes_written", []),

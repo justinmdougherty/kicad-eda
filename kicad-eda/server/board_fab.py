@@ -15,6 +15,9 @@ kicad-cli pos export is unchanged (no --exclude-dnp): the filtering is ours,
 so it also holds for footprints that lack the DNP attribute. assembly_files is
 imported on first use (server/tools put on sys.path then), never at import.
 
+D7-23a (ADR D7.12): with the stackup artifact (<board stem>.stackup.json or
+stackup_json) board_physics writes the fab stackup outputs before the zip.
+
 toolchain is imported AS A MODULE and its functions looked up at call time, so
 tests that monkeypatch tc.run / tc.board_cli reach this code.
 """
@@ -30,6 +33,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import board_physics
 import toolchain as tc
 
 NOT_WRITTEN = "BOM.csv / CPL.csv not written"
@@ -76,13 +80,17 @@ def _assembly(netlist: str, out: str, pos: str) -> dict[str, Any]:
 
 
 def export(pcb: str, out_dir: str = "", zip_name: str = "",
-           netlist: str = "") -> dict:
+           netlist: str = "", stackup_json: str = "") -> dict:
     """export_fab_package's body: Gerbers, drill, pos, the optional BOM/CPL
-    pair (flagged parts left out: bom_excluded, assembly_warnings), then the
-    zip (see the tool's docstring in board_pipeline_tools)."""
+    pair (flagged parts left out: bom_excluded, assembly_warnings), the fab
+    stackup outputs, then the zip (see the tool's docstring in
+    board_pipeline_tools)."""
     cli = tc.board_cli(pcb)
     if not cli:
         return {"ok": False, "reason": "kicad-cli not found; install KiCad."}
+    found = board_physics.find(pcb, stackup_json)          # D7-23a: the stackup artifact
+    if isinstance(found, dict):
+        return found
     out = out_dir or (str(Path(pcb).with_suffix("")) + "_gerbers")
     Path(out).mkdir(parents=True, exist_ok=True)
     g = tc.run([cli, "pcb", "export", "gerbers", "-o", out, pcb])
@@ -90,14 +98,16 @@ def export(pcb: str, out_dir: str = "", zip_name: str = "",
     pos = str(Path(out) / (Path(pcb).stem + "-pos.csv"))
     p = tc.run([cli, "pcb", "export", "pos", "-o", pos, "--format", "csv", "--units", "mm", pcb])
     assembly = _assembly(netlist, out, pos)
+    stack = board_physics.fab_stackup_outputs(pcb, out, found, cli, netlist=netlist)
     zpath = zip_name or (str(Path(pcb).with_suffix("")) + f"_{tc.FAB_PROFILE}.zip")
     files = [f for f in glob.glob(str(Path(out) / "*")) if not f.endswith(".zip")]
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
         for f in files:
             z.write(f, arcname=Path(f).name)
-    return {"ok": g.returncode == 0 and dr.returncode == 0,
-            "out_dir": out, "zip": zpath, "fab_profile": tc.FAB_PROFILE, "kicad_cli": cli,
-            "bom": assembly["bom"], "cpl": assembly["cpl"],
-            "bom_excluded": assembly["excluded"], "assembly_warnings": assembly["warnings"],
-            "files": [Path(f).name for f in files],
-            "stderr": (g.stderr + dr.stderr + p.stderr)[-1200:]}
+    res = {"ok": g.returncode == 0 and dr.returncode == 0,
+           "out_dir": out, "zip": zpath, "fab_profile": tc.FAB_PROFILE, "kicad_cli": cli,
+           "bom": assembly["bom"], "cpl": assembly["cpl"],
+           "bom_excluded": assembly["excluded"], "assembly_warnings": assembly["warnings"],
+           "files": [Path(f).name for f in files],
+           "stderr": (g.stderr + dr.stderr + p.stderr)[-1200:]}
+    return board_physics.with_fab_stackup(res, stack)                  # D7-23a

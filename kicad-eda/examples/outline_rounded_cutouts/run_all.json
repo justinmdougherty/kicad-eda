@@ -1,0 +1,7 @@
+{
+  "expect": "PASS",
+  "post_checks": [
+    {"script": "pipeline/e2e_outline_check.py", "python": "kicad",
+     "args": ["{pcb}", "{netlist}", "{report}"]}
+  ]
+}
