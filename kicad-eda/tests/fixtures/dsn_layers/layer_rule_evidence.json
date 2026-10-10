@@ -1,0 +1,19 @@
+{
+ "question": "Does Freerouting 1.9.0 honour a per-class (layer_rule L (rule (width W)))? (ADR D7.9 one-time check, D7-19)",
+ "freerouting": "1.9.0",
+ "kicad": "9.0.4",
+ "date": "2026-10-09",
+ "fixture": "six_layer.dsn.txt",
+ "setup": "dsn_layers.postprocess(layer_rule_verified=True) with POLICY 6L (F.Cu In2.Cu In3.Cu B.Cu signal; GND In1.Cu, +3V3 In4.Cu planes) and every one of the 16 non-plane nets an impedance net {primary F.Cu 0.25 mm, In2.Cu 0.15 mm}: class kicad_eda_net_<net> = use_layer F.Cu In2.Cu, (rule (width 250)), (layer_rule In2.Cu (rule (width 150))); dsn_canon order; board_autoroute.route (offline, -mp 600 -dct 0); SES wires of those nets read with dsn_sexpr",
+ "dsn_sha256": "9e1737908eca6c8ad5594be93d053d9cade765ea39c36cde3888ef8ec3ca4a74",
+ "route_seconds": 7.8,
+ "expected_um": {"F.Cu": 250, "In2.Cu": 150},
+ "observed_um": {"F.Cu": {"250": 41}, "In2.Cu": {"150": 14}},
+ "control": {
+  "setup": "the same nets with In2.Cu 0.2501 mm (inside the primary window): use_layer F.Cu In2.Cu, no layer_rule",
+  "observed_um": {"F.Cu": {"250": 41}, "In2.Cu": {"250": 14}}
+ },
+ "kicad_import_um": {"F.Cu": {"250": 85}, "In2.Cu": {"150": 46}},
+ "verified": true,
+ "rerun_by": "tests/test_dsn_layers_live.py::test_live_layer_rule_is_honoured_by_freerouting"
+}

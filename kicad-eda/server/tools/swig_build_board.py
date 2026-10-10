@@ -39,25 +39,54 @@ marker) past it. Every courtyard is checked against the outline.
 Emits a JSON result on stdout; F3-12 adds "anchors" (the "at" parts), "fields"
 ([x0, y0, x1, y1] per auto field), "containment" (outline_audit issues, also
 warnings) and "derived_overhang" ({ref: {overhang_mm, source}}).
+
+Attributes (D4, F46-19): board_only parts are loaded, placed and netted like
+any other part; every component's board_only / dnp / in_bom flags (booleans,
+else the build is refused) become footprint attributes through
+swig_anchor.apply_attrs (board-only, DNP, excluded from the BOM / position
+files; flags only turn attributes on). The result adds "anchored" (how many
+parts "at" placed), "board_only" (refs) and "attr_warnings" (setters this
+pcbnew lacks; also warnings), so a keep-mode rebuild round-trips "at" and
+the attributes through the saved board.
+
+Stackup (D7-14, ADR D7.5): swig_stackup.load_or_resolve gives the stackup
+(the netlist's; cross-checked with the env KICAD_EDA_STACKUP artifact when
+set, a stale one is a warning). apply_layers sets the copper count, each
+layer's type from its role and the board thickness; one pour per plane /
+mixed layer on its net (an outer mixed pour's local clearance = the smallest
+CPWG ground_gap on it: the artifact's solved lines, else net_specs with an
+explicit ground_gap); no pour on a signal or unused layer (single-sided B.Cu);
+the legacy antenna_keepout is a rule area on every enabled copper layer
+(rule_areas). "zones" stays ["<layer>:<net>"] of the pours, the layer read
+with board.GetLayerName(zone.GetLayer()). After SaveBoard, swig_stackup.finalize
+ALWAYS splices the stackup block (not for the legacy shorthand), reloads,
+fills, saves and verifies; a mismatch (copper, types, thickness, block, zone
+roles, a missing pour or keep-out) is ok false with "error". The result adds
+"stackup" (source, preset, thickness, copper, spliced, pour_clearances,
+problems), "layer_roles" ([{layer, role, net, type}]) and "rule_areas"
+([{name, layers}] read back).
 """
 import functools
 import json
+import math
 import os
 import sys
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import kicad_quiet  # noqa: F401  (before pcbnew: no modal wx dialogs)
 import pcbnew
 
-import board_outline as bo
 import build_features as bf
 import build_layout as bl
 import edge_mount as em
 import fp_dialect
 import libtable
 import outline as ol
+import stackup_model as sm
+import swig_anchor as sa
+import swig_stackup as ss
 
 
 def mm(v: float) -> int:
@@ -253,13 +282,21 @@ def edge_mounts(fps: dict) -> tuple[dict, list[str]]:
     return info, warnings
 
 
+def apply_attributes(design: dict, placed: dict) -> list[str]:
+    """swig_anchor.apply_attrs on every component's footprint (D4 board_only,
+    dnp, in_bom; a flag only turns attributes ON, a library's own stay).
+    Returns its warnings, one per setter this pcbnew lacks (never faked); the
+    flags are booleans (build_layout.check_design refused anything else)."""
+    return [w for c in design["components"] for w in sa.apply_attrs(placed[c["ref"]], c, pcbnew)]
+
+
 def place_board(board: "pcbnew.BOARD", design: dict, src: "bf.OutlineSource", sheet: tuple,
                 loaded: tuple, dims: tuple[float, float]) -> tuple[dict, "bl.Layout",
                                                                    tuple, dict, list[str]]:
     """build_layout's targets, the board centred on its sheet, every footprint
-    placed, "edge" connectors snapped and every courtyard checked against the
-    outline (legacy: the w x h rectangle). Returns (placed, layout, (ox, oy),
-    result keys, warnings)."""
+    placed with its D4 attributes, "edge" connectors snapped and every
+    courtyard checked against the outline (legacy: the w x h rectangle).
+    Returns (placed, layout, (ox, oy), result keys, warnings)."""
     fps, extents, pincount, mouth = loaded
     edge_info, warnings = edge_mounts(fps)       # at the origin, rot 0: before placement
     layout = bl.compute_targets(design, src.outline, dims, (extents, pincount, mouth),
@@ -267,13 +304,18 @@ def place_board(board: "pcbnew.BOARD", design: dict, src: "bf.OutlineSource", sh
     ox = round((sheet[1] - layout.w) / 2.0, 3)
     oy = round((sheet[2] - layout.h) / 2.0, 3)
     placed = bl.place_footprints(board, design, fps, extents, layout, ox, oy)
+    attr_warnings = apply_attributes(design, placed)
     shape = src.outline or ol.from_board_block({"w": layout.w, "h": layout.h})
     notes = bl.snap_connectors(design, placed, shape, edge_info, ox, oy)
     issues, derived, found = bl.containment(design, placed, shape, edge_info, ox, oy)
-    keys = {"anchors": bl.anchor_refs(design), "containment": issues,
+    anchors = bl.anchor_refs(design)
+    keys = {"anchors": anchors, "containment": issues,
             "fields": [[round(v, 6) + 0.0 for v in f.rect] for f in layout.fields],
-            "derived_overhang": derived}
-    return placed, layout, (ox, oy), keys, [*warnings, *layout.warnings, *notes, *found]
+            "derived_overhang": derived, "anchored": len(anchors),
+            "board_only": [c["ref"] for c in design["components"] if c.get("board_only") is True],
+            "attr_warnings": attr_warnings}
+    return placed, layout, (ox, oy), keys, [*warnings, *layout.warnings, *attr_warnings,
+                                            *notes, *found]
 
 
 def assign_pads(design: dict, placed: dict,
@@ -299,14 +341,25 @@ def assign_pads(design: dict, placed: dict,
     return assigned, missing
 
 
-def new_board() -> tuple["pcbnew.BOARD", list[str]]:
-    """An empty 4-layer board with the JLCPCB-class design rules (so
-    default-rule DRC reflects the real fab), and the warnings. A rule that
-    silently fails to apply means every later DRC runs against the wrong fab
-    floors, so a failed set is a hard error and a field this pcbnew version
-    lacks is reported, not hidden."""
+def load_stackup(design: dict) -> "ss.LoadedStackup":
+    """The stackup to build (swig_stackup.load_or_resolve: the netlist's,
+    cross-checked with $KICAD_EDA_STACKUP when set). BuildError when the
+    netlist stackup does not resolve (an ST-E error; G1 lint reports it)."""
+    try:
+        return ss.load_or_resolve(design)
+    except ValueError as e:
+        raise bf.BuildError(f"stackup: {e}") from e
+
+
+def new_board(rs: sm.ResolvedStackup) -> tuple["pcbnew.BOARD", list[str]]:
+    """An empty board with the stackup's copper layers, layer types and
+    thickness (swig_stackup.apply_layers, ADR D7.5 step 1) and the
+    JLCPCB-class design rules (so default-rule DRC reflects the real fab),
+    and the warnings. A rule that silently fails to apply means every later
+    DRC runs against the wrong fab floors, so a failed set is a hard error and
+    a field this pcbnew version lacks is reported, not hidden."""
     board = pcbnew.CreateEmptyBoard()
-    board.SetCopperLayerCount(4)
+    ss.apply_layers(board, rs)
     skipped_rules = apply_design_rules(board)
     if not skipped_rules:
         return board, []
@@ -333,11 +386,75 @@ def load_hole(footprints: str | dict, mh_fp: str) -> "pcbnew.FOOTPRINT":
     return fp
 
 
+OUTER = ("F.Cu", "B.Cu")
+
+
+def _positive_mm(v: object) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+
+
+def _artifact_gaps(lines: Mapping) -> list[tuple[str, float]]:
+    """(layer, ground_gap) of every solved CPWG line of the artifact (ADR D7.4)."""
+    out = []
+    for line in lines.values():
+        if not isinstance(line, Mapping) or line.get("line") != "cpwg":
+            continue
+        layers = line.get("layers")
+        for layer, geo in (layers.items() if isinstance(layers, Mapping) else ()):
+            gap = geo.get("ground_gap") if isinstance(geo, Mapping) else None
+            out += [(layer, float(gap))] if _positive_mm(gap) else []
+    return out
+
+
+def _declared_gaps(design: Mapping) -> list[tuple[str, float]]:
+    """(layer, ground_gap) of net_specs with an explicit ground_gap on a CPWG
+    line ("cpwg", or "auto" with freq_hz on an outer layer: ADR D7.7) on its
+    "layers" (default F.Cu, the primary outer layer)."""
+    specs, out = design.get("net_specs"), []
+    for spec in (specs.values() if isinstance(specs, Mapping) else ()):
+        if not isinstance(spec, Mapping) or not _positive_mm(spec.get("ground_gap")):
+            continue
+        line = spec.get("line", "auto")
+        if line == "cpwg" or (line == "auto" and _positive_mm(spec.get("freq_hz"))):
+            layers = spec.get("layers") if isinstance(spec.get("layers"), list) else ["F.Cu"]
+            out += [(layer, float(spec["ground_gap"])) for layer in layers
+                    if isinstance(layer, str)]
+    return out
+
+
+def pour_clearances(design: Mapping, rs: sm.ResolvedStackup,
+                    lines: Mapping) -> dict[str, float]:
+    """{outer mixed layer: the smallest CPWG ground_gap on it (mm)}: the local
+    clearance of that layer's pour, so KiCad fills at the line's own class
+    clearance = ground_gap (ADR D7.6 'realising the gap'). ``lines`` is the
+    fresh artifact's solved lines (artifact_lines), plus net_specs gaps."""
+    mixed = {c.name for c in rs.copper if c.role == "mixed" and c.name in OUTER}
+    out: dict[str, float] = {}
+    for layer, gap in _artifact_gaps(lines) + _declared_gaps(design):
+        if layer in mixed:
+            out = {**out, layer: min(gap, out.get(layer, gap))}
+    return out
+
+
+def artifact_lines(loaded: "ss.LoadedStackup") -> Mapping:
+    """The artifact's "lines" when the stackup came from a fresh artifact, else {}."""
+    if loaded.source != "artifact" or not loaded.artifact:
+        return {}
+    try:
+        lines = ss.read_artifact(loaded.artifact).get("lines")
+    except (OSError, ValueError):
+        return {}
+    return lines if isinstance(lines, Mapping) else {}
+
+
 def add_features(board: "pcbnew.BOARD", design: dict, placed: dict, nets: tuple,
-                 frame: "bf.Frame", sheet: tuple, footprints: str | dict) -> tuple[dict, list]:
+                 frame: "bf.Frame", sheet: tuple, footprints: str | dict,
+                 plan: tuple[dict, dict]) -> tuple[dict, list]:
     """Edge.Cuts (+ the aux origin of an outline board), then build_features'
     preroutes, mounting holes (nickname-stamped like every part, D1), planes
-    and antenna keep-out, in that order. Returns (result keys, warnings)."""
+    (``plan`` = ({layer: net} of the plane / mixed layers, {layer: local
+    clearance mm})) and antenna keep-out, in that order. Returns (result
+    keys, warnings)."""
     get_net, netmap = nets
     outline_info, warnings = bf.add_board_outline(board, design, frame, sheet)
     preroutes, notes = bf.add_preroutes(board, design, placed, get_net, frame.ox, frame.oy)
@@ -345,8 +462,8 @@ def add_features(board: "pcbnew.BOARD", design: dict, placed: dict, nets: tuple,
     holes, notes = bf.add_mounting_holes(board, design, functools.partial(load_hole, footprints),
                                          frame, libtable.DEFAULT_MOUNTING_HOLE_FOOTPRINT)
     warnings = warnings + notes
-    zones, notes = bf.add_planes(board, design, netmap, frame,
-                                 FAB_RULES_MM["m_CopperEdgeClearance"])
+    zones, notes = bf.add_planes(board, plan[0], netmap, frame,
+                                 FAB_RULES_MM["m_CopperEdgeClearance"], plan[1])
     warnings = warnings + notes
     keepout, notes = bf.add_antenna_keepout(board, design, frame)
     return ({"zones": zones, "antenna_keepout": keepout, "mounting_holes": holes,
@@ -367,14 +484,16 @@ def place_silk(board: "pcbnew.BOARD") -> list[str]:
                 f"their footprint defaults"]
 
 
-def save_and_fill(board: "pcbnew.BOARD", out_path: str, zones: list[str], sheet: tuple,
-                  legacy: bool) -> list[str]:
-    """SaveBoard, the sheet splice (outline boards), then the zone fill on a
-    FRESHLY LOADED board: the in-memory CreateEmptyBoard board lacks the
-    connectivity the headless ZONE_FILLER needs and segfaults 9.0.4. The
-    splice runs first so the fill saves the final sheet. An unfilled plane is
-    a board with no ground/power copper, so a fill failure is fatal.
-    Returns warnings."""
+def save_and_finalize(board: "pcbnew.BOARD", out_path: str, rs: sm.ResolvedStackup,
+                      sheet: tuple, legacy: bool) -> tuple[dict, list[str]]:
+    """SaveBoard, the sheet splice (outline boards), then ALWAYS
+    swig_stackup.finalize (ADR D7.5 steps 3-5): the stackup block spliced in
+    (not for the legacy shorthand), a FRESH LoadBoard (the in-memory
+    CreateEmptyBoard board lacks the connectivity the headless ZONE_FILLER
+    needs and segfaults 9.0.4; the load also reads <stem>.kicad_dru), the
+    zone fill, SaveBoard and the copper / types / thickness / block / zone-role
+    check (the pour coverage is verify()'s). The paper splice runs first so
+    the fill saves the final sheet. Returns (finalize's result, warnings)."""
     warnings = []
     try:
         board.BuildConnectivity()
@@ -384,12 +503,42 @@ def save_and_fill(board: "pcbnew.BOARD", out_path: str, zones: list[str], sheet:
     pcbnew.SaveBoard(out_path, board)
     if not legacy:
         bf.splice_paper(out_path, sheet)
-    if zones:
-        b2 = bo.load_board(out_path)
-        b2.BuildConnectivity()
-        pcbnew.ZONE_FILLER(b2).Fill(b2.Zones())
-        pcbnew.SaveBoard(out_path, b2)
-    return warnings
+    return ss.finalize(out_path, rs, fill=True, require_planes=False), warnings
+
+
+def verify(fin: Mapping, zones: list[str], keepout: Mapping | None,
+           rs: sm.ResolvedStackup) -> list[str]:
+    """finalize's problems, plus every pour the builder made present on the
+    saved board and the antenna keep-out on every enabled copper layer."""
+    saved = {f"{z['layer']}:{z['net']}" for z in fin["zones"] if not z["rule_area"]}
+    problems = [*fin["problems"], *(f"the {z} pour is missing from the saved board"
+                                    for z in zones if z not in saved)]
+    if keepout is None:
+        return problems
+    name, copper = keepout.get("name", "ANTENNA"), list(rs.copper_names())
+    areas = [z["layers"] for z in fin["zones"] if z["rule_area"] and z["name"] == name]
+    if copper not in areas:
+        problems.append(f"the antenna keep-out {name!r} covers {areas or 'no layer'} on the "
+                        f"saved board, not every copper layer {copper}")
+    return problems
+
+
+def stackup_record(loaded: "ss.LoadedStackup", fin: Mapping, clearances: Mapping,
+                   problems: list[str]) -> dict:
+    """The result's "stackup": what was built and how it verified."""
+    rs = loaded.stackup
+    return {"source": rs.source, "from": loaded.source, "artifact": loaded.artifact,
+            "preset": rs.preset, "fab": rs.fab, "copper_layers": rs.copper_layers,
+            "kicad_copper_count": rs.kicad_copper_count,
+            "thickness_mm": rs.board_thickness_computed, "saved_thickness_mm": fin["thickness_mm"],
+            "copper": fin["copper"], "spliced": fin["spliced"], "filled": fin["filled"],
+            "pour_clearances": dict(clearances), "problems": problems}
+
+
+def layer_roles(rs: sm.ResolvedStackup) -> list[dict]:
+    """[{layer, role, net, type}] top to bottom (type = the KiCad layer type)."""
+    return [{"layer": c.name, "role": c.role, "net": c.net, "type": c.kicad_type}
+            for c in rs.copper]
 
 
 def main() -> None:
@@ -401,8 +550,10 @@ def main() -> None:
     src = bf.resolve_outline_source(design, os.environ)
     design = src.design
     pcbnew.KIID.SeedGenerator(bf.kiid_seed(netlist_bytes, src.sidecar_bytes))
+    stack = load_stackup(design)
     outline_wh = bf.outline_dims(src)          # None: legacy
-    board, warnings = new_board()
+    board, warnings = new_board(stack.stackup)
+    warnings = warnings + ([stack.note] if stack.note else [])
     # The board is centred on its sheet: A4 for legacy boards (CreateEmptyBoard's
     # default, saved as (paper "A4")); an outline board gets the smallest
     # landscape size holding it + 20 mm margins, spliced in after SaveBoard
@@ -417,19 +568,25 @@ def main() -> None:
     get_net, netmap = net_registry(board)
     assigned, missing_pads = assign_pads(design, placed, get_net)
     frame = bf.Frame(layout.w, layout.h, ox, oy, src.outline, src.source)
+    clearances = pour_clearances(design, stack.stackup, artifact_lines(stack))
     feats, more = add_features(board, design, placed, (get_net, netmap), frame, sheet,
-                               footprints)
+                               footprints, (stack.stackup.planes(), clearances))
     warnings = warnings + notes + more + place_silk(board)
-    warnings = warnings + save_and_fill(board, out_path, feats["zones"], sheet,
-                                        src.outline is None)
+    fin, more = save_and_finalize(board, out_path, stack.stackup, sheet, src.outline is None)
+    problems = verify(fin, feats["zones"], feats["antenna_keepout"], stack.stackup)
     fpids = {**fpids, **feats["mounting_holes"]}
     print(json.dumps({
-        "ok": not missing_pads, "pcb": out_path, "footprints": len(placed),
+        "ok": not missing_pads and not problems, "pcb": out_path, "footprints": len(placed),
         "nets": len(netmap), "pads_assigned": assigned, "missing_pads": missing_pads,
         "zones": feats["zones"], "antenna_keepout": feats["antenna_keepout"],
+        "rule_areas": [{"name": z["name"], "layers": z["layers"]} for z in fin["zones"]
+                       if z["rule_area"]],
+        "stackup": stackup_record(stack, fin, clearances, problems),
+        "layer_roles": layer_roles(stack.stackup),
         "mounting_holes": list(feats["mounting_holes"]), "preroutes": feats["preroutes"],
         "board_mm": [layout.w, layout.h], "outline": feats["outline"], "fpids": fpids,
-        **placement, "warnings": warnings,
+        **placement, "warnings": warnings + more,
+        **({"error": "stackup verification failed: " + "; ".join(problems)} if problems else {}),
     }))
 
 

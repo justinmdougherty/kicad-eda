@@ -1,0 +1,179 @@
+(pcb quoted_wrapped.dsn
+  (parser
+    (string_quote ")
+    (space_in_quoted_tokens on)
+    (host_cad "KiCad's Pcbnew")
+    (host_version "9.0.4")
+  )
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer F.Cu
+      (type signal)
+      (property
+        (index 0)
+      )
+    )
+    (layer In1.Cu
+      (type power)
+      (property
+        (index 1)
+      )
+    )
+    (layer In2.Cu
+      (type signal)
+      (property
+        (index 2)
+      )
+    )
+    (layer B.Cu
+      (type signal)
+      (property
+        (index 3)
+      )
+    )
+    (boundary
+      (path pcb 0  130000 -80000  100000 -80000  100000 -100000  130000 -100000
+            130000 -80000)
+    )
+    (plane GND (polygon F.Cu 0  100300 -80300  129700 -80300  129700 -99700  100300 -99700
+            100300 -80300))
+    (plane GND (polygon In1.Cu 0  100300 -80300  129700 -80300  129700 -99700  100300 -99700
+            100300 -80300))
+    (plane +3V3 (polygon In2.Cu 0  100300 -80300  129700 -80300  129700 -99700  100300 -99700
+            100300 -80300))
+    (via "Via[0-3]_600:300_um")
+    (rule
+      (width 200)
+      (clearance 200)
+      (clearance 50 (type smd_smd))
+    )
+  )
+  (placement
+    (component R_0603_1608Metric
+      (place R1 105000 -85000 front 0 (PN 330))
+      (place R2 105000 -95000 front 0 (PN 10k))
+      (place R3 112000 -95000 back 0 (PN 22))
+    )
+    (component LED_0603_1608Metric
+      (place D1 110000 -85000 front 0 (PN "LED (red)"))
+    )
+    (component "SOIC-14_3.9x8.7mm_P1.27mm"
+      (place U1 120000 -90000 front 0 (PN "ATtiny84A-SSU"))
+    )
+    (component PinHeader_1x02_P2.54mm_Vertical
+      (place J1 126000 -90000 front 0 (PN "Conn_01x02"))
+    )
+  )
+  (library
+    (image R_0603_1608Metric
+      (outline (path signal 100  -800 400  800 400  800 -400  -800 -400  -800 400))
+      (pin Rect[T]Pad_800.000000x950.000000_um 1 -825 0)
+      (pin Rect[T]Pad_800.000000x950.000000_um 2 825 0)
+    )
+    (image LED_0603_1608Metric
+      (outline (path signal 100  -800 400  800 400  800 -400  -800 -400  -800 400))
+      (pin Rect[T]Pad_800.000000x950.000000_um 1 -825 0)
+      (pin Rect[T]Pad_800.000000x950.000000_um 2 825 0)
+    )
+    (image "SOIC-14_3.9x8.7mm_P1.27mm"
+      (outline (path signal 100  -1950 4325  1950 4325  1950 -4325  -1950 -4325  -1950 4325))
+      (pin Rect[T]Pad_1950.000000x600.000000_um 1 -2475 3810)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 2 -2475 2540)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 3 -2475 1270)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 4 -2475 0)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 5 -2475 -1270)
+      (pin Rect[T]Pad_1950.000000x600.000000_um (rotate 90) 6 -2475 -2540)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 7 -2475 -3810)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 8 2475 -3810)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 9 2475 -2540)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 10 2475 -1270)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 11 2475 0)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 12 2475 1270)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 13 2475 2540)
+      (pin Rect[T]Pad_1950.000000x600.000000_um 14 2475 3810)
+    )
+    (image PinHeader_1x02_P2.54mm_Vertical
+      (outline (path signal 100  -1270 1270  1270 1270  1270 -3810  -1270 -3810  -1270 1270))
+      (pin Rect[A]Pad_1700.000000x1700.000000_um 1 0 0)
+      (pin Rect[A]Pad_1700.000000x1700.000000_um 2 0 -2540)
+    )
+    (padstack Rect[T]Pad_800.000000x950.000000_um
+      (shape (rect F.Cu -400 -475 400 475))
+      (attach off)
+    )
+    (padstack Rect[T]Pad_1950.000000x600.000000_um
+      (shape (rect F.Cu -975 -300 975 300))
+      (attach off)
+    )
+    (padstack Rect[A]Pad_1700.000000x1700.000000_um
+      (shape (rect F.Cu -850 -850 850 850))
+      (shape (rect In1.Cu -850 -850 850 850))
+      (shape (rect In2.Cu -850 -850 850 850))
+      (shape (rect B.Cu -850 -850 850 850))
+      (attach off)
+    )
+    (padstack "Via[0-3]_600:300_um"
+      (shape (circle F.Cu 600))
+      (shape (circle In1.Cu 600))
+      (shape (circle In2.Cu 600))
+      (shape (circle B.Cu 600))
+      (attach off)
+    )
+  )
+  (network
+    (net +3V3
+      (pins U1-1 J1-1 R2-1)
+    )
+    (net GND
+      (pins U1-14 J1-2 D1-1)
+    )
+    (net "/LED (red)"
+      (pins U1-2 R1-1)
+    )
+    (net "Net-(D1-A)"
+      (pins R1-2 D1-2)
+    )
+    (net "a b"
+      (pins R2-2 U1-4)
+    )
+    (net USB_DP
+      (pins U1-6 R3-1)
+    )
+    (net "unconnected-(R3-Pad2)"
+      (pins R3-2)
+    )
+    (net "unconnected-(U1-PA0-Pad13)"
+      (pins U1-13)
+    )
+    (net "#RESET"
+      (pins U1-3)
+    )
+    (net /ANT_2"
+      (pins U1-5)
+    )
+    (class kicad_default "" "/LED (red)" "Net-(D1-A)" "a b" USB_DP "unconnected-(R3-Pad2)"
+      "unconnected-(U1-PA0-Pad13)"
+      (circuit
+        (use_via "Via[0-3]_600:300_um")
+      )
+      (rule
+        (width 200)
+        (clearance 200)
+      )
+    )
+    (class Power "#RESET" +3V3 /ANT_2" GND
+      (circuit
+        (use_via "Via[0-3]_600:300_um")
+      )
+      (rule
+        (width 400)
+        (clearance 200)
+      )
+    )
+  )
+  (wiring
+    (wire (path F.Cu 200  107000 -85000  108500 -85000)(net "Net-(D1-A)")(type route))
+    (via "Via[0-3]_600:300_um"  118000 -92000 (net GND)(type route))
+  )
+)

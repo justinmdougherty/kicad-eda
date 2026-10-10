@@ -1,23 +1,21 @@
 """Class C fallback models (ADR D7.6 'Class C fallback models', critique M11; task D7-05c).
 
-A class C closed-form result is the FD seed and, without FD (or over budget), the answer; this
-module corrects it per cause. It holds the functional forms only: every coefficient, calibrated
-range and est_error_pct comes from server/data/tline_fallback.json, written by
-tools/tline_calibrate.py from FD runs with tests/fixtures/tline/fallback_calibration.json.
-- offset_stripline (stripline / dual_stripline, single or edge, not centred): each mode's image
-  result / (1 + e), e = sum_f c_f(a) x_f, x = 1, ln(W/b), t/b (+ ln(S/b) for pairs), c_f
-  piecewise-linear in the asymmetry a = h_near / (h_near + h_far); eeff kept (homogeneous
-  builds have eeff = Er exactly: the correction is geometric).
-- masked_coupled_microstrip (edge pair with solder mask, no covering plies): the bare
-  KJ84-mapped pair x r^k_even / r^k_odd, r = Z_coated / Z_bare of the single-ended Wan-Hoorfar
-  microstrip of the same width, k = sum_f k_f x_f, x = 1, ln(W/h), ln(S/h), (c3 + t)/S (mask in
-  the gap, as coplanar.mask_in_gaps); the mask adds dielectric only, so the air capacitance is
-  kept and eeff_odd scales as (Zodd_bare / Zodd)^2.
-- multi_ply_er_contrast, cpw_finite_ground, nearest_closed_form: identity (series-mean Er,
-  infinite-ground CPW, the nearest closed form); est = max(tabled, the closed form's own).
-Outside a cause's calibrated domain (or with coplanar grounds / etch, never calibrated) the
-correction still applies but est is never below the closed form's. Results stay class C, model
-'<model>+fallback:<cause>'. Stdlib only; registers no model (tline/__init__ lists the module).
+Corrects a class C closed-form result (the FD seed; without FD the answer) per cause. Forms
+only: coefficients, calibrated domains and every est_error_pct come from
+server/data/tline_fallback.json, written by tools/tline_calibrate.py from FD runs.
+- offset_stripline (offset / dual stripline, single or edge): per mode Z_image / (1 + e),
+  e = sum_f c_f(a) x_f, c_f piecewise-linear in a = h_near / (h_near + h_far) (the centred
+  knot fitted too: the mapped-Cohn pair has its own error); eeff kept.
+- masked_coupled_microstrip (masked edge pair, no covering plies): per mode the bare KJ84 pair
+  x r^k e^d, r = Z_coated / Z_bare of the single-ended Wan-Hoorfar line, k / d = sum of
+  coefficient x feature; eeff_odd scales as (Zodd_bare / Zodd)^2 (air capacitance kept).
+- multi_ply_er_contrast, cpw_finite_ground, nearest_closed_form: identity; est = max(tabled,
+  the closed form's own).
+Features: 'one' or '*'-joined factors, each a domain coordinate or 'ln_' + one. Coordinates
+are clamped to the calibrated domain (the box tline_calibrate samples uniformly); outside it,
+or with coplanar grounds / etch (never calibrated), est is never below the closed form's and a
+warning says why. Results stay class C, model '<model>+fallback:<cause>'. Stdlib only;
+registers no model (tline/__init__ lists the module).
 """
 from __future__ import annotations
 
@@ -36,22 +34,21 @@ from .microstrip import CONTRAST_LIMIT, evaluate_microstrip, substrate
 from .stripline import ASYM_EPS, pair_line_result, sides
 from .types import LineGeometry, LineResult, Verdict, single_line_result
 
-SCHEMA = "kicad-eda/tline-fallback@1"
+SCHEMA = "kicad-eda/tline-fallback@2"
 DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "tline_fallback.json"
 OFFSET, MASKED = "offset_stripline", "masked_coupled_microstrip"
 MULTI_PLY, CPW_FINITE, NEAREST = "multi_ply_er_contrast", "cpw_finite_ground", "nearest_closed_form"
 CAUSES = (OFFSET, MASKED, MULTI_PLY, CPW_FINITE, NEAREST)
 IDENTITY_CAUSES = (MULTI_PLY, CPW_FINITE, NEAREST)
 OFFSET_KINDS = ("stripline", "dual_stripline")
-OFFSET_MODES = {"single": ("one", "ln_w_over_b", "t_over_b"),
-                "even": ("one", "ln_w_over_b", "t_over_b", "ln_s_over_b"),
-                "odd": ("one", "ln_w_over_b", "t_over_b", "ln_s_over_b")}
-OFFSET_DOMAIN = ("a", "w_over_b", "t_over_b", "s_over_b", "contrast")
-MASK_FEATURES = ("one", "ln_w_over_h", "ln_s_over_h", "mask_gap_fill")
-MASK_DOMAIN = ("w_over_h", "s_over_h", "t_over_h", "mask_gap_fill", "er", "contrast",
-               "mask_er", "mask_c1_over_h", "mask_c2_over_h")
-LABELS = {"a": "asymmetry a", "mask_er": "mask Er", "mask_c1_over_h": "mask c1/h",
-          "mask_c2_over_h": "mask c2/h", "mask_gap_fill": "mask gap fill (c3 + t)/S"}
+OFFSET_MODES = ("single", "even", "odd")
+PAIR_COORDS = ("s_over_b", "t_over_s")
+OFFSET_COORDS = ("a", "w_over_b", "t_over_b", "t_over_w", "er_near_over_far", "side_contrast",
+                 *PAIR_COORDS)
+MASK_COORDS = ("w_over_h", "s_over_w", "t_over_h", "t_over_w", "t_over_s", "er", "contrast",
+               "mask_er", "mask_c1_over_h", "mask_c2_over_c1", "mask_c3_over_c1", "s_over_h",
+               "mask_c2_over_h", "mask_c3_over_s", "mask_gap_fill")
+LABELS = {"a": "asymmetry a", "t_over_w": "t/W", "t_over_s": "t/S"}  # else 'mask c1/h' style
 OUTSIDE = "outside the FD-calibrated range"
 
 
@@ -59,15 +56,14 @@ OUTSIDE = "outside the FD-calibrated range"
 class OffsetFit:
     knots: tuple[float, ...]
     terms: Mapping[str, Mapping[str, tuple[float, ...]]]   # mode -> feature -> per knot
-    est: Mapping[str, tuple[float, ...]]                   # 'single' | 'pair' -> per interval
-    even_est: tuple[float, ...]
+    est: Mapping[str, float]                               # 'single' (z0) | 'pair' (z_diff)
+    even_est: float
     domain: Mapping[str, tuple[float, float]]
 
 
 @dataclass(frozen=True)
 class MaskFit:
-    k_even: Mapping[str, float]
-    k_odd: Mapping[str, float]
+    terms: Mapping[str, Mapping[str, float]]               # k_even/k_odd/d_even/d_odd
     est: float
     even_est: float
     domain: Mapping[str, tuple[float, float]]
@@ -76,7 +72,6 @@ class MaskFit:
 @dataclass(frozen=True)
 class FallbackTable:
     """The parsed data file; `digest` is the sha256 of its canonical JSON."""
-
     offset: OffsetFit
     masked: MaskFit
     identity_est: Mapping[str, float]
@@ -84,7 +79,6 @@ class FallbackTable:
     source: str
 
 
-# ---------------------------------------------------------------- data file
 def _number(value: Any, where: str, *, positive: bool = False) -> float:
     ok = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
     if not ok or (positive and not value > 0):
@@ -93,59 +87,74 @@ def _number(value: Any, where: str, *, positive: bool = False) -> float:
     return float(value)
 
 
-def _numbers(values: Any, where: str, count: int, *, positive: bool = False) -> tuple[float, ...]:
-    if not isinstance(values, list) or len(values) != count:
-        raise ValueError(f"{where}: expected a list of {count} numbers, got {values!r}")
-    return tuple(_number(v, f"{where}[{i}]", positive=positive) for i, v in enumerate(values))
+def _numbers(values: Any, where: str, count: int | None = None) -> tuple[float, ...]:
+    if not isinstance(values, list) or (count is not None and len(values) != count):
+        raise ValueError(f"{where}: expected a list of {count or 'some'} numbers, got {values!r}")
+    return tuple(_number(v, f"{where}[{i}]") for i, v in enumerate(values))
 
 
-def _mapping(value: Any, where: str, allowed: tuple[str, ...]) -> Mapping[str, Any]:
-    if not isinstance(value, dict) or not value:
-        raise ValueError(f"{where}: expected a non-empty object, got {value!r}")
-    unknown = sorted(set(value) - set(allowed))
+def _object(value: Any, where: str, allowed: tuple[str, ...] | None = None) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{where}: expected an object, got {value!r}")
+    unknown = sorted(set(value) - set(allowed)) if allowed is not None else []
     if unknown:
         raise ValueError(f"{where}: unknown names {unknown} (allowed: {list(allowed)})")
     return value
 
 
-def _domain(value: Any, where: str, allowed: tuple[str, ...]) -> Mapping[str, tuple[float, float]]:
-    out = {}
-    for name, pair in _mapping(value, f"{where}.domain", allowed).items():
-        lo, hi = _numbers(pair, f"{where}.domain.{name}", 2)
+def _domain(value: Any, where: str, coords: tuple[str, ...]) -> Mapping[str, tuple[float, float]]:
+    given, out = _object(value, f"{where}.domain", coords), {}
+    for name in coords:
+        lo, hi = _numbers(given.get(name), f"{where}.domain.{name}", 2)
         if lo > hi:
             raise ValueError(f"{where}.domain.{name}: lower bound {lo} above upper bound {hi}")
         out[name] = (lo, hi)
     return MappingProxyType(out)
 
 
+def _check_feature(name: str, coords: tuple[str, ...], domain: Mapping[str, tuple[float, float]],
+                   where: str) -> str:
+    """A feature name: 'one' or '*'-joined factors '<coord>' / 'ln_<coord>' (ln only of a
+    coordinate whose calibrated range is positive)."""
+    for factor in ([] if name == "one" else name.split("*")):
+        log, coord = factor.startswith("ln_"), factor.removeprefix("ln_")
+        if coord not in coords or (log and not domain[coord][0] > 0):
+            raise ValueError(f"{where}: feature {name!r}: {factor!r} is neither a coordinate "
+                             f"of this cause {list(coords)} nor ln of a positive one")
+    return name
+
+
 def _parse_offset(doc: Mapping[str, Any], where: str) -> OffsetFit:
-    knots = _numbers(doc.get("knots"), f"{where}.knots", len(doc.get("knots") or ()))
+    knots = _numbers(doc.get("knots"), f"{where}.knots")
     if len(knots) < 2 or any(b <= a for a, b in pairwise(knots)):
         raise ValueError(f"{where}.knots: expected at least two increasing values, got {knots}")
-    terms = _mapping(doc.get("terms"), f"{where}.terms", tuple(OFFSET_MODES))
+    domain = _domain(doc.get("domain"), where, OFFSET_COORDS)
+    terms = _object(doc.get("terms"), f"{where}.terms", OFFSET_MODES)
     parsed = {}
-    for mode, allowed in OFFSET_MODES.items():
-        given = _mapping(terms.get(mode), f"{where}.terms.{mode}", allowed)
-        parsed[mode] = MappingProxyType({f: _numbers(v, f"{where}.terms.{mode}.{f}", len(knots))
-                                         for f, v in given.items()})
-    est = _mapping(doc.get("est_error_pct"), f"{where}.est_error_pct", ("single", "pair"))
-    intervals = len(knots) - 1
+    for mode in OFFSET_MODES:
+        coords = tuple(c for c in OFFSET_COORDS if mode != "single" or c not in PAIR_COORDS)
+        given = _object(terms.get(mode), f"{where}.terms.{mode}")
+        parsed[mode] = MappingProxyType({
+            _check_feature(f, coords, domain, f"{where}.terms.{mode}"):
+                _numbers(v, f"{where}.terms.{mode}.{f}", len(knots)) for f, v in given.items()})
+    est = _object(doc.get("est_error_pct"), f"{where}.est_error_pct", ("single", "pair"))
     return OffsetFit(knots, MappingProxyType(parsed), MappingProxyType(
-        {k: _numbers(est.get(k), f"{where}.est_error_pct.{k}", intervals, positive=True)
+        {k: _number(est.get(k), f"{where}.est_error_pct.{k}", positive=True)
          for k in ("single", "pair")}),
-        _numbers(doc.get("z_even_error_pct"), f"{where}.z_even_error_pct", intervals,
-                 positive=True), _domain(doc.get("domain"), where, OFFSET_DOMAIN))
+        _number(doc.get("z_even_error_pct"), f"{where}.z_even_error_pct", positive=True), domain)
 
 
 def _parse_masked(doc: Mapping[str, Any], where: str) -> MaskFit:
-    def k(name: str) -> Mapping[str, float]:
-        given = _mapping(doc.get(name), f"{where}.{name}", MASK_FEATURES)
-        return MappingProxyType({f: _number(v, f"{where}.{name}.{f}") for f, v in given.items()})
-
-    return MaskFit(k("k_even"), k("k_odd"),
-                   _number(doc.get("est_error_pct"), f"{where}.est_error_pct", positive=True),
-                   _number(doc.get("z_even_error_pct"), f"{where}.z_even_error_pct",
-                           positive=True), _domain(doc.get("domain"), where, MASK_DOMAIN))
+    domain = _domain(doc.get("domain"), where, MASK_COORDS)
+    terms = {}
+    for key in ("k_even", "k_odd", "d_even", "d_odd"):
+        given = _object(doc.get(key), f"{where}.{key}")
+        terms[key] = MappingProxyType({
+            _check_feature(f, MASK_COORDS, domain, f"{where}.{key}"):
+                _number(v, f"{where}.{key}.{f}") for f, v in given.items()})
+    est, even = (_number(doc.get(k), f"{where}.{k}", positive=True)
+                 for k in ("est_error_pct", "z_even_error_pct"))
+    return MaskFit(MappingProxyType(terms), est, even, domain)
 
 
 def parse_table(doc: Mapping[str, Any], *, source: str = "<dict>") -> FallbackTable:
@@ -156,11 +165,12 @@ def parse_table(doc: Mapping[str, Any], *, source: str = "<dict>") -> FallbackTa
     if not isinstance(causes, dict) or set(causes) != set(CAUSES):
         raise ValueError(f"{source}: causes must be exactly {list(CAUSES)}, "
                          f"got {sorted(causes) if isinstance(causes, dict) else causes!r}")
-    identity = {c: _number(causes[c].get("est_error_pct"), f"{source}: {c}.est_error_pct",
+    entries = {c: _object(causes[c], f"{source}: {c}") for c in CAUSES}
+    identity = {c: _number(entries[c].get("est_error_pct"), f"{source}: {c}.est_error_pct",
                            positive=True) for c in IDENTITY_CAUSES}
     text = json.dumps(doc, sort_keys=True, separators=(",", ":"))
-    return FallbackTable(_parse_offset(causes[OFFSET], f"{source}: {OFFSET}"),
-                         _parse_masked(causes[MASKED], f"{source}: {MASKED}"),
+    return FallbackTable(_parse_offset(entries[OFFSET], f"{source}: {OFFSET}"),
+                         _parse_masked(entries[MASKED], f"{source}: {MASKED}"),
                          MappingProxyType(identity),
                          hashlib.sha256(text.encode("utf-8")).hexdigest(), source)
 
@@ -181,18 +191,11 @@ def default_table() -> FallbackTable:
     return load_table(DATA_PATH)
 
 
-# ---------------------------------------------------------------- causes
-def _masked(geom: LineGeometry) -> bool:
-    m = geom.mask
-    return m is not None and max(m.over_trace, m.over_substrate, m.between) > 0
-
-
 def _identity_causes(geom: LineGeometry) -> tuple[str, ...]:
     closed = geom.kind in OFFSET_KINDS or geom.pair == "broadside"
     ers = [p.er for p in (geom.below + geom.above if closed else geom.below)]
-    found = [MULTI_PLY] if ers and (max(ers) - min(ers)) / min(ers) > CONTRAST_LIMIT else []
-    if geom.kind == "cpw" and geom.ground_width is not None:
-        found.append(CPW_FINITE)
+    found = ([MULTI_PLY] if ers and (max(ers) - min(ers)) / min(ers) > CONTRAST_LIMIT else []) + (
+        [CPW_FINITE] if geom.kind == "cpw" and geom.ground_width is not None else [])
     return tuple(found) or (NEAREST,)
 
 
@@ -203,23 +206,52 @@ def cause_of(geom: LineGeometry) -> str:
         s = sides(geom)
         if not math.isclose(s.h_below, s.h_above, rel_tol=ASYM_EPS):
             return OFFSET
-    if geom.kind == "microstrip" and geom.pair == "edge" and _masked(geom) and not geom.above:
+    m = geom.mask
+    coated = m is not None and max(m.over_trace, m.over_substrate, m.between) > 0
+    if geom.kind == "microstrip" and geom.pair == "edge" and coated and not geom.above:
         return MASKED
     return ",".join(_identity_causes(geom))
 
 
-# ---------------------------------------------------------------- features and domains
-def _features(values: Mapping[str, float]) -> dict[str, float]:
-    """The fitted features from a cause's domain coordinates (offset: w/b, t/b, s/b; masked:
-    w/h, s/h, (c3 + t)/S)."""
-    if "a" in values:
-        x = {"one": 1, "ln_w_over_b": math.log(values["w_over_b"]),
-             "t_over_b": values["t_over_b"]}
-        if "s_over_b" in values:
-            x["ln_s_over_b"] = math.log(values["s_over_b"])
-        return x
-    return {"one": 1, "ln_w_over_h": math.log(values["w_over_h"]),
-            "ln_s_over_h": math.log(values["s_over_h"]), "mask_gap_fill": values["mask_gap_fill"]}
+def _offset_coords(geom: LineGeometry) -> dict[str, float]:
+    s = sides(geom)
+    near, far = sorted(((s.h_above, s.er_above), (s.h_below, s.er_below)))     # by height
+    b = s.h_below + s.h_above + geom.t
+    out = {"a": near[0] / (near[0] + far[0]), "w_over_b": geom.width / b, "t_over_b": geom.t / b,
+           "t_over_w": geom.t / geom.width, "er_near_over_far": near[1] / far[1],
+           "side_contrast": max(substrate(geom.below).contrast, substrate(geom.above).contrast)}
+    if geom.pair == "edge":
+        out.update(s_over_b=geom.pair_gap / b, t_over_s=geom.t / geom.pair_gap)
+    return out
+
+
+def _mask_coords(geom: LineGeometry) -> dict[str, float]:
+    sub, m, w, s, t = substrate(geom.below), geom.mask, geom.width, geom.pair_gap, geom.t
+    c1 = m.over_substrate or math.inf          # no coating over the substrate: outside
+    return {"w_over_h": w / sub.h, "s_over_w": s / w, "t_over_h": t / sub.h, "t_over_w": t / w,
+            "t_over_s": t / s, "er": sub.er, "contrast": sub.contrast, "mask_er": m.er,
+            "mask_c1_over_h": m.over_substrate / sub.h,
+            "mask_c2_over_c1": m.over_trace / c1, "mask_c3_over_c1": m.between / c1,
+            "s_over_h": s / sub.h,
+            "mask_c2_over_h": m.over_trace / sub.h, "mask_c3_over_s": m.between / s,
+            "mask_gap_fill": (m.between + t) / s}
+
+
+def domain_values(geom: LineGeometry) -> dict[str, float]:
+    """The calibrated-domain coordinates of a corrected cause ({} for identity causes)."""
+    cause = cause_of(geom)
+    if cause == OFFSET:
+        return _offset_coords(geom)
+    return _mask_coords(geom) if cause == MASKED else {}
+
+
+def feature_value(name: str, coords: Mapping[str, float]) -> float:
+    """A named feature: 'one', or the product of its '*'-joined factors (coordinate or ln_)."""
+    out = 1.0
+    for factor in ([] if name == "one" else name.split("*")):
+        value = coords[factor.removeprefix("ln_")]
+        out *= math.log(value) if factor.startswith("ln_") else value
+    return out
 
 
 def _clamped(domain: Mapping[str, tuple[float, float]], values: Mapping[str, float]
@@ -227,11 +259,6 @@ def _clamped(domain: Mapping[str, tuple[float, float]], values: Mapping[str, flo
     """Coordinates moved to the nearest calibrated value (no extrapolation of the forms)."""
     return {k: min(max(v, domain[k][0]), domain[k][1]) if k in domain else v
             for k, v in values.items()}
-
-
-def features(geom: LineGeometry) -> dict[str, float]:
-    """The fitted features of an offset line or a masked pair (unclamped)."""
-    return _features(domain_values(geom))
 
 
 def mask_ratio(geom: LineGeometry) -> float:
@@ -242,42 +269,13 @@ def mask_ratio(geom: LineGeometry) -> float:
             / evaluate_microstrip(single, 0).z0)
 
 
-def domain_values(geom: LineGeometry) -> dict[str, float]:
-    """The calibrated-domain coordinates of a corrected cause ({} for identity causes)."""
-    cause = cause_of(geom)
-    if cause == OFFSET:
-        s = sides(geom)
-        a, b = min(s.h_below, s.h_above) / (s.h_below + s.h_above), s.h_below + s.h_above + geom.t
-        out = {"a": a, "w_over_b": geom.width / b, "t_over_b": geom.t / b, "contrast": s.contrast}
-        if geom.pair == "edge":
-            out["s_over_b"] = geom.pair_gap / b
-        return out
-    if cause == MASKED:
-        sub, m = substrate(geom.below), geom.mask
-        return {"w_over_h": geom.width / sub.h, "s_over_h": geom.pair_gap / sub.h,
-                "t_over_h": geom.t / sub.h, "mask_gap_fill": (m.between + geom.t) / geom.pair_gap,
-                "er": sub.er, "contrast": sub.contrast, "mask_er": m.er,
-                "mask_c1_over_h": m.over_substrate / sub.h, "mask_c2_over_h": m.over_trace / sub.h}
-    return {}
-
-
-# ---------------------------------------------------------------- shared helpers
 def _interp(knots: tuple[float, ...], values: tuple[float, ...], x: float) -> float:
     """Piecewise-linear in x through (knots, values), constant beyond the end knots."""
-    if x <= knots[0]:
-        return values[0]
+    x = min(max(x, knots[0]), knots[-1])
     for (x0, y0), (x1, y1) in pairwise(zip(knots, values, strict=True)):
         if x <= x1:
             return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
     return values[-1]
-
-
-def _interval_est(knots: tuple[float, ...], est: tuple[float, ...], x: float) -> float:
-    """The estimate of the knot interval holding x (the larger one on an interior knot)."""
-    hits = [e for (lo, hi), e in zip(pairwise(knots), est, strict=True) if lo <= x <= hi]
-    if hits:
-        return max(hits)
-    return est[0] if x < knots[0] else est[-1]
 
 
 def _notes(cause: str, domain: Mapping[str, tuple[float, float]], geom: LineGeometry
@@ -287,14 +285,20 @@ def _notes(cause: str, domain: Mapping[str, tuple[float, float]], geom: LineGeom
     for name, value in domain_values(geom).items():
         lo, hi = domain.get(name, (value, value))
         if not lo <= value <= hi:
-            out.append(f"fallback {cause}: {LABELS.get(name, name)} {value:.4g} is {OUTSIDE} "
+            label = LABELS.get(name, name.replace("_over_", "/").replace("_", " "))
+            out.append(f"fallback {cause}: {label} {value:.4g} is {OUTSIDE} "
                        f"[{lo:.4g}, {hi:.4g}]: corrected at the nearest calibrated value")
-    if geom.ground_gap is not None:
-        out.append(f"fallback {cause}: coplanar grounds (ground_gap {geom.ground_gap} mm) are "
-                   f"{OUTSIDE} (none)")
-    if geom.etch > 0:
-        out.append(f"fallback {cause}: etch {geom.etch} mm is {OUTSIDE} (none)")
-    return out
+    extra = ((f"coplanar grounds (ground_gap {geom.ground_gap} mm)", geom.ground_gap is not None),
+             (f"etch {geom.etch} mm", geom.etch > 0))
+    return out + [f"fallback {cause}: {what} is {OUTSIDE} (none)" for what, on in extra if on]
+
+
+def outside_notes(geom: LineGeometry, *, table: FallbackTable | None = None) -> list[str]:
+    """Why `geom` lies outside its cause's FD-calibrated domain ([] inside or for identity)."""
+    tab, cause = table or default_table(), cause_of(geom)
+    if cause not in (OFFSET, MASKED):
+        return []
+    return _notes(cause, (tab.offset if cause == OFFSET else tab.masked).domain, geom)
 
 
 def _finish(geom: LineGeometry, result: LineResult, cause: str, z: tuple[float, ...],
@@ -311,38 +315,34 @@ def _finish(geom: LineGeometry, result: LineResult, cause: str, z: tuple[float, 
     return pair_line_result(z[0], z[1], eeff, model=model, verdict=verdict, eeff_odd_f=eeff_f)
 
 
-# ---------------------------------------------------------------- the corrections
-def _e(fit: OffsetFit, mode: str, a: float, x: Mapping[str, float]) -> float:
-    """e of one mode: sum over the tabled features of c_f(a) x_f."""
-    return sum(_interp(fit.knots, c, a) * x[f] for f, c in fit.terms[mode].items())
+def _dot(terms: Mapping[str, float], x: Mapping[str, float]) -> float:
+    return sum(c * feature_value(f, x) for f, c in terms.items())
 
 
 def _offset(geom: LineGeometry, result: LineResult, fit: OffsetFit) -> LineResult:
     values = domain_values(geom)
-    a, x = values["a"], _features(_clamped(fit.domain, values))
-    if geom.pair == "single":
-        es = (_e(fit, "single", a, x),)
-        z, key = (result.z0 / (1 + es[0]),), "single"
-    else:
-        es = (_e(fit, "even", a, x), _e(fit, "odd", a, x))
-        z, key = (result.z_even / (1 + es[0]), result.z_odd / (1 + es[1])), "pair"
+    a, x = values["a"], _clamped(fit.domain, values)
+    modes = ("single",) if geom.pair == "single" else ("even", "odd")
+    es = [_dot({f: _interp(fit.knots, c, x["a"]) for f, c in fit.terms[m].items()}, x)
+          for m in modes]
+    zs = (result.z0,) if geom.pair == "single" else (result.z_even, result.z_odd)
     note = (f"fallback {OFFSET}: image method / (1 + e) at asymmetry {a:.3f}, e = "
             + " / ".join(f"{v:+.2%}" for v in es) + " (FD-calibrated)")
-    return _finish(geom, result, OFFSET, z, 1, _interval_est(fit.knots, fit.est[key], a),
+    return _finish(geom, result, OFFSET, tuple(z / (1 + e) for z, e in zip(zs, es, strict=True)),
+                   1, fit.est["single" if geom.pair == "single" else "pair"],
                    [note, *_notes(OFFSET, fit.domain, geom)])
 
 
 def _masked_pair(geom: LineGeometry, result: LineResult, fit: MaskFit) -> LineResult:
     if result.z_even is None or result.z_odd is None:
         raise ValueError(f"{MASKED}: the closed-form result of an edge pair has no z_even/z_odd")
-    x, r = _features(_clamped(fit.domain, domain_values(geom))), mask_ratio(geom)
-    k_even = sum(c * x[f] for f, c in fit.k_even.items())
-    k_odd = sum(c * x[f] for f, c in fit.k_odd.items())
-    z_odd = result.z_odd * r ** k_odd
-    note = (f"fallback {MASKED}: bare pair x r^k with the single-ended Wan-Hoorfar mask ratio "
-            f"r {r:.4f}, k_even {k_even:.3f}, k_odd {k_odd:.3f} (FD-calibrated)")
-    return _finish(geom, result, MASKED, (result.z_even * r ** k_even, z_odd),
-                   (result.z_odd / z_odd) ** 2, fit.est, [note, *_notes(MASKED, fit.domain, geom)])
+    x, r = _clamped(fit.domain, domain_values(geom)), mask_ratio(geom)
+    k, d = ({m: _dot(fit.terms[f"{p}_{m}"], x) for m in ("even", "odd")} for p in ("k", "d"))
+    z_even, z_odd = (getattr(result, f"z_{m}") * r ** k[m] * math.exp(d[m]) for m in k)
+    note = (f"fallback {MASKED}: bare pair x r^k e^d with the single-ended Wan-Hoorfar mask "
+            f"ratio r {r:.4f}, k_even {k['even']:.3f}, k_odd {k['odd']:.3f} (FD-calibrated)")
+    return _finish(geom, result, MASKED, (z_even, z_odd), (result.z_odd / z_odd) ** 2, fit.est,
+                   [note, *_notes(MASKED, fit.domain, geom)])
 
 
 def _identity(geom: LineGeometry, result: LineResult, table: FallbackTable) -> LineResult:
@@ -354,15 +354,13 @@ def _identity(geom: LineGeometry, result: LineResult, table: FallbackTable) -> L
                    est_error_pct=est, warnings=(*result.warnings, note))
 
 
-# ---------------------------------------------------------------- public API
 def correct(geom: LineGeometry, result: LineResult, *,
             table: FallbackTable | None = None) -> LineResult:
     """The fallback model of the geometry's cause applied to its closed-form `result`, whatever
     the result's class (calibration and FD seeding); a result already corrected is returned."""
     if "+fallback:" in result.model:
         return result
-    tab = table or default_table()
-    cause = cause_of(geom)
+    tab, cause = table or default_table(), cause_of(geom)
     if cause == OFFSET:
         return _offset(geom, result, tab.offset)
     if cause == MASKED:
@@ -373,17 +371,19 @@ def correct(geom: LineGeometry, result: LineResult, *,
 def apply(geom: LineGeometry, result: LineResult, *,
           table: FallbackTable | None = None) -> LineResult:
     """Class A / B results pass through unchanged; class C results are corrected (correct)."""
-    if result.accuracy_class != "C":
-        return result
-    return correct(geom, result, table=table)
+    return result if result.accuracy_class != "C" else correct(geom, result, table=table)
 
 
-def z_even_error_pct(geom: LineGeometry, *, table: FallbackTable | None = None) -> float | None:
-    """The calibrated even-mode error bound (%) of a corrected pair; None for other causes."""
-    tab = table or default_table()
-    cause = cause_of(geom)
+def z_even_error_pct(geom: LineGeometry, closed: LineResult | None = None, *,
+                     table: FallbackTable | None = None) -> float | None:
+    """The calibrated even-mode error bound (%) of a corrected pair; outside the calibrated
+    domain raised to the closed form's estimate (`closed`, evaluated when not given). None for
+    other causes."""
+    tab, cause = table or default_table(), cause_of(geom)
     if geom.pair != "edge" or cause not in (OFFSET, MASKED):
         return None
-    if cause == MASKED:
-        return tab.masked.even_est
-    return _interval_est(tab.offset.knots, tab.offset.even_est, domain_values(geom)["a"])
+    est = (tab.masked if cause == MASKED else tab.offset).even_est
+    if not outside_notes(geom, table=tab):
+        return est
+    from . import evaluate       # the package registry (tline/__init__ imports this module)
+    return max(est, (closed or evaluate(geom)).est_error_pct)

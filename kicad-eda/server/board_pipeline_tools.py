@@ -90,17 +90,28 @@ def render_pcb(pcb: str, side: str = "top", out_png: str = "") -> dict:
     return {"ok": r.returncode == 0, "output": out, "kicad_cli": cli, "stderr": r.stderr[-1000:]}
 
 
-def build_board_from_netlist(netlist: str, board_w: float, board_h: float,
+def build_board_from_netlist(netlist: str, board_w: float = 0, board_h: float = 0,
                              out_pcb: str = "", footprints_dir: str = "",
                              placement: str = "", pack_scale: float = 1.0) -> dict:
     """Generate a placed .kicad_pcb with copper planes from the netlist.json.
 
     Loads every footprint by lib_id, places it (board-relative coords, optionally
-    overridden by a placement.json of ref -> [x, y, rot]), centers the board on an
-    A4 sheet, assigns every pad to its net (all copper elements of split thermal
+    overridden by a placement.json of ref -> [x, y, rot]), centers the board on
+    its sheet, assigns every pad to its net (all copper elements of split thermal
     pads), draws the Edge.Cuts outline, sets JLCPCB-class rules, and pours a GND
     plane on In1.Cu + the first power rail on In2.Cu (filled). Runs under KiCad's
     bundled Python (KiCad 9/10) with THAT install's footprint libraries.
+    The netlist board block is resolved first: outline.loop or outline.dxf
+    (read here, relative to the netlist), corner_radius, cutouts and datum
+    make an outline board, with exact Edge.Cuts, the aux origin at its datum
+    and a <pcb stem>.outline.json sidecar beside the board; a plain w/h block
+    sizes a board with fixed parts as before. The result's "outline" gives
+    the source, fingerprint and sidecar. A block that cannot be resolved (e.g.
+    a missing DXF) refuses before KiCad starts. board_w/board_h (mm) are
+    optional: 0 = from the netlist; they size only a fully placed board that
+    has no board block (auto placement sizes the board to its parts). A value
+    that differs from the board block / outline by more than 0.01 mm is
+    reported as "board_w/board_h ignored" in the warnings.
     pack_scale (>1) loosens auto-placement spacing to give a deterministic
     router more room on a re-route. A board-API session (open_board) that
     still holds out_pcb is closed first (released_boards), or the build is
@@ -114,9 +125,15 @@ def autoroute_board(pcb: str, max_passes: int = 100, jar: str = "",
                     route_timeout: int = 300, from_snapshot: bool = False,
                     dsn_seed: int = 0) -> dict:
     """Autoroute a board with Freerouting: export Specctra DSN, route, import the
-    SES session back, and refill zones. Signal layers route on F.Cu/B.Cu while
-    GND/power return to the inner planes. The router is killed after
-    route_timeout seconds so a pathological board can never hang the pipeline.
+    SES session back, and refill zones. Every copper layer is routable in the
+    exported DSN (no per-layer restriction yet), so Freerouting may also lay
+    signal tracks on the inner plane layers; the refilled planes clear around
+    them. A board with a non-rectangular outline (arcs, cutouts, more than 4
+    vertices or slanted edges) gets its DSN boundary shrunk and its cutout
+    keepouts grown so the routed copper keeps the board's copper-to-edge
+    clearance; a rectangular board keeps the outline KiCad exported. The
+    router is killed after route_timeout seconds so a pathological board can
+    never hang the pipeline.
     Returns the resulting track count and unconnected count. Routing is
     deterministic for a given placement: the exported DSN is rewritten in a
     canonical order (KiCad writes footprints and vias in random-UUID order and

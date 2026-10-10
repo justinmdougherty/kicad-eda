@@ -626,7 +626,8 @@ def test_a_kicad_server_helper_name_is_not_a_taken_tool_name(monkeypatch):
     assert callable(k._kicad_python) and callable(k.register_tool_modules)
     monkeypatch.setattr(review_tools, "TOOLS", (_kicad_python, register_tool_modules))
     names = _register(FastMCP("registry-probe"))
-    assert names[-2:] == ["_kicad_python", "register_tool_modules"]
+    # registered, not refused; feature modules after review_tools may follow them
+    assert {"_kicad_python", "register_tool_modules"} <= set(names)
 
 
 @pytest.mark.parametrize("bad, why", [(probe_tool, "must be a tuple"),

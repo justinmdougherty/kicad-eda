@@ -31,14 +31,33 @@ the schematic, but the board takes pad nets from the netlist, so a floating
 stacked pin's floating_detail entry carries ``stacked_on`` and a ``hint``
 that suggests netting the whole pin group at once (its pads listed; for a
 sym_author part, the pin_groups entry of that name).
+
+Board-only parts (D4 ``"board_only": true``: holes, fiducials, board-only
+pads) are not in the schematic, so the pin-type, decoupling and floating-pin
+checks leave them out (they need no lib_id and an unreadable one is no error).
+
+Ground (report["ground_nets"]): a net whose name matches (case-insensitive)
+``[A|D|P|S|C]GND*``, ``VSS*``, ``0V`` or ``EARTH`` (is_ground_name), or that
+carries a power_in pin with such a name. A ground rail never needs a bypass
+cap of its own, and a cap to any ground covers a rail: a rail counts as
+decoupled when any capacitor sits on it (a series cap included -- name-based
+ground detection must never take coverage away, since an uncovered rail makes
+G2 add a bypass cap automatically).
+
+Component ``pins`` fallback: a component whose symbol cannot be read (or that
+has no lib_id) but carries ``"pins": {pad: {"name", "type"}}`` (e.g. from an
+import) is judged from that map instead of being reported unreadable; the
+report lists it under ``pins_fallback``. A malformed map is an error naming
+what is wrong. With no symbol source at all the pin checks stay off.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import NamedTuple
 
@@ -60,6 +79,13 @@ _ANON_PIN_NAMES = ("~", "")
 # a stacked pin (D1, KLC S4.3) is hidden and typed passive
 _STACKED_TYPE = "passive"
 _USAGE = "usage: design_report.py <netlist.json> [symbols_dir | library_map.json] [--json]"
+# a ground net / ground pin name (case-insensitive)
+GROUND_NAME_RE = re.compile(r"^(?:(?:A|D|P|S|C)?GND\w*|VSS\w*|0V|EARTH)$", re.IGNORECASE)
+# the electrical types a component "pins" fallback may use (KiCad's pin types)
+PIN_TYPES = frozenset({"input", "output", "bidirectional", "tri_state", "passive", "free",
+                       "unspecified", "power_in", "power_out", "open_collector",
+                       "open_emitter", "no_connect"})
+_PINS_SHAPE = "must be an object of pad -> {name, type}"
 
 
 class DesignReportError(Exception):
@@ -69,12 +95,24 @@ class DesignReportError(Exception):
 class PinMaps(NamedTuple):
     """What the symbols say, per ref: {pad: electrical type}, {pin name: pad}
     (first name wins), {pad: pin name} (stacked pins too) and {stacked pad:
-    the pad it is stacked on}; plus one error per unreadable lib_id."""
+    the pad it is stacked on}; plus one error per unreadable lib_id and the
+    refs judged from their own "pins" map."""
     types: dict
     aliases: dict
     names: dict
     stacked: dict
     errors: list
+    fallback: list
+
+
+def is_ground_name(name: object) -> bool:
+    """True for a ground net or pin name: [A|D|P|S|C]GND*, VSS*, 0V, EARTH."""
+    return isinstance(name, str) and GROUND_NAME_RE.fullmatch(name) is not None
+
+
+def _board_only(comp: Mapping) -> bool:
+    """D4 ``"board_only": true`` (lint rejects a non-boolean; never raise here)."""
+    return comp.get("board_only") is True
 
 
 def _checked_source(source: object) -> SymbolSource | None:
@@ -142,6 +180,71 @@ def _symbol_maps(flat: list) -> tuple[dict, dict, dict, dict]:
     return symlib.pin_etypes(flat), aliases, _pin_names(flat), _stacked_pins(flat)
 
 
+def _fallback_maps(pins: object) -> tuple[dict, dict, dict, dict]:
+    """(types, aliases, names, stacked) from a component's own ``"pins":
+    {pad: {"name", "type"}}`` map, the way _symbol_maps reads a symbol (no
+    geometry, so nothing is stacked). ValueError naming what is malformed."""
+    if not isinstance(pins, Mapping) or not pins:
+        raise ValueError(_PINS_SHAPE)
+    types: dict = {}
+    aliases: dict = {}
+    names: dict = {}
+    for pad, info in pins.items():
+        key = str(pad)
+        if not isinstance(info, Mapping) or "type" not in info:
+            raise ValueError(f"pad {key!r} must be an object with a 'type'")
+        etype, name = info["type"], info.get("name") or ""
+        if not isinstance(etype, str) or etype not in PIN_TYPES:
+            raise ValueError(f"pad {key!r} has unknown type {etype!r}")
+        if not isinstance(name, str):
+            raise ValueError(f"pad {key!r} name must be a string")
+        types[key] = etype
+        if name not in _ANON_PIN_NAMES:
+            names[key] = name
+            if name != key:
+                aliases.setdefault(name, key)       # first name wins, as for a symbol
+    return types, aliases, names, {}
+
+
+def _symbol_reader(symbols: SymbolSource) -> Callable[[str], tuple[tuple | None, str]]:
+    """read(lib_id) -> (_symbol_maps of it, '') or (None, reason); each lib_id
+    is flattened once."""
+    cache: dict = {}
+    memo: dict = {}
+
+    def read(lib_id: str) -> tuple[tuple | None, str]:
+        if lib_id not in memo:
+            lib, _, name = lib_id.partition(":")
+            try:
+                memo[lib_id] = (_symbol_maps(symlib.flatten(cache, symbols, lib, name)), "")
+            except (symlib.SymbolLibError, ValueError, IndexError, TypeError) as e:
+                memo[lib_id] = (None, f"{type(e).__name__}: {e}")
+        return memo[lib_id]
+    return read
+
+
+def _component_maps(comp: Mapping, read: Callable) -> tuple[tuple | None, str, bool]:
+    """(maps, why not, from its "pins" map) for one schematic component: its
+    symbol's maps, else its "pins" fallback; maps is None when neither works."""
+    lib_id = comp.get("lib_id")
+    maps, why = read(lib_id) if lib_id else (None, f"component has no lib_id ({comp!r})")
+    if maps is not None or comp.get("pins") is None:
+        return maps, why, False
+    try:
+        return _fallback_maps(comp["pins"]), "", True
+    except ValueError as e:
+        return None, f'{why}; its "pins" map is unusable: {e}', False
+
+
+def _schematic_parts(design: dict) -> list:
+    """The components the pin checks judge: every one but the board-only ones.
+    DesignReportError unless ``components`` is a list of objects."""
+    comps = design.get("components", [])
+    if not isinstance(comps, list) or not all(isinstance(c, dict) for c in comps):
+        raise DesignReportError("netlist 'components' must be a list of objects")
+    return [c for c in comps if not _board_only(c)]
+
+
 def _pin_types(design: dict, source: object) -> PinMaps:
     """PinMaps from the KiCad symbols of ``source`` (a directory, a
     LibraryResolver or a library map). The alias map lets a netlist that keys
@@ -150,47 +253,45 @@ def _pin_types(design: dict, source: object) -> PinMaps:
 
     No source ('' / None / an empty map) yields empty maps and no errors (the
     caller chose not to supply symbols; the report marks symbols_available
-    False). A symbol that cannot be loaded/parsed is reported once per lib_id
-    in ``errors`` and its refs are left OUT of the maps, so the caller can see
-    exactly which parts the pin-type checks did not cover. A component with no
-    usable ``lib_id`` is likewise reported and skipped (lint does not reject
-    it, and the pipeline calls analyze() unconditionally, so it must not raise).
+    False). Board-only parts are skipped. A symbol that cannot be loaded or
+    parsed is reported once per lib_id in ``errors`` and its refs are left OUT
+    of the maps, unless a ref carries a usable "pins" map, which then stands
+    in for the symbol (``fallback``). A component with no usable ``lib_id`` is
+    likewise reported and skipped (lint does not reject it, and the pipeline
+    calls analyze() unconditionally, so it must not raise).
 
     Raises DesignReportError only when ``components`` is not a list of dicts,
     TypeError when ``source`` is none of the three kinds."""
     tables: tuple[dict, dict, dict, dict] = ({}, {}, {}, {})   # types, aliases, names, stacked
     errors: list = []
+    fallback: list = []
     symbols = _checked_source(source)
     if symbols is None:
-        return PinMaps(*tables, errors)
-    comps = design.get("components", [])
-    if not isinstance(comps, list) or not all(isinstance(c, dict) for c in comps):
-        raise DesignReportError("netlist 'components' must be a list of objects")
-    cache: dict = {}
+        return PinMaps(*tables, errors, fallback)
+    read = _symbol_reader(symbols)
     failed: dict = {}                              # lib_id -> (reason, [refs])
-    for c in comps:
+    for c in _schematic_parts(design):
         ref, lib_id = c.get("ref"), c.get("lib_id")
-        if not ref or not lib_id:
-            errors.append(f"pin types unavailable for {ref or '(no ref)'}: "
-                          f"component has no lib_id ({c!r})")
+        if not ref:
+            errors.append(f"pin types unavailable for (no ref): component has no ref ({c!r})")
             continue
-        if lib_id in failed:
-            failed[lib_id][1].append(ref)
-            continue
-        lib, _, name = lib_id.partition(":")
-        try:
-            per_ref = _symbol_maps(symlib.flatten(cache, symbols, lib, name))
-        except (symlib.SymbolLibError, ValueError, IndexError, TypeError) as e:
-            failed[lib_id] = (f"{type(e).__name__}: {e}", [ref])
+        per_ref, why, from_pins = _component_maps(c, read)
+        fallback = [r for r in fallback if r != ref]   # a duplicate ref read earlier
+        if per_ref is None:
             for table in tables:
-                table.pop(ref, None)                # a duplicate ref read earlier
+                table.pop(ref, None)
+            if lib_id and c.get("pins") is None:
+                failed.setdefault(lib_id, (why, []))[1].append(ref)
+            else:
+                errors.append(f"pin types unavailable for "
+                              f"{f'{lib_id} ({ref})' if lib_id else ref}: {why}")
             continue
         for table, value in zip(tables, per_ref, strict=True):
             table[ref] = value
-    for lib_id, (reason, refs) in failed.items():
-        errors.append(f"pin types unavailable for {lib_id} "
-                      f"({', '.join(refs)}): {reason}")
-    return PinMaps(*tables, errors)
+        fallback += [ref] if from_pins else []
+    errors += [f"pin types unavailable for {lib_id} ({', '.join(refs)}): {reason}"
+               for lib_id, (reason, refs) in failed.items()]
+    return PinMaps(*tables, errors, fallback)
 
 
 def _canon(aliases: dict, ref: str, pad) -> str:
@@ -265,9 +366,12 @@ def _floating(comps: list, maps: PinMaps, net_of: dict, no_connect: set) -> tupl
     neither netted, nor declared no_connect, nor typed no-connect by the
     symbol. A detail entry is {pin, ref, pad, type, name, same_name_net,
     lib_id, footprint} (the napkin floating-pin policy's input, D5); a
-    stacked pin's entry also has stacked_on and hint (_stack_hint)."""
+    stacked pin's entry also has stacked_on and hint (_stack_hint). Board-only
+    parts are never judged (they are not in the schematic)."""
     detail = []
     for c in comps:
+        if _board_only(c):
+            continue
         ref, pin_names = c["ref"], maps.names.get(c["ref"], {})
         for p, t in maps.types.get(ref, {}).items():
             pad = str(p)
@@ -296,8 +400,9 @@ def analyze(design: dict, symbols_dir: SymbolSource | None = "", *,
     maps = _pin_types(design, symbols_dir if symbols is None else symbols)
     net_of = _net_index(nets, maps.aliases)
     no_connect = {(r, _canon(maps.aliases, r, p)) for r, p in design.get("no_connect", [])}
+    grounds = _ground_nets(nets, maps)
     dfa = _dfa(comps)
-    decoupling = _decoupling(comps, maps.types, net_of)
+    decoupling = _decoupling(comps, maps.types, net_of, grounds)
     rails = _power_tree(nets, specs, maps)
     floating, floating_detail = _floating(comps, maps, net_of, no_connect)
     return {
@@ -305,13 +410,26 @@ def analyze(design: dict, symbols_dir: SymbolSource | None = "", *,
         "dfa": dfa,
         "decoupling": decoupling,
         "power_tree": rails,
+        "ground_nets": sorted(grounds),
         "flags": {"floating_pins": floating,
                   "floating_detail": floating_detail,
                   "nets_missing_pull": _nets_missing_pull(nets),
                   "rails_missing_testpoint": _rails_missing_testpoint(nets, specs)},
         "symbols_available": bool(maps.types and any(maps.types.values())),
+        "pins_fallback": maps.fallback,
         "errors": maps.errors,
     }
+
+
+def _ground_nets(nets: dict, maps: PinMaps) -> frozenset:
+    """Nets named like a ground (is_ground_name) or carrying a power_in pin
+    whose name is one (e.g. a "GND" pin on a net called "RTN")."""
+    def ground_pin(ref: str, pad: object) -> bool:
+        key = _canon(maps.aliases, ref, pad)
+        return (maps.types.get(ref, {}).get(key) == "power_in"
+                and is_ground_name(maps.names.get(ref, {}).get(key)))
+    return frozenset(net for net, conns in nets.items()
+                     if is_ground_name(net) or any(ground_pin(r, p) for r, p in conns))
 
 
 def _net_index(nets: dict, aliases: dict) -> dict:
@@ -343,24 +461,27 @@ def _dfa(comps: list) -> dict:
     }
 
 
-def _decoupling(comps: list, ptypes: dict, net_of: dict) -> dict:
-    """Decoupling coverage: every IC power_in net should see a cap on it."""
+def _decoupling(comps: list, ptypes: dict, net_of: dict, grounds: frozenset) -> dict:
+    """Decoupling coverage: every IC power_in net that is not a ground should
+    see a cap on it (a cap to any ground counts). Board-only parts are
+    neither ICs nor caps."""
+    parts = [c for c in comps if not _board_only(c)]
     ref_nets: dict = defaultdict(set)
     for (r, _p), net in net_of.items():
         ref_nets[r].add(net)
     cap_nets: set = set()
-    for c in comps:
+    for c in parts:
         if _prefix(c["ref"]) == "C":
             cap_nets |= ref_nets[c["ref"]]
     decoupling: dict = {"checked": [], "uncovered": []}
-    for c in comps:
+    for c in parts:
         ref = c["ref"]
         pwr_nets = {net_of.get((ref, str(p)))
                     for p, t in ptypes.get(ref, {}).items() if t == "power_in"}
         pwr_nets.discard(None)
         if not pwr_nets:
             continue
-        missing = sorted(n for n in pwr_nets if n not in cap_nets and n != "GND")
+        missing = sorted(n for n in pwr_nets if n not in cap_nets and n not in grounds)
         covered = sorted(n for n in pwr_nets if n in cap_nets)
         decoupling["checked"].append(
             {"ref": ref, "rails": sorted(pwr_nets), "decoupled": covered})
@@ -406,14 +527,26 @@ def _rails_missing_testpoint(nets: dict, specs: dict) -> list:
                   and not any(_prefix(r) == "TP" for r, _ in nets[net]))
 
 
-def to_markdown(rep: dict) -> str:
-    L = [f"# Design Report — {rep['title']}", ""]
+def _source_lines(rep: dict) -> list[str]:
+    """The "## Errors" section (unreadable symbols) and the parts judged from
+    their own "pins" map; nothing when neither applies."""
+    lines: list[str] = []
     if rep.get("errors"):
-        L += ["## Errors",
-              "The following symbols could not be read; decoupling, power-tree "
-              "and floating-pin checks did NOT cover their parts:"]
-        L += [f"- {e}" for e in rep["errors"]]
-        L.append("")
+        lines += ["## Errors",
+                  "The following symbols could not be read; decoupling, power-tree "
+                  "and floating-pin checks did NOT cover their parts:"]
+        lines += [f"- {e}" for e in rep["errors"]]
+        lines.append("")
+    if rep.get("pins_fallback"):
+        lines.append("## Pin types from the netlist")
+        lines += [f'- {ref}: symbol unavailable; pin types taken from its "pins" map'
+                  for ref in rep["pins_fallback"]]
+        lines.append("")
+    return lines
+
+
+def to_markdown(rep: dict) -> str:
+    L = [f"# Design Report — {rep['title']}", "", *_source_lines(rep)]
     d = rep["dfa"]
     L += ["## DFA / BOM",
           f"- Placements: **{d['placements']}**  |  unique line items: "

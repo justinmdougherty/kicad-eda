@@ -1,29 +1,41 @@
 #!/usr/bin/env python3
 """Board-side gate checks — runs under KiCad's bundled Python (needs pcbnew).
 
-Three modes, each emits JSON {"issues": [...], "warnings": [...]} on stdout:
+Three modes, each emits JSON {"issues": [...], "warnings": [...]} on stdout,
+plus "codes" / "warning_codes" (a stable code per issue / warning, in order) and
+"details" (per issue: a longer text, or null):
 
   placement <pcb> [netlist.json]
       Pre-route placement-review checks (the G3 gate):
       - every connector's mating mouth faces OFF the board (not into the
         interior) and sits at the edge it faces (<= 3 mm); a J* part the
-        netlist flags "interior": true (jumper, Kelvin header) is exempt
+        netlist flags "interior": true (jumper, Kelvin header) is exempt.
+        With a readable Edge.Cuts outline the edge is the outline's nearest
+        edge (outline_audit.connector_edge_issue; cutout edges count with
+        board.panel_cutouts), else the Edge.Cuts bounding box as before
       - if the netlist requests an antenna_keepout, a no-fill rule area exists
       - exposed-pad via farms, pre-route plane integrity, height zones
+      - the outline rules of swig_outline_checks: an open outline, courtyards,
+        pads, mounting-hole drills, fab outline rules, edge-mount straddle,
+        plane islands on shaped boards (warnings)
   placement_routed <pcb> [netlist.json]
-      The placement checks re-run on a routed board (plane integrity skipped).
+      The placement checks re-run on a routed board (plane checks skipped).
   routed <pcb> [netlist.json]
       Post-route layout-review checks (part of the G4 gate):
       - every net bound to a net class is routed at >= the class track width
         (verifies the IPC-2221/2141A rules engine wasn't silently ignored)
       - high-current layer transitions have enough via ampacity; declared
         differential pairs are length-matched and coupled (warnings)
-      These live in swig_routed_checks.py and are re-exported here.
+        (swig_routed_checks.py, re-exported here)
+      - copper containment: every track / arc / via / pad on the board material
+        (swig_outline_checks; DRC misses copper wholly inside an Edge.Cuts hole)
 
 main() loads the board through board_outline.load_board (a missing or
 unreadable file is one JSON issue, never a None board) and builds every
 footprint's courtyard cache: KiCad 9.0.4's LoadBoard leaves them EMPTY, so the
 connector rule never fired and check_heights measured the silk/text bbox (T02).
+board_outline and swig_outline_checks are imported inside functions: unit tests
+import this module with a stub pcbnew, and both bind pcbnew when first imported.
 
 These complement (not replace) kicad-cli DRC: DRC checks geometry against
 rules; these check the *design intent* a DRC can't see.
@@ -79,21 +91,71 @@ def is_edge_connector(ref: str, interior: set) -> bool:
     return ref.startswith("J") and ref not in interior
 
 
-def check_placement(board, design, routed=False):
-    """routed=True re-validates a cached ROUTED board: plane integrity is
-    skipped — it is a PRE-route check (its premise is "the router will trust
-    the DSN plane rectangle and return the net broken"); on a routed board
-    the plane is legitimately carved by via antipads and any stranded
-    islands are already tied by healed tracks, proven by DRC unconnected=0
-    at G4. Every other placement check still applies to the artifact."""
-    issues = []
+def inward_text(ref: str) -> str:
+    """The G3 text of a connector whose mouth faces the board (napkin_policy and
+    faithful.relax_g3 match its prefix; F5-08 drift-tests this source)."""
+    return f"{ref}: mating face points INTO the board interior (unusable in an enclosure)"
+
+
+def far_text(ref: str, dist: float) -> str:
+    """The G3 text of a connector whose mouth is more than 3 mm from its edge."""
+    return (f"{ref}: mating face is {dist:.1f} mm from the board edge it faces "
+            f"(must be at the edge, <=3 mm)")
+
+
+def _bbox_connector(ref: str, mouth: tuple, box: tuple) -> str | None:
+    """The bbox rule (a board without a readable outline): the mouth must point
+    away from the board centre and its courtyard face lie <= 3 mm from the
+    Edge.Cuts bounding-box side it faces."""
+    to = pcbnew.ToMM
+    (mx, my), cybb = mouth
+    bx0, by0, bx1, by1 = box
+    ccx, ccy = to(cybb.GetCenter().x), to(cybb.GetCenter().y)
+    if mx * (ccx - (bx0 + bx1) / 2) + my * (ccy - (by0 + by1) / 2) <= 0:
+        return inward_text(ref)
+    if mx > 0:
+        dist = bx1 - to(cybb.GetRight())
+    elif mx < 0:
+        dist = to(cybb.GetLeft()) - bx0
+    elif my > 0:
+        dist = by1 - to(cybb.GetBottom())
+    else:
+        dist = to(cybb.GetTop()) - by0
+    return far_text(ref, dist) if dist > 3.0 else None
+
+
+def _outline_connector(ref: str, mouth: tuple, shape: Any, panel: bool
+                       ) -> tuple[str | None, str | None]:
+    """(text, detail) of the outline rule: the courtyard face the mouth opens
+    through, judged against its nearest outline edge."""
+    import swig_outline_checks as soc
+    to = pcbnew.ToMM
+    (mx, my), cybb = mouth
+    ox, oy = shape.origin
+    box = (to(cybb.GetLeft()) - ox, to(cybb.GetTop()) - oy,
+           to(cybb.GetRight()) - ox, to(cybb.GetBottom()) - oy)
+    v = soc.connector_verdict(shape.outline, ref, soc.face_point(box, (mx, my)), (mx, my), panel)
+    if v is None:
+        return None, None
+    return (inward_text(ref) if v.kind == "inward" else far_text(ref, v.dist)), v.detail
+
+
+def _edges_box(board: Any) -> tuple[float, float, float, float]:
     to = pcbnew.ToMM
     bb = board.GetBoardEdgesBoundingBox()
-    bx0, by0 = to(bb.GetLeft()), to(bb.GetTop())
-    bx1, by1 = to(bb.GetRight()), to(bb.GetBottom())
-    bcx, bcy = (bx0 + bx1) / 2, (by0 + by1) / 2
+    return to(bb.GetLeft()), to(bb.GetTop()), to(bb.GetRight()), to(bb.GetBottom())
 
+
+def connector_findings(board: Any, design: dict, shape: Any) -> list:
+    """connector_edge findings of every edge connector with a mating direction:
+    the outline rule when the board has a readable outline, else the bbox rule.
+    The texts are the plain legacy sentences; the outline's nearest-edge
+    explanation goes in the finding's detail."""
+    import swig_outline_checks as soc
     interior = interior_refs(design)
+    panel = bool((design.get("board") or {}).get("panel_cutouts"))
+    box = _edges_box(board) if shape.outline is None else None
+    out = []
     for fp in board.GetFootprints():
         ref = fp.GetReference()
         if not is_edge_connector(ref, interior):
@@ -101,38 +163,54 @@ def check_placement(board, design, routed=False):
         m = _world_mouth(fp)
         if m is None:
             continue                       # vertical header — no mating direction
-        (mx, my), cybb = m
-        ccx, ccy = to(cybb.GetCenter().x), to(cybb.GetCenter().y)
-        if mx * (ccx - bcx) + my * (ccy - bcy) <= 0:
-            issues.append(f"{ref}: mating face points INTO the board interior "
-                          f"(unusable in an enclosure)")
-            continue
-        if mx > 0:
-            dist = bx1 - to(cybb.GetRight())
-        elif mx < 0:
-            dist = to(cybb.GetLeft()) - bx0
-        elif my > 0:
-            dist = by1 - to(cybb.GetBottom())
-        else:
-            dist = to(cybb.GetTop()) - by0
-        if dist > 3.0:
-            issues.append(f"{ref}: mating face is {dist:.1f} mm from the board "
-                          f"edge it faces (must be at the edge, <=3 mm)")
+        text, detail = ((_bbox_connector(ref, m, box), None) if shape.outline is None
+                        else _outline_connector(ref, m, shape, panel))
+        if text is not None:
+            out.append(soc.Finding(soc.CONNECTOR_EDGE, "error", text, detail))
+    return out
 
-    if design.get("antenna_keepout"):
-        # the "no copper pour" getter differs between pcbnew 9.x and 10.x: read it
-        # through board_outline. Imported here: board_outline binds pcbnew when first
-        # imported, and unit tests import this module with a stub pcbnew briefly.
-        import board_outline
-        ok = any(board_outline.blocks_pour(z) for z in board.Zones())
-        if not ok:
-            issues.append("antenna_keepout requested in the netlist but no "
-                          "no-fill rule area exists on the board")
 
-    issues += check_ep_via_farms(board, design)
-    pi_issues, pi_warnings = ([], []) if routed else check_plane_integrity(board)
-    h_issues, h_warnings = check_heights(board, design)
-    return issues + pi_issues + h_issues, pi_warnings + h_warnings
+def keepout_findings(board: Any, design: dict) -> list:
+    """antenna_keepout requested but no no-fill rule area on the board. The pour
+    flag's getter differs between pcbnew 9.x and 10.x: board_outline reads it."""
+    if not design.get("antenna_keepout"):
+        return []
+    import board_outline
+    import swig_outline_checks as soc
+    if any(board_outline.blocks_pour(z) for z in board.Zones()):
+        return []
+    return [soc.Finding("antenna_keepout", "error", "antenna_keepout requested in the netlist "
+                        "but no no-fill rule area exists on the board")]
+
+
+def placement_findings(board: Any, design: dict, routed: bool = False) -> list:
+    """Every G3 finding (swig_outline_checks.Finding: code, severity, text,
+    detail). routed=True re-validates a cached ROUTED board: the plane checks
+    are skipped — they are PRE-route checks (their premise is "the router will
+    trust the DSN plane rectangle and return the net broken"); on a routed board
+    the plane is legitimately carved by via antipads and any stranded islands
+    are already tied by healed tracks, proven by DRC unconnected=0 at G4. Every
+    other placement check still applies to the artifact."""
+    import swig_outline_checks as soc
+    shape = soc.read_shape(board)
+    found = [*shape.findings, *connector_findings(board, design, shape),
+             *keepout_findings(board, design),
+             *soc.tagged("ep_via_farm", "error", check_ep_via_farms(board, design))]
+    if not routed:
+        pi_issues, pi_warnings = check_plane_integrity(board)
+        found += (soc.tagged("plane_fractured", "error", pi_issues)
+                  + soc.tagged("plane_pinch", "warning", pi_warnings)
+                  + soc.plane_island_findings(board, shape))
+    h_issues, h_warnings = check_heights(board, design, shape.origin)
+    found += (soc.tagged("height_zone", "error", h_issues)
+              + soc.tagged("height_unknown", "warning", h_warnings))
+    return found + soc.placement_findings(board, design, shape)
+
+
+def check_placement(board: Any, design: dict, routed: bool = False) -> tuple[list, list]:
+    """(issues, warnings) texts of placement_findings."""
+    import swig_outline_checks as soc
+    return soc.split(placement_findings(board, design, routed))
 
 
 # component height defaults by footprint hint (mm), specific before generic
@@ -148,47 +226,57 @@ PKG_HEIGHTS = [
 ]
 
 
-def check_heights(board, design):
+def _part_height(c: dict) -> float | None:
+    """The component's "height", else the package table's, else None."""
+    if c.get("height") is not None:
+        return float(c["height"])
+    fp_name = c.get("footprint", "")
+    for hint, h in PKG_HEIGHTS:
+        if hint.lower() in fp_name.lower():
+            return h
+    return None
+
+
+def _height_box(fp: Any, side: str, origin: tuple) -> tuple[float, float, float, float]:
+    """fp's courtyard bbox on its side (else its bounding box) in the board frame."""
+    to = pcbnew.ToMM
+    try:
+        cy = fp.GetCourtyard(pcbnew.F_CrtYd if side == "F" else pcbnew.B_CrtYd)
+        fbb = cy.BBox() if cy and cy.OutlineCount() > 0 else fp.GetBoundingBox()
+    except Exception:
+        fbb = fp.GetBoundingBox()
+    ox, oy = origin
+    return (to(fbb.GetLeft()) - ox, to(fbb.GetTop()) - oy,
+            to(fbb.GetRight()) - ox, to(fbb.GetBottom()) - oy)
+
+
+def check_heights(board: Any, design: dict,
+                  origin: tuple | None = None) -> tuple[list, list]:
     """Mechanical ceiling check — courtyard DRC is 2D-blind. The netlist
     declares "height_zones": [{x,y,w,h,max_height, side: "F"|"B"|"both",
     exempt: [refs]}] in board-relative mm (a HAT's underside clearance to
     the Pi, an enclosure lid, a heatsink shadow). Part height comes from
     the component's "height" key, else the package table; a part inside a
     zone with UNKNOWN height is a warning ("declare it"), a part TALLER
-    than the ceiling is a blocker. Returns (issues, warnings)."""
+    than the ceiling is a blocker. `origin` = the board frame's sheet origin
+    (the outline bbox top-left); None: the Edge.Cuts bounding box's (that
+    box includes half the Edge.Cuts line width). Returns (issues, warnings)."""
     zones = design.get("height_zones") or []
     if not zones:
         return [], []
     issues, warnings = [], []
     to = pcbnew.ToMM
-    bb = board.GetBoardEdgesBoundingBox()
-    ox, oy = to(bb.GetLeft()), to(bb.GetTop())
+    if origin is None:
+        bb = board.GetBoardEdgesBoundingBox()
+        origin = (to(bb.GetLeft()), to(bb.GetTop()))
     comps = {c["ref"]: c for c in design.get("components", [])}
-
-    def part_height(c):
-        if c.get("height") is not None:
-            return float(c["height"])
-        fp_name = c.get("footprint", "")
-        for hint, h in PKG_HEIGHTS:
-            if hint.lower() in fp_name.lower():
-                return h
-        return None
-
     for fp in board.GetFootprints():
         ref = fp.GetReference()
         c = comps.get(ref)
         if c is None:
             continue                       # mounting holes etc.
         side = "B" if fp.GetLayer() == pcbnew.B_Cu else "F"
-        try:
-            cy = fp.GetCourtyard(pcbnew.F_CrtYd if side == "F"
-                                 else pcbnew.B_CrtYd)
-            fbb = (cy.BBox() if cy and cy.OutlineCount() > 0
-                   else fp.GetBoundingBox())
-        except Exception:
-            fbb = fp.GetBoundingBox()
-        fx0, fy0 = to(fbb.GetLeft()) - ox, to(fbb.GetTop()) - oy
-        fx1, fy1 = to(fbb.GetRight()) - ox, to(fbb.GetBottom()) - oy
+        fx0, fy0, fx1, fy1 = _height_box(fp, side, origin)
         for z in zones:
             zside = z.get("side", "F")
             if zside != "both" and zside != side:
@@ -199,7 +287,7 @@ def check_heights(board, design):
                     or fy1 < z["y"] or fy0 > z["y"] + z["h"]):
                 continue
             lim = float(z["max_height"])
-            h = part_height(c)
+            h = _part_height(c)
             zname = z.get("name", f"height zone @({z['x']},{z['y']})")
             if h is None:
                 warnings.append(
@@ -458,32 +546,51 @@ def read_design(path: str) -> tuple[dict, list[str]]:
     return design, []
 
 
+def routed_findings(board: Any, pcb: str, design: dict) -> list:
+    """The G4 findings: class widths and via ampacity (blockers), the outline's
+    copper containment (and an unreadable outline), diff pairs (warnings)."""
+    import swig_outline_checks as soc
+    pro = pcb.rsplit(".", 1)[0] + ".kicad_pro"
+    shape = soc.read_shape(board)
+    return [*soc.tagged("routed_width", "error", check_routed_widths(board, pro, design)),
+            *soc.tagged("via_ampacity", "error", check_via_ampacity(board, design)),
+            *shape.findings, *soc.routed_findings(board, shape),
+            *soc.tagged("diff_pair", "warning", check_diff_pairs(board, design))]
+
+
+def mode_findings(mode: str, pcb: str, board: Any, design: dict) -> list:
+    """The findings of one main() mode."""
+    import swig_outline_checks as soc
+    if mode == "placement":
+        return placement_findings(board, design)
+    if mode == "placement_routed":
+        return placement_findings(board, design, routed=True)
+    if mode == "routed":
+        return routed_findings(board, pcb, design)
+    return [soc.Finding("unknown_mode", "error", f"unknown mode {mode}")]
+
+
 def run_mode(mode: str, pcb: str, board: Any, design: dict) -> tuple[list, list]:
     """(issues, warnings) of one main() mode."""
-    if mode == "placement":
-        return check_placement(board, design)
-    if mode == "placement_routed":
-        return check_placement(board, design, routed=True)
-    if mode == "routed":
-        pro = pcb.rsplit(".", 1)[0] + ".kicad_pro"
-        issues = check_routed_widths(board, pro, design)
-        issues += check_via_ampacity(board, design)
-        return issues, check_diff_pairs(board, design)
-    return [f"unknown mode {mode}"], []
+    import swig_outline_checks as soc
+    return soc.split(mode_findings(mode, pcb, board, design))
 
 
 def main() -> int:
-    """argv: mode pcb [netlist.json]. Prints {"issues": [...], "warnings": [...]};
-    rc 1 (with one issue saying why) when the board cannot be loaded."""
+    """argv: mode pcb [netlist.json]. Prints {"issues", "warnings", "codes",
+    "warning_codes", "details"} (swig_outline_checks.to_json); rc 1 (with one
+    issue saying why) when the board cannot be loaded."""
+    import swig_outline_checks as soc
     mode, pcb = sys.argv[1], sys.argv[2]
-    design, warnings = read_design(sys.argv[3]) if len(sys.argv) > 3 else ({}, [])
+    design, unread = read_design(sys.argv[3]) if len(sys.argv) > 3 else ({}, [])
+    notes = soc.tagged("netlist_unread", "warning", unread)
     try:
         board = load_checked_board(pcb)
     except (OSError, RuntimeError) as e:
-        print(json.dumps({"issues": [f"cannot load the board: {e}"], "warnings": warnings}))
+        failed = soc.Finding("board_unreadable", "error", f"cannot load the board: {e}")
+        print(json.dumps(soc.to_json([failed, *notes])))
         return 1
-    issues, found = run_mode(mode, pcb, board, design)
-    print(json.dumps({"issues": issues, "warnings": warnings + found}))
+    print(json.dumps(soc.to_json([*notes, *mode_findings(mode, pcb, board, design)])))
     return 0
 
 

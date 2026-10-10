@@ -20,8 +20,8 @@ this file) by tool_registry.py.
   PCB: live IPC tools (pcb_ipc_tools.py), the headless board pipeline
       (board_pipeline_tools.py: kicad-cli, KiCad's bundled Python,
       Freerouting) and agent routing on KiCad's board API (board_route_tools.py,
-      its own board registry). build_schematic_from_netlist (here): the API backend when
-      available, else sch_stage_tools.py (+ build_pin_sidecars, design_report).
+      its own board registry). build_schematic_from_netlist (here; body, project
+      libraries, file route: sch_stage_tools.py, + build_pin_sidecars, design_report).
   TOOLCHAIN (kicad_env + toolchain.py): newest kicad-cli for schematics; for a
       board the kicad-cli of the KiCad that WROTE the file, the pcbnew install's
       for a new board (KICAD_CLI_POLICY); KiCad 11 api-server for both APIs.
@@ -67,7 +67,8 @@ from board_pipeline_tools import (          # noqa: E402,F401  (re-exported for 
     check_design_gates, drc_pcb, export_fab_package, export_gerbers, render_pcb)
 from mcp.server.fastmcp import FastMCP     # noqa: E402
 from pcb_ipc_tools import create_pcb        # noqa: E402,F401
-from sch_stage_tools import _build_via_sch_build, build_pin_sidecars, design_report  # noqa: E402
+from sch_stage_tools import _build_via_sch_build  # noqa: E402,F401  (kept: k.<name>)
+from sch_stage_tools import build_netlist_schematic, build_pin_sidecars, design_report  # noqa: E402
 from session_release import Release, close_error_fields  # noqa: E402
 from tool_registry import register_tool_modules  # noqa: E402
 
@@ -589,7 +590,7 @@ def _build_via_api(netlist: str, out: str, symbols_dir: str, sidecars_dir: str) 
         return release.blocked
     notes = {**release.fields(), **close_error_fields(_forget(_key(out)))}
     try:
-        design = json.loads(Path(netlist).read_text(encoding="utf-8"))
+        design = json.loads(Path(netlist).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as e:
         return {"ok": False, "sch": out, "reason": f"netlist unreadable: {e}", **notes}
     try:
@@ -610,26 +611,20 @@ def build_schematic_from_netlist(netlist: str, out_sch: str = "",
 
     Lays components on a grid (one cell per unit), wires connectivity with a
     net label at every pin, adds PWR_FLAGs on undriven power nets and
-    no_connect flags on unused pins. backend "auto" lets KiCad 11's schematic
-    API place the symbols and write the file when available (response
-    backend "api"), else server/tools/sch_build.py embeds the symbols itself
-    ("file"; defaults: symbols_dir = KiCad's stock library, sidecars_dir =
-    this server's pins/). Optionally runs ERC (newest kicad-cli, errors only)
-    and reports the violation count."""
+    no_connect flags on unused pins. Project libraries (the netlist's
+    `libraries` block, the sym-lib-table / fp-lib-table beside it) are written
+    into the schematic directory's tables first (`library_tables`); ok is
+    False, nothing built, when they do not load. backend "auto" lets KiCad
+    11's schematic API place the symbols and write the file when available
+    (response backend "api"), else server/tools/sch_build.py embeds the
+    symbols itself ("file", + <stem>.kicad_pro; defaults: symbols_dir =
+    KiCad's stock library, sidecars_dir = <netlist dir>/pins then this
+    server's pins/). When KiCad 11 has no global library tables, "auto" falls
+    back to "file" and says so in `fallback` (decision recorded). Optionally
+    runs ERC (newest kicad-cli, errors only) and reports the violation count."""
     out = out_sch or str(Path(netlist).with_suffix(".kicad_sch"))
-    chosen = _pick_backend(backend)
-    if chosen == "api":
-        res = _build_via_api(netlist, out, symbols_dir, sidecars_dir)
-    else:
-        res = _build_via_sch_build(netlist, out, symbols_dir, sidecars_dir)
-    res["backend"] = chosen
-    if res.get("ok") and run_erc and tc.kicad_cli():
-        # gate on ERRORS only (warnings inform but don't block — e.g. the
-        # pin_to_pin warning for an address-strap pin tied to a power net is a
-        # known false positive); same severity policy as the DRC gate.
-        erc = tc.erc_json(out, str(Path(out).with_suffix("")) + "_erc.json")
-        res.update({k: v for k, v in erc.items() if k != "report"})
-    return res
+    return build_netlist_schematic(netlist, out, symbols_dir, sidecars_dir, _pick_backend(backend),
+                                   _build_via_api, insist=backend == "api", erc=run_erc)
 
 
 # ----------------------------------------------------------------------------

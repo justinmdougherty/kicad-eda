@@ -31,6 +31,7 @@ from fixtures import pipeline_world
 from fixtures.pipeline_world import CLEAN_DRC, DESIGN, K9_HEADER, World, recording_feature
 
 world = pipeline_world.world        # the fixture (an assignment: see pipeline_world)
+REAL_BOARD_FIX = rp_kicad.board_fix  # World replaces it; a test can put the real one back
 
 SHA = {seed: str(seed) * 64 for seed in range(3)}
 BUILT = f"{K9_HEADER}(built 1.0)\n"
@@ -60,14 +61,18 @@ def _gate(rep: dict, name: str) -> dict:
     return next(g for g in rep["gates"] if g["gate"] == name)
 
 
-def _boards_at_build(world: World, monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
-    """Wrap the fake build: the board bytes on disk when each build starts."""
-    seen: list[bytes] = []
+def _boards_at_build(world: World,
+                     monkeypatch: pytest.MonkeyPatch) -> list[tuple[bytes, bytes | None]]:
+    """Wrap the fake build: (the board bytes, the <pcb>.preheal bytes or None)
+    on disk when each build starts (the next attempt deletes .preheal)."""
+    seen: list[tuple[bytes, bytes | None]] = []
     inner = world.fake_build
 
     def build(netlist: str, w: float, h: float, pcb: str, fps: str, placement: str,
               scale: float) -> dict:
-        seen.append(Path(pcb).read_bytes() if Path(pcb).is_file() else b"")
+        board, preheal = Path(pcb), _side(world, ".preheal")
+        seen.append((board.read_bytes() if board.is_file() else b"",
+                     preheal.read_bytes() if preheal.is_file() else None))
         return inner(netlist, w, h, pcb, fps, placement, scale)
 
     monkeypatch.setattr(k, "build_board_from_netlist", build)
@@ -198,6 +203,38 @@ def test_a_route_provider_is_called_once_per_attempt_without_alternates_or_heal(
     assert not _side(world, ".placed").exists()
 
 
+RECOVERY_SUFFIXES = (".placed", ".preheal", ".alt0", ".alt1", ".alt2", ".alt7")
+
+
+def test_a_route_provider_run_leaves_no_older_recovery_copy(world):
+    for suffix in RECOVERY_SUFFIXES:
+        _side(world, suffix).write_text("an older run's copy\n", encoding="utf-8")
+    world.use_features(recording_feature("carry", route_provider=lambda ctx: (
+        lambda *args, **kw: {"ok": True, "tracks": 9, "unconnected": 0})))
+    assert world.run()["PASS"] is True
+    assert [s for s in RECOVERY_SUFFIXES if _side(world, s).exists()] == []
+
+
+def test_each_attempt_starts_without_the_previous_attempts_recovery_copies(world):
+    world.routes = [_route(2)]
+    world.routes_by_seed = {1: [_route(2, seed=1), _route(0, tracks=31, seed=1)],
+                            2: [_route(3, seed=2)]}
+    world.drcs = [CLEAN_DRC, NEAR, CLEAN_DRC]
+    world.fixes["heal"] = [[OPEN]]                       # attempt 1: rolled back, escalate
+    _side(world, ".alt7").write_text("an older run's seed-7 board\n", encoding="utf-8")
+    rep = world.run()
+    assert world.route_seeds() == [0, 1, 2, 0, 1]        # attempt 2 stops at seed 1
+    assert [a[3] for a in world.args_of("build")] == [1.0, 1.5]
+    assert rep["PASS"] is True and rep["autoroute"]["dsn_seed"] == 1
+    assert not _side(world, ".alt2").exists()            # attempt 1's seed-2 board is gone
+    assert not _side(world, ".alt7").exists()
+    assert not _side(world, ".preheal").exists()         # attempt 2 healed nothing
+    built = f"{K9_HEADER}(built 1.5)\n"
+    assert _side(world, ".placed").read_text(encoding="utf-8") == built
+    assert _side(world, ".alt0").read_text(encoding="utf-8") == built + "(routed)\n"
+    assert world.pcb.read_bytes() == _side(world, ".alt1").read_bytes()
+
+
 # --- the verified heal ----------------------------------------------------------------
 
 @pytest.mark.parametrize("fixes, drcs, routed, reason", [
@@ -207,7 +244,7 @@ def test_a_route_provider_is_called_once_per_attempt_without_alternates_or_heal(
      [CLEAN_CHECK, {"issues": [WIDTH], "warnings": []}],
      f"the heal added routed-check issue(s): {WIDTH}"),
     (["bridged 14.35 mm on F.Cu", OPEN], [NEAR], [CLEAN_CHECK],
-     f"the healer left 1 break(s) open ({OPEN})"),
+     f"the healer left 1 finding(s) open ({OPEN})"),
     (["bridged 0.4 mm gap on N1"], [NEAR, NEAR], [CLEAN_CHECK, CLEAN_CHECK],
      "2 unconnected item(s) left after the heal"),
 ], ids=["new-drc-error", "new-width-issue", "open-entry", "still-unconnected"])
@@ -225,9 +262,10 @@ def test_a_heal_that_is_not_better_is_rolled_back_and_the_ladder_escalates(
         {"gate": "G4", "round": 1,
          "applied": ["2 unrouted -> re-placed at pack_scale 1.5 and re-routed"]}]
     assert [a[3] for a in world.args_of("build")] == [1.0, 1.5]
-    preheal = _side(world, ".preheal").read_bytes()
-    assert boards[1] == preheal                          # restored before the rebuild
-    assert b"(fixed heal)" not in preheal
+    board, preheal = boards[1]
+    assert board == preheal                              # restored before the rebuild
+    assert b"(routed)" in board and b"(fixed heal)" not in board
+    assert not _side(world, ".preheal").exists()         # attempt 2 healed nothing
     assert rep["PASS"] is True and rep["autoroute"]["pack_scale"] == 1.5
 
 
@@ -284,6 +322,108 @@ def test_a_heal_that_applies_nothing_is_not_logged(world):
     assert rp_route.heal_near_miss(ctx, 1) is False
     assert ctx.remediation == [] and world.names().count("drc") == 1
     assert world.pcb.read_text(encoding="utf-8") == "routed\n"
+
+
+def test_a_healer_that_printed_no_result_is_rolled_back_naming_its_output(world, monkeypatch):
+    monkeypatch.setattr(rp_kicad, "board_fix", REAL_BOARD_FIX)
+    monkeypatch.setattr(k, "_kicad_python", lambda: "K:/9.0/bin/python.exe")
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(
+        args, 3, "", "Traceback (most recent call last):\nRuntimeError: pcbnew exploded"))
+    world.routes = [{"tracks": 20, "unconnected": 2}] * 3 + [{"tracks": 30, "unconnected": 0}]
+    world.drcs = [CLEAN_DRC, NEAR, CLEAN_DRC]
+    rep = world.run()
+    rolled = rep["remediation"][2]["applied"]
+    assert len(rolled) == 1 and rolled[0].startswith(
+        "heal rolled back: the healer left 1 finding(s) open (OPEN: swig_board_fixes.py "
+        "produced no result (heal, exit 3): ")
+    assert "pcbnew exploded" in rolled[0]
+    assert [a[3] for a in world.args_of("build")] == [1.0, 1.5] and rep["PASS"] is True
+
+
+DRC_FAILED = RuntimeError("DRC of netlist.kicad_pcb failed: kicad-cli exited 3: Error: bad board")
+CHECK_TIMED_OUT = subprocess.TimeoutExpired(["python.exe", "swig_gate_checks.py"], 300)
+FIX_TIMED_OUT = subprocess.TimeoutExpired(["python.exe", "swig_board_fixes.py"], 300)
+
+
+def _fail_nth(world: World, monkeypatch: pytest.MonkeyPatch, name: str, nth: int,
+              exc: Exception, mode: str | None = None, scribble: bool = False) -> None:
+    """rp_kicad.<name> raises `exc` on its nth call (counting only calls with
+    `mode` among their arguments when given), after appending to the board when
+    `scribble` (a child killed mid-save); every other call is World's."""
+    inner = getattr(rp_kicad, name)
+    seen = [0]
+
+    def call(*args: Any) -> Any:
+        if mode is None or mode in args:
+            seen[0] += 1
+            if seen[0] == nth:
+                if scribble:
+                    with open(world.pcb, "a", encoding="utf-8") as f:
+                        f.write(f"(half {name})\n")
+                raise exc
+        return inner(*args)
+
+    monkeypatch.setattr(rp_kicad, name, call)
+
+
+@pytest.mark.parametrize("name, nth, mode, exc, scribble", [
+    ("drc", 3, None, DRC_FAILED, False),                 # courtyard, before heal, after heal
+    ("gate_check", 2, "routed", CHECK_TIMED_OUT, False),  # before heal, after heal
+    ("board_fix", 1, "heal", FIX_TIMED_OUT, True),         # the healer killed mid-save
+], ids=["after-heal-drc", "after-heal-routed-check", "healer-timeout"])
+def test_a_heal_that_raises_is_rolled_back_and_the_ladder_escalates(
+        world, monkeypatch, name, nth, mode, exc, scribble):
+    boards = _boards_at_build(world, monkeypatch)
+    world.routes = [{"tracks": 20, "unconnected": 2}] * 3 + [{"tracks": 30, "unconnected": 0}]
+    world.drcs = [CLEAN_DRC, NEAR, CLEAN_DRC]
+    world.fixes["heal"] = [["bridged 0.4 mm gap on N1"]]
+    _fail_nth(world, monkeypatch, name, nth, exc, mode=mode, scribble=scribble)
+    rep = world.run()
+    assert rep["remediation"][2:] == [
+        {"gate": "G4", "round": 1, "applied": [
+            f"heal rolled back: the heal or the re-check of the healed board failed "
+            f"({type(exc).__name__}: {exc})"]},
+        {"gate": "G4", "round": 1,
+         "applied": ["2 unrouted -> re-placed at pack_scale 1.5 and re-routed"]}]
+    board, preheal = boards[1]
+    assert board == preheal                              # restored before the rebuild
+    assert b"(routed)" in board and b"(fixed heal)" not in board and b"(half" not in board
+    assert [a[3] for a in world.args_of("build")] == [1.0, 1.5] and rep["PASS"] is True
+
+
+def test_a_routed_board_that_cannot_be_judged_before_the_heal_is_left_untouched(
+        world, monkeypatch):
+    ctx = _routed_context(world)
+    world.pcb.write_text("routed\n", encoding="utf-8")
+    _fail_nth(world, monkeypatch, "drc", 1, DRC_FAILED)
+    with pytest.raises(RuntimeError, match="bad board"):  # nothing was changed: stay loud
+        rp_route.heal_near_miss(ctx, 1)
+    assert world.pcb.read_text(encoding="utf-8") == "routed\n"
+    assert "board_fix" not in world.names() and ctx.remediation == []
+
+
+def _decisions(world: World) -> list[dict]:
+    path = Path(str(world.netlist).removesuffix(".json") + ".decisions.jsonl")
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_a_heal_rollback_is_its_own_decision_not_an_applied_action(world):
+    world.routes = [{"tracks": 20, "unconnected": 2}] * 3 + [{"tracks": 30, "unconnected": 0}]
+    world.drcs = [CLEAN_DRC, NEAR, {**CLEAN_DRC, "errors": 1, "types": {"clearance": 1}},
+                  CLEAN_DRC]
+    world.fixes["heal"] = [["bridged 0.4 mm gap on N1"]]
+    rep = world.run()
+    assert rep["remediation"][2]["applied"] == [
+        "heal rolled back: the heal added DRC error(s) (0 -> 1: clearance x1)"]
+    g4 = [e for e in _decisions(world) if e["stage"] == "G4"]
+    assert not any("rolled back" in e["decision"] for e in g4 if "corrective" in e["question"])
+    kept = [e for e in g4 if "micro-gap heal" in e["question"]]
+    assert [(e["question"], e["decision"], e["alternatives"]) for e in kept] == [(
+        "G4 near miss (attempt 1): keep the micro-gap heal?",
+        "no (the heal added DRC error(s) (0 -> 1: clearance x1)): the routed board was "
+        "restored byte for byte and the scale loop escalates",
+        ["keep the healed board"])]
+    assert rp_route.HEAL_RULE in kept[0]["rationale"]
 
 
 def test_the_heal_docstring_no_longer_claims_a_rebuild_cannot_help():
@@ -387,6 +527,36 @@ def test_board_fix_returns_open_findings_with_their_prefix(tmp_path, monkeypatch
         "bridged", "OPEN: VIN: x"]
 
 
+def test_board_fix_reports_a_fixer_that_printed_no_result(tmp_path, monkeypatch):
+    _capture_children(monkeypatch)
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: subprocess.CompletedProcess(
+        args, 3221225477, "Loading board\n", "Segmentation fault in ZONE_FILLER"))
+    assert rp_kicad.board_fix(str(tmp_path / "b.kicad_pcb"), "n.json", "all") == [
+        "OPEN: swig_board_fixes.py produced no result (all, exit 3221225477): "
+        "Loading board\nSegmentation fault in ZONE_FILLER"]
+
+
+def test_board_fix_that_times_out_raises(tmp_path, monkeypatch):
+    _capture_children(monkeypatch)
+
+    def slow(args: list[str], **kw: Any) -> subprocess.CompletedProcess:
+        raise subprocess.TimeoutExpired(args, kw["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", slow)
+    with pytest.raises(subprocess.TimeoutExpired):       # loud (the verified heal rolls back)
+        rp_kicad.board_fix(str(tmp_path / "b.kicad_pcb"), "n.json", "heal")
+    assert "timeout" in " ".join((rp_kicad.board_fix.__doc__ or "").split()).lower()
+
+
+def test_board_fix_without_kicad_python_is_an_open_finding(tmp_path, monkeypatch):
+    calls = _capture_children(monkeypatch)
+    monkeypatch.setattr(k, "_kicad_python", lambda: None)
+    assert rp_kicad.board_fix(str(tmp_path / "b.kicad_pcb"), "n.json", "ep_vias") == [
+        "OPEN: board fixes unavailable (ep_vias): KiCad's Python or swig_board_fixes.py "
+        "not found"]
+    assert calls == []
+
+
 def test_emc_stitch_appends_the_feature_argv(monkeypatch):
     calls = _capture_children(monkeypatch, stdout='{"ok": true}\n')
     assert rp_kicad.emc_stitch("b.kicad_pcb", {"max_freq_hz": 1e9}, ["--stackup", "a.json"]) == {
@@ -475,3 +645,50 @@ def test_a_failed_emc_stitch_leaves_the_judged_board(world, monkeypatch):
     assert "(half stitched)" not in world.pcb.read_text(encoding="utf-8")
     assert "EMC stitching FAILED: zone refill failed" in _gate(rep, "G4")["warnings"]
     assert world.names().count("drc") == 2 and rep["PASS"] is True
+
+
+def test_an_emc_stitch_that_raises_leaves_the_judged_board(world, monkeypatch):
+    _emc_world(world)
+    killed = subprocess.TimeoutExpired(["python.exe", "emc_stitch.py"], 600)
+
+    def stitch(pcb: str, emc: dict, extra: list[str] | None = None) -> dict:
+        with open(pcb, "a", encoding="utf-8") as f:
+            f.write("(half stitched)\n")
+        raise killed
+
+    monkeypatch.setattr(rp_kicad, "emc_stitch", stitch)
+    rep = world.run()
+    assert "(half stitched)" not in world.pcb.read_text(encoding="utf-8")
+    reason = f"TimeoutExpired: {killed}"
+    assert rep["emc"] == {"ok": False, "reason": reason}
+    assert f"EMC stitching FAILED: {reason}" in _gate(rep, "G4")["warnings"]
+    assert world.names().count("drc") == 2 and rep["PASS"] is True
+
+
+@pytest.mark.parametrize("name, nth, mode, exc, drcs", [
+    ("drc", 3, None, DRC_FAILED, [CLEAN_DRC]),          # courtyard, G4, stitched
+    # the stitched board's DRC is measured (4 errors), then its routed check fails
+    ("gate_check", 2, "routed", CHECK_TIMED_OUT,         # G4, stitched
+     [CLEAN_DRC, CLEAN_DRC, {**CLEAN_DRC, "errors": 4}, CLEAN_DRC]),
+], ids=["stitched-drc", "stitched-routed-check"])
+def test_a_stitched_board_that_cannot_be_judged_is_rolled_back(
+        world, monkeypatch, name, nth, mode, exc, drcs):
+    _emc_world(world)
+    before: list[bytes] = []
+    inner = world.fake_emc
+
+    def emc(pcb: str, emc: dict, extra: list[str] | None = None) -> dict:
+        before.append(Path(pcb).read_bytes())
+        return inner(pcb, emc, extra)
+
+    monkeypatch.setattr(rp_kicad, "emc_stitch", emc)
+    world.drcs = drcs
+    _fail_nth(world, monkeypatch, name, nth, exc, mode=mode)
+    rep = world.run()
+    assert world.pcb.read_bytes() == before[0]           # the stitched board was undone
+    g4 = _gate(rep, "G4")
+    assert g4["passed"] is True and rep["PASS"] is True
+    assert [w for w in g4["warnings"] if w.startswith("EMC stitching")] == [
+        f"EMC stitching rolled back: the stitched board could not be judged "
+        f"({type(exc).__name__}: {exc}); the pre-stitch board was restored byte for byte"]
+    assert rep["emc"]["rolled_back"] is True and rep["drc"] == CLEAN_DRC

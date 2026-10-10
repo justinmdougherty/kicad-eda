@@ -13,8 +13,9 @@ the placement, and so the route):
      (fewest unrouted, then the lowest seed, the canonical order 0 included);
   2. the micro-gap heal, accepted only when the healed board is better: DRC
      unconnected 0, no more DRC errors than before, no new routed-check issue
-     and no 'OPEN:' finding; otherwise the routed board is restored byte for
-     byte and the scale loop escalates.
+     and no 'OPEN:' finding; otherwise (also when the healer or the re-check
+     of the healed board fails) the routed board is restored byte for byte,
+     the rollback is a G4 decision of its own and the scale loop escalates.
 Both apply only to Freerouting: a route_provider is called once per attempt.
 
 Files beside the board (git-ignored):
@@ -22,6 +23,8 @@ Files beside the board (git-ignored):
   <pcb>.alt<s>    the board routed with dsn_seed s (0 = the canonical order)
   <pcb>.preheal   the routed board the heal started from (restored on a rollback)
   <pcb>.attempt   the last ROUTED board of the scale loop (rp_context.ATTEMPT_SUFFIX)
+Every attempt first deletes the .placed / .preheal / .alt<s> copies of the
+previous attempt (or run), so each one on disk belongs to the current placement.
 
 ctx.route_rep = {attempt, pack_scale, tracks, unconnected[, dsn_sha256, dsn_seed]
 [, alternates: [{seed, unconnected, tracks, dsn_sha256[, error]}, ...]][, error]};
@@ -49,6 +52,10 @@ PREHEAL_SUFFIX = ".preheal"
 ALT_SUFFIX = ".alt"
 DSN_STAMP = ("dsn_sha256", "dsn_seed")    # what board_autoroute stamps on its result
 HEAL_ROLLED_BACK = "heal rolled back: "
+NOTHING_APPLIED = "the healer applied nothing"   # a no-op heal: restored, not logged
+HEAL_RULE = ("a micro-gap heal is kept only when the healed board has DRC unconnected 0, "
+             "no more DRC errors than before, no new routed-check issue and no finding "
+             "left open; otherwise the routed board is restored and pack_scale escalates")
 
 
 def route_attempt(ctx: rp_context.RunContext, attempt: int, scale: float) -> bool:
@@ -59,6 +66,7 @@ def route_attempt(ctx: rp_context.RunContext, attempt: int, scale: float) -> boo
     k.autoroute_board: same call, same result, no alternates and no heal."""
     ctx.report["renders_placement"] = rp_kicad.render(ctx.pcb, "place")
     provider = rp_hooks.first("route_provider", ctx)
+    clear_recovery_copies(ctx.pcb)
     if provider is None:
         copy_board(ctx.pcb, ctx.pcb + PLACED_SUFFIX)
     router: Callable[..., dict] = provider or k.autoroute_board
@@ -150,27 +158,51 @@ def heal_near_miss(ctx: rp_context.RunContext, attempt: int) -> bool:
     router/SES artifacts. With the canonical DSN Freerouting is deterministic
     per placement (re-routing the same placement repeats the route); a rebuild
     at a new pack_scale changes the placement, so it is the fallback when the
-    heal is not accepted. Accepted only when it made the board better (DRC
-    unconnected 0, DRC errors <= before, routed-check issues a subset of
-    before, no 'OPEN:' finding); otherwise <pcb>.preheal is restored byte for
-    byte, 'heal rolled back: <reason>' is logged and False lets the scale loop
-    escalate. True when healed."""
+    heal is not accepted. Accepted only when it made the board better
+    (HEAL_RULE); otherwise -- also when the healer or the re-check of the
+    healed board fails (rp_kicad.CHILD_ERRORS) -- <pcb>.preheal is restored
+    byte for byte, 'heal rolled back: <reason>' is logged and False lets the
+    scale loop escalate. True when healed. A routed board that cannot be
+    judged BEFORE the heal raises: nothing was changed yet."""
     pcb = ctx.pcb
     before = routed_findings(ctx)          # its DRC writes the report the healer reads
     copy_board(pcb, pcb + PREHEAL_SUFFIX)
-    healed = rp_kicad.board_fix(pcb, ctx.netlist, "heal")
-    reason = heal_refusal(healed)
-    if reason is None:
-        reason = heal_regression(before, routed_findings(ctx))
+    healed, reason = try_heal(ctx, before)
     if reason is not None:
         copy_board(pcb + PREHEAL_SUFFIX, pcb)
-        if healed:
-            ctx.log_remediation("G4", attempt, [HEAL_ROLLED_BACK + reason])
+        if reason != NOTHING_APPLIED:
+            log_rollback(ctx, attempt, reason)
         return False
     ctx.log_remediation("G4", attempt, healed)
     ctx.route_rep = {**ctx.route_rep, "unconnected": 0}
     snapshot_routed(pcb)
     return True
+
+
+def try_heal(ctx: rp_context.RunContext, before: dict) -> tuple[list, str | None]:
+    """Run the healer and judge its board: (what it applied, why the heal is
+    not kept or None). A healer or re-check that raises is a reason too (the
+    caller restores the routed board); the healed board is measured only when
+    the healer's own answer is a heal."""
+    try:
+        healed = rp_kicad.board_fix(ctx.pcb, ctx.netlist, "heal")
+        reason = heal_refusal(healed)
+        if reason is None:
+            reason = heal_regression(before, routed_findings(ctx))
+    except rp_kicad.CHILD_ERRORS as e:
+        return [], (f"the heal or the re-check of the healed board failed "
+                    f"({type(e).__name__}: {e})")
+    return healed, reason
+
+
+def log_rollback(ctx: rp_context.RunContext, attempt: int, reason: str) -> None:
+    """The rollback in the remediation log, and as a G4 decision of its own
+    (not an applied corrective action: the heal was undone)."""
+    ctx.log_remediation("G4", attempt, [HEAL_ROLLED_BACK + reason], record=False)
+    ctx.decide("G4", f"G4 near miss (attempt {attempt}): keep the micro-gap heal?",
+               f"no ({reason}): the routed board was restored byte for byte and the "
+               f"scale loop escalates", HEAL_RULE, source="run_pipeline G4 verified heal",
+               alternatives=("keep the healed board",))
 
 
 def routed_findings(ctx: rp_context.RunContext) -> dict:
@@ -182,11 +214,12 @@ def routed_findings(ctx: rp_context.RunContext) -> dict:
 
 def heal_refusal(healed: list) -> str | None:
     """Why the healer's own answer is not a heal: an 'OPEN:' finding (a break
-    left open, e.g. no clear path at the class width) or nothing applied."""
+    left open, e.g. no clear path at the class width, or a healer that could
+    not run or printed no result) or nothing applied."""
     open_items = [str(h) for h in healed if str(h).lstrip().startswith(rp_context.OPEN_PREFIX)]
     if open_items:
-        return f"the healer left {len(open_items)} break(s) open ({'; '.join(open_items)})"
-    return None if healed else "the healer applied nothing"
+        return f"the healer left {len(open_items)} finding(s) open ({'; '.join(open_items)})"
+    return None if healed else NOTHING_APPLIED
 
 
 def heal_regression(before: dict, after: dict) -> str | None:
@@ -210,6 +243,27 @@ def copy_board(src: str, dst: str) -> None:
     """Byte-exact copy of a board file (a failure is loud: a restore point the
     loop relies on must exist)."""
     shutil.copyfile(src, dst)
+
+
+def recovery_copies(pcb: str) -> list[Path]:
+    """The near-miss copies beside the board that exist: <pcb>.placed,
+    <pcb>.preheal and every <pcb>.alt<seed> (any seed, also one no longer in
+    ALT_DSN_SEEDS)."""
+    board = Path(pcb)
+    alt = board.name + ALT_SUFFIX
+    named = [Path(pcb + PLACED_SUFFIX), Path(pcb + PREHEAL_SUFFIX)]
+    alts = ([p for p in board.parent.iterdir()
+             if p.name.startswith(alt) and p.name[len(alt):].isdigit()]
+            if board.parent.is_dir() else [])
+    return [p for p in named if p.is_file()] + sorted(alts)
+
+
+def clear_recovery_copies(pcb: str) -> None:
+    """Delete the previous attempt's (or run's) near-miss copies before this
+    attempt routes, so every copy on disk belongs to this placement (a
+    failure is loud: a stale copy would be taken for this attempt's)."""
+    for path in recovery_copies(pcb):
+        path.unlink(missing_ok=True)
 
 
 def snapshot_routed(pcb: str) -> None:

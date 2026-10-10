@@ -24,6 +24,12 @@ GATE_TIMEOUT_S = 300          # swig_gate_checks / swig_board_fixes
 RENDER_TIMEOUT_S = 300
 EMC_TIMEOUT_S = 600
 ERROR_LINE = re.compile(r"(^|\s)Error:", re.M)   # kicad-cli (wx may prefix a timestamp)
+OPEN = "OPEN: "               # an unfixed board_fix finding (starts with rp_context.OPEN_PREFIX)
+OUTPUT_TAIL = 300             # chars of a child's output kept when it printed no result
+# what a wrapper here raises when its KiCad child fails (drc: RuntimeError; any
+# child: subprocess.TimeoutExpired past its timeout, OSError when it cannot start).
+# A transaction (the verified heal, the EMC stitch) restores its snapshot on these.
+CHILD_ERRORS: tuple[type[Exception], ...] = (RuntimeError, OSError, subprocess.SubprocessError)
 
 
 def board_cli(pcb: str) -> str:
@@ -73,17 +79,25 @@ def board_fix(pcb: str, netlist: str, mode: str) -> list:
     """Apply post-route board-level corrective actions (micro-gap heal,
     IPC-2221 parallel vias, EP via farms) under KiCad's Python, from the DRC
     report rp_kicad.drc wrote. Returns the applied log plus every unfixed
-    finding as an 'OPEN: ...' entry."""
+    finding as an 'OPEN: ...' entry. A fixer that is unavailable (no KiCad
+    Python or script), or that exits without printing its result (a crash),
+    is itself an 'OPEN:' entry naming why (the exit code and its output
+    tail), never an empty 'nothing to fix'. A fixer still running after
+    GATE_TIMEOUT_S raises subprocess.TimeoutExpired, and one that cannot be
+    started raises OSError (CHILD_ERRORS: loud; the verified heal restores
+    its snapshot on them)."""
     kpy = k._kicad_python()
     script = SERVER / "tools" / "swig_board_fixes.py"
     if not kpy or not script.is_file():
-        return []
+        return [f"{OPEN}board fixes unavailable ({mode}): KiCad's Python or {script.name} "
+                "not found"]
     r = tc.run([kpy, str(script), pcb, netlist, str(drc_guard.report_path(pcb)), mode],
                timeout=GATE_TIMEOUT_S)
     d = tc.last_json(r.stdout or "")
     if d is None:
-        return []
-    return list(d.get("applied", [])) + [f"OPEN: {o}" for o in d.get("open", [])]
+        tail = ((r.stdout or "") + (r.stderr or "")).strip()[-OUTPUT_TAIL:]
+        return [f"{OPEN}{script.name} produced no result ({mode}, exit {r.returncode}): {tail}"]
+    return list(d.get("applied", [])) + [f"{OPEN}{o}" for o in d.get("open", [])]
 
 
 def render(pcb: str, tag: str, quality: str = "basic") -> list:

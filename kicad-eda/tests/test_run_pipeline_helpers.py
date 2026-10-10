@@ -486,6 +486,7 @@ def test_drc_runs_the_board_cli_and_records_it(tmp_path, monkeypatch):
     monkeypatch.setattr(tc, "kicad_cli", lambda: "N:/10.99/kicad-cli.exe")
     monkeypatch.setattr(rp_kicad.subprocess, "run", fake_run)
     monkeypatch.chdir(tmp_path)
+    (tmp_path / "b.kicad_pcb").write_text("(kicad_pcb)\n", encoding="utf-8")   # drc_guard checks it
     res = rp_kicad.drc("b.kicad_pcb")
     assert calls[0][:3] == ["S:/9.0/kicad-cli.exe", "pcb", "drc"]
     assert res == {"errors": 1, "unconnected": 1, "types": {"clearance": 1},

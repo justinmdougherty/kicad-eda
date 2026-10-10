@@ -118,6 +118,31 @@ def test_build_all_reports_each_failure_and_keeps_going(project: Path):
     assert reasons["no-colon"] == "'no-colon' is not of the form Library:Symbol"
 
 
+def test_the_pins_dirs_are_sch_builds_own(project: Path):
+    """One definition: the dirs written are the ones sch_build searches (D1)."""
+    import sch_build
+    assert bps.CENTRAL_PINS_DIR is sch_build.CENTRAL_PINS_DIR
+    assert bps.PROJECT_PINS_DIR == sch_build.PROJECT_PINS_DIR
+    assert sch_build.default_sidecar_dirs(str(project / "netlist.json")) == [
+        str(project / bps.PROJECT_PINS_DIR), str(bps.CENTRAL_PINS_DIR)]
+
+
+def test_progress_goes_to_stderr_so_stdout_is_only_the_summary(
+        project: Path, capsys: pytest.CaptureFixture):
+    """In-process (e.g. inside a stdio MCP server) nothing reaches stdout;
+    the CLI's stdout is the JSON summary line alone."""
+    netlist = str(project / "netlist.json")
+    summary = bps.run_netlist(netlist, str(FIXTURE_SYMBOLS), lib_ids=[LIB_ID, "Missing:Chip"])
+    out, err = capsys.readouterr()
+    assert out == "" and summary["pins"] == {LIB_ID: 79}
+    assert [ln.split()[:2] for ln in err.splitlines()] == [[LIB_ID, "ok"],
+                                                            ["Missing:Chip", "FAILED"]]
+    assert bps.main(["--netlist", netlist]) == 0
+    out, err = capsys.readouterr()
+    assert len(out.strip().splitlines()) == 1 and _last_json(out)["ok"] is True
+    assert err.split()[:2] == [LIB_ID, "ok"]
+
+
 def test_build_all_reports_an_unwritable_out_dir(project: Path):
     blocker = project / "a_file"
     blocker.write_text("x", encoding="utf-8")
@@ -271,6 +296,7 @@ def test_cli_script_netlist_mode_end_to_end(project: Path):
                        stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8",
                        errors="replace", timeout=CHILD_TIMEOUT_S)
     assert r.returncode == 0, r.stdout + r.stderr
+    assert len(r.stdout.strip().splitlines()) == 1 and LIB_ID in r.stderr   # progress: stderr
     summary = _last_json(r.stdout)
     path = project / "pins" / f"{NICK}_LG290P.pins.json"
     assert summary["written"] == [str(path)] and summary["pins"] == {LIB_ID: 79}

@@ -20,36 +20,62 @@ stock footprints directory (dir mode, as before). Every spawned build reports
 Relative netlist / board paths (the harness passes them as given) work the
 same; a board directory that does not exist is refused before anything else.
 
+Board outline (ROADMAP D2, F3-19): build resolves the netlist ``board``
+block with outline_resolve.resolve_board (relative to the netlist directory;
+a DXF is read here, in the venv) before anything is written or spawned, and
+refuses ``{"ok": False, "reason": "board outline: ..."}`` when it cannot. A
+non-legacy board gets the version-1 sidecar ``<pcb stem>.outline.json``
+beside the board and ``KICAD_EDA_OUTLINE=<its absolute path>`` in the
+builder's environment (swig_build_board then uses the sidecar's board block).
+A legacy board (no block, or a plain w x h rectangle) keeps today's argv
+exactly, gets no sidecar (a stale one is removed) and never inherits a stray
+KICAD_EDA_OUTLINE. board_w / board_h (0 = from the netlist) go to the
+builder unchanged; one > 0 that differs from the board block / outline bbox
+by more than SIZE_TOL_MM is reported as ignored. Every spawned build reports
+``outline`` = the builder's own record + {source, fingerprint, sidecar}.
+
 toolchain and kicad_ipc are imported AS MODULES and their functions looked up
 at call time, so tests that monkeypatch tc.run / ipc.write_guard reach this
-code. server/tools is put on sys.path lazily (apply_netclasses, project_libs),
-never at import time.
+code. server/tools is put on sys.path lazily (apply_netclasses, project_libs,
+outline_resolve), never at import time.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import ModuleType
+from typing import TYPE_CHECKING
 
 import kicad_ipc as ipc
 import project_libs
 import toolchain as tc
 
+if TYPE_CHECKING:                  # server/tools: imported lazily by outline_module()
+    from outline_resolve import ResolvedBoard
+
 BUILD_TIMEOUT_S = 600              # the SWIG build child (D0: every KiCad child has one)
 MAP_PREFIX = "kicad-eda-libmap-"   # the temp library map handed to the builder as argv[3]
 FOOTPRINTS, SYMBOLS = "footprints", "symbols"   # library_map() keys = the D1 block keys
+SIZE_TOL_MM = 0.01                 # board_w / board_h vs the outline bbox
+SIZE_IGNORED = "board_w/board_h ignored: the board outline defines the board"
+OutlinePlan = tuple["ResolvedBoard", list[str]]   # (the resolved board block, result warnings)
 
 
-def build(netlist: str, board_w: float, board_h: float,
+def build(netlist: str, board_w: float = 0, board_h: float = 0,
           out_pcb: str = "", footprints_dir: str = "",
           placement: str = "", pack_scale: float = 1.0) -> dict:
     """build_board_from_netlist's body: SWIG build of the placed board, then
     the net classes (see the tool's docstring in board_pipeline_tools and
-    the module doc for the project libraries)."""
+    the module doc for the project libraries and the board outline)."""
+    bad = size_refusal(board_w, board_h)
+    if bad:
+        return bad
     kpy = tc.kicad_python()
     if not kpy:
         return {"ok": False, "reason": "KiCad bundled Python (with pcbnew) not found"}
@@ -67,24 +93,131 @@ def build(netlist: str, board_w: float, board_h: float,
     if isinstance(loaded, dict):
         return loaded
     libs, design = loaded
+    board = resolve_outline(design, netlist, board_w, board_h)
+    if isinstance(board, dict):
+        return board
     guard = ipc.write_guard(out)
     if guard:
         return guard
     held = release_board_session(out)
     if held.get("ok") is False:
         return held
+    argv = [str(script), netlist, out, fps, str(board_w), str(board_h),
+            *([placement] if placement else [])]
+    return {**build_released(kpy, argv, libs, design, board, pack_scale), **held}
+
+
+def build_released(kpy: str, argv: list[str], libs: project_libs.ProjectLibs, design: dict,
+                   board: OutlinePlan, pack_scale: float) -> dict:
+    """build's writes once no editor or session holds the board (argv[1:3] =
+    netlist, out): the library tables, the outline sidecar, the SWIG child,
+    then the net classes. A refusal on the way spawns nothing."""
+    netlist, out = argv[1], argv[2]
     declared = declared_libraries(libs)
     tables = materialize_libraries(libs, design, out, bool(declared))
     if isinstance(tables, dict):
-        return {**tables, **held}
-    argv = [str(script), netlist, out, fps, str(board_w), str(board_h),
-            *([placement] if placement else [])]
-    res = run_with_libraries(kpy, argv, libs, FOOTPRINTS in declared, pack_scale)
+        return tables
+    resolved, notes = board
+    placed = place_sidecar(resolved, out)
+    if isinstance(placed, dict):
+        return placed
+    sidecar, stale = placed
+    res = run_with_libraries(kpy, argv, libs, FOOTPRINTS in declared,
+                             builder_env(pack_scale, sidecar))
     res = {**res, "pcb": out, "libraries": project_libs.sources(libs, design),
-           "library_tables": tables}
+           "library_tables": tables, "outline": outline_record(res, resolved, sidecar)}
+    res = with_warnings(res, [*notes, *stale])
     if res["ok"]:
         res = {**res, **apply_netclasses(netlist, out, res.get("zones", []))}
-    return {**res, **held}
+    return res
+
+
+# --- the board outline (ROADMAP D2) ---------------------------------------------------------
+def outline_module() -> ModuleType:
+    """server/tools/outline_resolve, imported on first use (module doc)."""
+    if str(tc.TOOLS_DIR) not in sys.path:
+        sys.path.insert(0, str(tc.TOOLS_DIR))
+    import outline_resolve as orz
+    return orz
+
+
+def size_refusal(board_w: object, board_h: object) -> dict | None:
+    """The refusal for a board_w / board_h that is not a finite number (the
+    builder would crash on it or silently drop it), else None."""
+    for name, value in (("board_w", board_w), ("board_h", board_h)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value):
+            return {"ok": False, "reason": f"{name} must be a finite number of mm (0 = from "
+                                           f"the netlist), got {value!r} (nothing was built)"}
+    return None
+
+
+def resolve_outline(design: dict, netlist: str, board_w: float,
+                    board_h: float) -> OutlinePlan | dict:
+    """(the resolved board block, its result warnings: the DXF reader's and
+    the ignored board_w / board_h), or the refusal {ok: False, reason:
+    "board outline: ..."} when outline_resolve cannot resolve the block."""
+    orz = outline_module()
+    try:
+        resolved = orz.resolve_board(design, Path(netlist).absolute().parent)
+    except orz.ResolveError as e:
+        return {"ok": False, "reason": f"board outline: {e}"}
+    notes = [f"board outline: {w}" for w in resolved.warnings]
+    if resolved.outline is None:                # source "none": nothing defines the board
+        return resolved, notes
+    w, h = orz.outline_bbox_dims(resolved)
+    off = any(given > 0 and abs(given - have) > SIZE_TOL_MM
+              for given, have in ((board_w, w), (board_h, h)))
+    if off:
+        notes.append(f"{SIZE_IGNORED} ({w:g} x {h:g} mm; {board_w:g} x {board_h:g} mm "
+                     "was given)")
+    return resolved, notes
+
+
+def place_sidecar(resolved: ResolvedBoard, out_pcb: str) -> tuple[str | None, list[str]] | dict:
+    """(the absolute sidecar path, warnings) for the builder: a non-legacy
+    board's sidecar written beside ``out_pcb``; None for a legacy board,
+    whose stale sidecar from an earlier outline build is removed (a warning
+    when that fails). A sidecar that cannot be written is a refusal."""
+    orz = outline_module()
+    path = os.path.abspath(orz.sidecar_path(out_pcb))
+    if resolved.is_legacy:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as e:
+            return None, [f"could not remove the stale outline sidecar {path} (not used by "
+                          f"this build): {e}"]
+        return None, []
+    try:
+        orz.write_sidecar(resolved, path)
+    except OSError as e:
+        return {"ok": False, "reason": f"cannot write the outline sidecar {path} (nothing "
+                                       f"was built): {e}"}
+    return path, []
+
+
+def builder_env(pack_scale: float, sidecar: str | None) -> dict[str, str]:
+    """The builder's environment: os.environ with PACK_SCALE, and
+    KICAD_EDA_OUTLINE = the sidecar exactly when there is one (an inherited
+    value is never passed on)."""
+    var = outline_module().ENV_VAR
+    base = {k: v for k, v in os.environ.items() if k.upper() != var}
+    return {**base, "PACK_SCALE": str(pack_scale), **({var: sidecar} if sidecar else {})}
+
+
+def outline_record(res: dict, resolved: ResolvedBoard, sidecar: str | None) -> dict:
+    """The result's ``outline``: the builder's record (bbox, paper, datum,
+    ...) when it reported one, plus {source, fingerprint, sidecar}."""
+    built = res.get("outline")
+    return {**(built if isinstance(built, dict) else {}), "source": resolved.source,
+            "fingerprint": resolved.fingerprint, "sidecar": sidecar}
+
+
+def with_warnings(res: dict, notes: list[str]) -> dict:
+    """``res`` with ``notes`` appended to its warnings (the builder's first)."""
+    if not notes:
+        return res
+    return {**res, "warnings": [*res.get("warnings", []), *notes]}
 
 
 def load_libraries(netlist: str,
@@ -132,23 +265,24 @@ def materialize_libraries(libs: project_libs.ProjectLibs, design: dict, out_pcb:
 
 
 def run_with_libraries(kpy: str, argv: list[str], libs: project_libs.ProjectLibs,
-                       use_map: bool, pack_scale: float) -> dict:
+                       use_map: bool, env: dict[str, str]) -> dict:
     """run_builder on ``argv`` (script, netlist, out, stock footprints dir,
-    ...). ``use_map``: argv[3] becomes the library map (project_libs.write_map)
-    in a temp *.json, deleted in finally; a map that cannot be written is a
-    refusal (nothing spawned), one that cannot be deleted a result warning."""
+    ...) with ``env`` (builder_env). ``use_map``: argv[3] becomes the library
+    map (project_libs.write_map) in a temp *.json, deleted in finally; a map
+    that cannot be written is a refusal (nothing spawned), one that cannot be
+    deleted a result warning."""
     if not use_map:
-        return run_builder(kpy, argv, pack_scale)
+        return run_builder(kpy, argv, env)
     try:
         lib_map = write_temp_map(libs)
     except OSError as e:
         return {"ok": False, "reason": f"cannot write the library map for the build "
                                        f"(nothing was built): {e}"}
     try:
-        res = run_builder(kpy, [*argv[:3], lib_map, *argv[4:]], pack_scale)
+        res = run_builder(kpy, [*argv[:3], lib_map, *argv[4:]], env)
     finally:
         leftover = remove_temp_map(lib_map)
-    return res if leftover is None else {**res, "warnings": [*res.get("warnings", []), leftover]}
+    return res if leftover is None else with_warnings(res, [leftover])
 
 
 def write_temp_map(libs: project_libs.ProjectLibs) -> str:
@@ -173,11 +307,11 @@ def remove_temp_map(path: str) -> str | None:
     return None
 
 
-def run_builder(kpy: str, argv: list[str], pack_scale: float) -> dict:
+def run_builder(kpy: str, argv: list[str], env: dict[str, str]) -> dict:
     """swig_build_board (``argv`` = the script and its arguments) under
-    KiCad's Python: its result JSON with ok = rc 0 and the script's ok, plus
-    the stderr tail; a child that cannot start or times out is a refusal."""
-    env = {**os.environ, "PACK_SCALE": str(pack_scale)}
+    KiCad's Python with ``env``: its result JSON with ok = rc 0 and the
+    script's ok, plus the stderr tail; a child that cannot start or times
+    out is a refusal."""
     try:
         r = tc.run([kpy, *argv], env=env, timeout=BUILD_TIMEOUT_S, encoding="utf-8",
                    errors="replace")

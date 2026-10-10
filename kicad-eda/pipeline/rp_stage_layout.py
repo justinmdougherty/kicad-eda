@@ -1,6 +1,7 @@
 """Harness stage G4 (layout / board review): judge the routed board, run the
 board-fix corrective-action loop, then the opt-in EMC stitching post-pass,
-which is a transaction: a stitch that makes G4 fail is undone byte for byte.
+which is a transaction: a stitch that makes G4 fail, or whose board cannot be
+judged, is undone byte for byte.
 Feature hooks (rp_hooks): g4_inputs and g4_verdict at every judgement (the
 first, the EMC re-judge and the re-judge of a rolled-back board), emc_args."""
 from __future__ import annotations
@@ -30,13 +31,19 @@ def judge_g4(ctx: rp_context.RunContext, refresh_unconnected: bool = False,
              notes: tuple[str, ...] = ()) -> None:
     """DRC + routed-width check + G4 verdict (with `notes` as warnings) on the
     current board."""
+    measure_g4(ctx, refresh_unconnected)
+    ctx.g4 = g4_verdict(ctx, notes)
+
+
+def measure_g4(ctx: rp_context.RunContext, refresh_unconnected: bool = False) -> None:
+    """The KiCad measurements G4 judges: DRC, then the routed-width check
+    (raises rp_kicad.CHILD_ERRORS when a child fails; no feature hook runs)."""
     ctx.drc_rep = rp_kicad.drc(ctx.pcb)
     ctx.report["drc"] = ctx.drc_rep
     if refresh_unconnected:
         ctx.route_rep = {**ctx.route_rep, "unconnected": ctx.drc_rep["unconnected"]}
         ctx.report["autoroute"] = ctx.route_rep
     ctx.routed_check = rp_kicad.gate_check("routed", ctx.pcb, ctx.netlist)
-    ctx.g4 = g4_verdict(ctx, notes)
 
 
 def g4_verdict(ctx: rp_context.RunContext, notes: tuple[str, ...] = ()) -> dict:
@@ -65,11 +72,16 @@ def stage_g4_fixes(ctx: rp_context.RunContext) -> None:
 
 def emc_stitch(ctx: rp_context.RunContext, emc: dict) -> dict:
     """rp_kicad.emc_stitch plus the features' extra argv (emc_args); with
-    none the call is exactly the plain two-argument one."""
+    none the call is exactly the plain two-argument one. A stitch child that
+    fails (rp_kicad.CHILD_ERRORS: a timeout, a child that cannot start) is a
+    failed stitch {ok: False, reason}, like one that reports a failure."""
     extra = rp_hooks.concat("emc_args", ctx)
-    if extra:
-        return rp_kicad.emc_stitch(ctx.pcb, emc, extra)
-    return rp_kicad.emc_stitch(ctx.pcb, emc)
+    try:
+        if extra:
+            return rp_kicad.emc_stitch(ctx.pcb, emc, extra)
+        return rp_kicad.emc_stitch(ctx.pcb, emc)
+    except rp_kicad.CHILD_ERRORS as e:
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
 
 
 def stage_emc(ctx: rp_context.RunContext) -> None:
@@ -77,8 +89,9 @@ def stage_emc(ctx: rp_context.RunContext) -> None:
     perimeter GND via fence + interior stitching grid (Ott/Montrose, lambda/20
     pitch from max_freq_hz), then DRC + the routed gate again — the pass is
     clearance-aware but the gate trusts measurements, not intentions. A
-    transaction: the board is snapshotted first; a stitch that makes G4 fail
-    is undone byte for byte (the passing board is re-judged, with a warning),
+    transaction: the board is snapshotted first; a stitch that makes G4 fail,
+    or whose board cannot be judged (a DRC / routed-check child fails), is
+    undone byte for byte (the passing board is re-judged, with a warning),
     and a failed stitch leaves the judged board as it was. Never on a cached
     board."""
     emc = ctx.design.get("emc") or {}
@@ -93,23 +106,30 @@ def stage_emc(ctx: rp_context.RunContext) -> None:
         restore_board(board, snapshot)
         ctx.g4 = g4_verdict(ctx, (f"EMC stitching FAILED: {er.get('reason')}", *teardrops))
         return
-    judge_g4(ctx, notes=(f"EMC stitching: {er.get('vias_added')} GND vias "
-                         f"(fence {er.get('fence')}, interior {er.get('interior')}, "
-                         f"pitch {er.get('pitch_mm')} mm)", *teardrops))
+    try:
+        measure_g4(ctx)
+    except rp_kicad.CHILD_ERRORS as e:
+        rollback_emc(ctx, board, snapshot, f"the stitched board could not be judged "
+                                           f"({type(e).__name__}: {e})", teardrops)
+        return
+    ctx.g4 = g4_verdict(ctx, (f"EMC stitching: {er.get('vias_added')} GND vias "
+                              f"(fence {er.get('fence')}, interior {er.get('interior')}, "
+                              f"pitch {er.get('pitch_mm')} mm)", *teardrops))
     if not ctx.g4["passed"]:
-        rollback_emc(ctx, board, snapshot, teardrops)
+        broke = "; ".join(ctx.g4["blockers"])
+        rollback_emc(ctx, board, snapshot, f"the stitched board failed G4 ({broke})", teardrops)
 
 
-def rollback_emc(ctx: rp_context.RunContext, board: Path, snapshot: bytes,
+def rollback_emc(ctx: rp_context.RunContext, board: Path, snapshot: bytes, why: str,
                  notes: tuple[str, ...]) -> None:
-    """The stitched board failed G4: put the pre-stitch board back byte for
-    byte and re-judge it (a fresh DRC report on disk), with a warning naming
-    what the stitch broke."""
-    broke = "; ".join(ctx.g4["blockers"])
+    """The stitched board failed G4 or could not be judged (`why`): put the
+    pre-stitch board back byte for byte and re-judge it (a fresh DRC report
+    on disk; a failure now raises: the board is already restored), with a
+    warning naming what went wrong."""
     restore_board(board, snapshot)
     ctx.report["emc"] = {**ctx.report["emc"], "rolled_back": True}
-    judge_g4(ctx, notes=(f"{EMC_ROLLED_BACK}the stitched board failed G4 ({broke}); the "
-                         f"pre-stitch board was restored byte for byte", *notes))
+    judge_g4(ctx, notes=(f"{EMC_ROLLED_BACK}{why}; the pre-stitch board was restored "
+                         f"byte for byte", *notes))
 
 
 def restore_board(board: Path, snapshot: bytes) -> None:

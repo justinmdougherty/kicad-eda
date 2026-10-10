@@ -18,7 +18,9 @@ libtable.LibraryResolver (netlist ``libraries`` block, project
 (LibraryResolver.library_map()).
 
 A missing library or symbol is reported per lib_id and does not abort the
-batch; the exit code is 1 if anything failed. The LAST stdout line is JSON:
+batch; the exit code is 1 if anything failed. Progress lines (one per lib_id)
+go to stderr, so in-process callers (a stdio MCP server) never write to stdout;
+the CLI's stdout is the JSON summary alone (the usage text on a usage error):
   {"ok": bool, "written": [path, ...], "failed": [{"symbol", "reason"}, ...],
    "pins": {lib_id: pin count}, "out_dir": path}
 (--netlist adds "netlist", and "note" when the netlist has no project parts).
@@ -50,14 +52,23 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import libtable  # noqa: E402
-from sch_build import LIBRARY_MAP_SUFFIX, read_library_map  # noqa: E402
+# the sidecar dirs are sch_build's (it searches <netlist dir>/pins, then server/pins)
+from sch_build import (  # noqa: E402
+    CENTRAL_PINS_DIR,
+    LIBRARY_MAP_SUFFIX,
+    PROJECT_PINS_DIR,
+    read_library_map,
+)
 from symlib import SymbolLibError, SymbolSource, flatten, pin_numbers, pin_offsets  # noqa: E402
 
 USAGE_EXIT = 2
-CENTRAL_PINS_DIR = Path(_HERE).parent / "pins"     # the plugin's sidecars for stock parts
-PROJECT_PINS_DIR = "pins"                           # <netlist dir>/pins: project parts (D1)
 PROJECT_SOURCES = (libtable.NETLIST, libtable.PROJECT)
 _OPTIONS = ("--netlist", "--symbols", "--out")
+
+
+def _progress(line: str) -> None:
+    """One progress line on stderr (stdout carries only the JSON summary)."""
+    print(line, file=sys.stderr)
 
 
 def _flat(cache: dict, source: SymbolSource, lib_id: str) -> list:
@@ -97,7 +108,7 @@ def _build_one(cache: dict, source: SymbolSource, out_dir: Path,
         path.write_text(json.dumps(pins, indent=2), encoding="utf-8")
     except OSError as e:
         return None, 0, f"cannot write {path}: {e}"
-    print(f"  {lib_id:42s} ok                 keys={len(pins)} pins={count}")
+    _progress(f"  {lib_id:42s} ok                 keys={len(pins)} pins={count}")
     return str(path), count, ""
 
 
@@ -110,7 +121,7 @@ def build_all(source: SymbolSource, out_dir: Path, lib_ids: Iterable[str]) -> di
         path, count, reason = _build_one(cache, source, out_dir, lib_id)
         if path is None:
             failed.append({"symbol": lib_id, "reason": reason})
-            print(f"  {lib_id:42s} FAILED  {reason}")
+            _progress(f"  {lib_id:42s} FAILED  {reason}")
             continue
         written.append(path)
         pins[lib_id] = count
@@ -216,7 +227,9 @@ def _parse_options(args: list[str]) -> tuple[dict[str, str], list[str]] | None:
 
 
 def _symbol_source(symbols: str) -> SymbolSource:
-    """The legacy <symbols> argument: a library map .json, else a directory."""
+    """The legacy <symbols> argument: a library map .json, else a directory.
+    (sch_build.symbol_source turns a directory into a netlist's resolver; the
+    legacy form has no netlist, so a directory stays a plain directory.)"""
     if symbols.lower().endswith(LIBRARY_MAP_SUFFIX) and not Path(symbols).is_dir():
         return read_library_map(symbols)
     return Path(symbols)

@@ -11,7 +11,8 @@ Outline source (ROADMAP_DECISIONS D2), resolved before placement:
   (d) otherwise LEGACY, unchanged: rectangle Edge.Cuts and planes, no aux origin, A4.
 Frames: board = mm, Y down, origin = outline bbox top-left; sheet = board +
 (ox, oy). Each feature is ONE function taking (board, design, ...) and
-returning (result, warnings); D7-14 replaces add_planes and add_antenna_keepout.
+returning (result, warnings). Planes follow the stackup roles and the antenna
+keep-out is a rule_areas area on every enabled copper layer (D7-14, ADR D7.5).
 """
 from __future__ import annotations
 
@@ -357,8 +358,8 @@ def add_mounting_holes(board: Any, design: Mapping, load: Callable[[str], Any], 
 
 # --- copper planes -----------------------------------------------------------------------------
 def default_planes(design: Mapping) -> dict[str, str]:
-    """netlist "planes" ({"<layer>": "<net>"}), else In1.Cu GND + In2.Cu the
-    first power rail (a regulated "+..." rail before a raw "V" input)."""
+    """The pre-D7 heuristic (lga_strategy pins its parity; the builder now pours
+    the stackup's plane / mixed layers, stackup_roles.default_plane_nets)."""
     planes = design.get("planes")
     if planes is not None:
         return dict(planes)
@@ -368,36 +369,35 @@ def default_planes(design: Mapping) -> dict[str, str]:
     return {"In1.Cu": "GND", **({"In2.Cu": power} if power else {})}
 
 
-def add_planes(board: Any, design: Mapping, netmap: Mapping, frame: Frame,
-               inset_mm: float) -> tuple[list[str], list[str]]:
-    """Copper pours, one per plane layer (4-layer Sig/GND/PWR/Sig by default;
-    signal layers stay un-poured). Legacy: the inset w x h rectangle
-    (board_shapes.add_plane); outline boards follow Edge.Cuts inset by
-    `inset_mm`, cutouts included (add_plane_outline). A layer that is unknown
-    or not enabled is skipped (a warning for a disabled one). Returns
-    (["<layer>:<net>", ...], warnings)."""
+def add_planes(board: Any, planes: Mapping[str, str], netmap: Mapping, frame: Frame,
+               inset_mm: float, clearances: Mapping[str, float] | None = None
+               ) -> tuple[list[str], list[str]]:
+    """One pour per stackup plane / mixed layer ({layer: net}): the inset w x h
+    rectangle (legacy) or Edge.Cuts inset by `inset_mm`; ``clearances`` {layer: mm}
+    = local clearance (<= the smallest CPWG ground gap). A net the design lacks is
+    skipped (warning). Returns (["<layer>:<net>"] via GetLayerName(GetLayer()), warnings)."""
     import board_outline as bo
     import board_shapes
     zones, warnings = [], []
-    for layer_name, net_name in default_planes(design).items():
+    for layer_name, net_name in planes.items():
+        lid, clear = board.GetLayerID(layer_name), (clearances or {}).get(layer_name)
+        if lid < 0 or not board.IsLayerEnabled(lid):
+            raise BuildError(f"plane {layer_name}:{net_name}: {layer_name} is not enabled on "
+                             f"this {board.GetCopperLayerCount()}-layer board")
         if net_name not in netmap:
+            warnings.append(f"plane {layer_name}:{net_name} skipped: the design has no net "
+                            f"{net_name} (no pad would tie the pour to it)")
             continue
-        lid = board.GetLayerID(layer_name)
-        if lid < 0:
-            continue
-        if not board.IsLayerEnabled(lid):
-            warnings.append(f"plane {layer_name}:{net_name} skipped: {layer_name} is not "
-                            f"enabled on this {board.GetCopperLayerCount()}-layer board")
-            continue
-        if frame.outline is None:
-            board_shapes.add_plane(board, lid, netmap[net_name], frame.w, frame.h,
-                                   frame.ox, frame.oy)
-        else:
-            try:
-                board_shapes.add_plane_outline(board, lid, netmap[net_name], inset_mm)
-            except bo.OutlineBuildError as e:
-                raise BuildError(f"plane {layer_name}:{net_name}: {e}") from e
-        zones.append(f"{layer_name}:{net_name}")
+        try:
+            zone = (board_shapes.add_plane(board, lid, netmap[net_name], frame.w, frame.h,
+                                           frame.ox, frame.oy) if frame.outline is None else
+                    board_shapes.add_plane_outline(board, lid, netmap[net_name], inset_mm,
+                                                   local_clearance_mm=clear))
+        except bo.OutlineBuildError as e:
+            raise BuildError(f"plane {layer_name}:{net_name}: {e}") from e
+        if clear is not None and frame.outline is None:
+            zone.SetLocalClearance(bo.nm(clear))
+        zones.append(f"{board.GetLayerName(zone.GetLayer())}:{net_name}")
     return zones, warnings
 
 
@@ -428,12 +428,11 @@ def leaves_bbox(rect: tuple, w: float, h: float) -> bool:
 
 def add_antenna_keepout(board: Any, design: Mapping, frame: Frame) -> tuple[dict | None,
                                                                              list[str]]:
-    """netlist "antenna_keepout" ({"edge", "depth"} or {"rect"}, "name"): a
-    rule area with no pour / vias / pads on every copper layer so the planes
-    clip around the radiator (board_shapes.add_keepout). Returns (the spec
-    when added, warnings: a rect that leaves the outline bbox). D7-14
-    replaces this function with an all-copper rule area."""
-    import board_shapes
+    """netlist "antenna_keepout" ({"edge", "depth"} or {"rect"}, "name"): a rule
+    area on EVERY enabled copper layer, legacy meaning (no pour, vias or pads;
+    tracks allowed: ADR D7.7), so the planes clip around the radiator
+    (rule_areas.add_rule_area). Returns (the spec, warnings: leaves the bbox)."""
+    import rule_areas
     ako = design.get("antenna_keepout")
     if not ako:
         return None, []
@@ -441,6 +440,10 @@ def add_antenna_keepout(board: Any, design: Mapping, frame: Frame) -> tuple[dict
     warnings = ["antenna keep-out [{:g}, {:g}, {:g}, {:g}] leaves the board outline bbox "
                 "0..{:g} x 0..{:g} mm (board frame)".format(*local, frame.w, frame.h)
                 ] if leaves_bbox(local, frame.w, frame.h) else []
-    kx, ky, kw, kh = keepout_rect(ako, frame.w, frame.h, frame.ox, frame.oy)
-    zone = board_shapes.add_keepout(board, kx, ky, kw, kh, ako.get("name", "ANTENNA"))
-    return (ako if zone else None), warnings
+    try:
+        rule_areas.add_rule_area(board, rule_areas.rect_points(*keepout_rect(
+            ako, frame.w, frame.h, frame.ox, frame.oy)), rule_areas.ALL,
+            name=ako.get("name", "ANTENNA"), no_pour=True, no_vias=True, no_pads=True)
+    except ValueError as e:
+        raise BuildError(f"antenna_keepout {dict(ako)!r}: {e}") from e
+    return dict(ako), warnings

@@ -1,7 +1,7 @@
 """Calibrate the class C fallback models of tline/fallback.py against the FD tier (D7-05c).
 
 Developer CLI, not run in CI: FD solves need numpy + scipy (fieldsolve2d), the fits numpy.
-    .venv/Scripts/python.exe server/tools/tline_calibrate.py            # FD runs + fit (~5 min)
+    .venv/Scripts/python.exe server/tools/tline_calibrate.py --jobs 3   # FD + fit (~20 min)
     .venv/Scripts/python.exe server/tools/tline_calibrate.py --refit    # refit committed FD data
     .venv/Scripts/python.exe server/tools/tline_calibrate.py --check    # compare, write nothing
 (--refit / --check reuse the FD values of --fd-source, default the --fixture path.)
@@ -13,24 +13,25 @@ Outputs, byte-stable on one platform (no timestamps or run times; the run time i
   FD values, closed form, fallback value and error); tests/test_tline_fallback.py checks every
   point against its est_error_pct and refits the data file from it (rerun --refit whenever a
   closed form changes).
-Grids (ADR D7.6 / D7.14; FD medium grid, mm, ohm):
-- masked edge-coupled microstrip, JLC mask (Er 3.8, c1 0.0305, c2 0.0152, c3 0.0305), 1 oz:
-  fit = h 0.0994 / 0.2104 / 0.508 (Dk 4.1 / 4.4 / 3.66) x S/W 0.5 / 1 / 2 near Zdiff 90 (the
-  width puts the bare closed form 7 % above the target, on the wide branch, gap >= 0.1 mm; S/W
-  0.5 cannot reach 90 ohm above that gap: the floor is used); held out = S/W 0.75 / 1.5 near 100,
-  S/W 3 near 90, the [R-imp] USB pair (W 0.259, S 0.15: FD 86.80), DMS90_7628_mask, other
-  copper, masks, Dk and the JLC06161H-2116 two-ply outer stack;
-- offset / dual stripline: fit = asymmetry 0.1-0.45 on b 0.6 Dk 4.4 0.5 oz and b 0.4 Dk 4.4
-  1 oz (singles over W, pairs over W x S); held out = b 0.8 Dk 3.66 1 oz and b 0.3 Dk 4.2 at
-  off-knot asymmetries, RO4350B / FR-4 contrast builds, SL50_off, DSL100_off and the
-  JLC06161H-2116 In2 dual stripline (singles and pairs);
-- measured identity causes: two-ply microstrip / centred stripline with Er contrast, CPW
-  without a back plane with finite grounds.
-Fits (numpy least squares): offset, per mode, e = Z_image / Z_FD - 1 on hat_k(a) x feature
-(linear, 0 at a = 0.5); masked, per mode, ln(Z_FD / Z_bare) on ln(r) x feature (linear).
-est_error_pct = the worst |error| over fit + held-out points (offset: per asymmetry interval,
-single z0 / pair z_diff), rounded up to the next 0.1 %; identity causes: the larger of the ADR
-placeholder and the measured worst rounded up.
+Calibration set (FD medium grid; mm, ohm):
+- the domain of each corrected cause is a declared box (OFFSET_BOX, MASK_BOX; plus the sampled
+  range of the masked derived coordinates); seeded random points drawn uniformly over it (log
+  scale for ratios) form a fit set and an independent held-out set (stdlib random: the same
+  geometries on every platform);
+- the task grid: masked edge-coupled microstrip, JLC mask, h 0.0994 / 0.2104 / 0.508 x S/W
+  0.5 / 1 / 2 near Zdiff 90 (fit; width with the bare closed form 7 % above the target, gap
+  >= 0.11 mm) and S/W 0.75 / 1.5 / 2.5 (held out); offset stripline at asymmetry 0.15-0.35
+  (fit); held-out named vectors: the [R-imp] USB pair (FD 86.80), DMS90_7628_mask, mask / copper
+  / Dk variants, SL50_off, DSL100_off and the JLC06161H-2116 In2 dual stripline;
+- measured identity causes: two-ply microstrips with Er contrast (named and random), centred
+  stripline with side contrast, CPW without a back plane with finite grounds.
+Fits (numpy least squares) on the fit set: offset, per mode, e = Z_image / Z_FD - 1 on
+hat_k(a) x feature over KNOTS (every knot free); masked, per mode, ln(Z_FD / Z_bare) on
+ln(r) x feature + feature. est_error_pct = EST_MARGIN x the worst |error| over the fit and
+held-out points inside the domain, rounded up to the next 0.1 % (offset: single z0, pair
+z_diff and z_even; masked: z_diff and z_even); identity causes: the larger of the ADR
+placeholder and that. One estimate per mode, not per asymmetry interval: thin intervals hold
+few points and their sample maxima understated independent FD probes (round-1 review).
 """
 from __future__ import annotations
 
@@ -38,9 +39,11 @@ import argparse
 import hashlib
 import json
 import math
+import random
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -56,28 +59,54 @@ ROOT = Path(__file__).resolve().parents[2]
 DATA_OUT = ROOT / "server" / "data" / "tline_fallback.json"
 FIXTURE_OUT = ROOT / "tests" / "fixtures" / "tline" / "fallback_calibration.json"
 FIXTURE_REL = "tests/fixtures/tline/fallback_calibration.json"
-FIXTURE_SCHEMA = "kicad-eda/tline-fallback-calibration@1"
+FIXTURE_SCHEMA = "kicad-eda/tline-fallback-calibration@2"
 GENERATED_BY = "server/tools/tline_calibrate.py"
 GRID = "medium"
 T_1OZ, T_HALF = 0.035, 0.0152
 JLC_MASK = MaskModel(er=3.8, over_trace=0.0152, over_substrate=0.0305, between=0.0305)
-KNOTS = (0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5)
-MASK_K = {"k_even": ("one", "ln_s_over_h"), "k_odd": ("one", "ln_w_over_h", "mask_gap_fill")}
+KNOTS = (0.1, 0.15, 0.2, 0.3, 0.4, 0.5)
+EST_MARGIN = 1.5             # est = margin x worst sampled error (a sample max is no bound):
+#                              independent probes reached 1.46 x the calibration worst
 PLACEHOLDER_PCT = {fb.MULTI_PLY: 3.0, fb.CPW_FINITE: 5.0, fb.NEAREST: 5.0}   # ADR D7.6 table
-MASK_TARGET_SCALE = 1.07     # bare closed form 7 % above the masked target (mask ~ -7 %)
-GAP_FLOOR_MM = 0.1           # masked grid: smallest pair gap
+# declared domains: sampled uniformly (log scale where the range spans > 2x), t/W and t/S cap
+# the copper (the mapped thickness models break down beyond: stripline pairs -4..-9 % at t/S 0.45)
+OFFSET_BOX = {"a": (0.1, 0.5), "w_over_b": (0.08, 0.7), "t_over_b": (0.012, 0.14),
+              "t_over_w": (0.0, 0.5), "er_near_over_far": (0.8, 1.25),
+              "side_contrast": (0.0, 0.1), "s_over_b": (0.1, 0.6), "t_over_s": (0.0, 0.35)}
+MASK_BOX = {"w_over_h": (0.5, 2.5), "s_over_w": (0.4, 3.0), "t_over_h": (0.03, 0.4),
+            "t_over_w": (0.0, 0.5), "t_over_s": (0.0, 0.35), "er": (3.0, 4.8),
+            "contrast": (0.0, 0.1), "mask_er": (3.2, 4.2), "mask_c1_over_h": (0.025, 0.4),
+            "mask_c2_over_c1": (0.3, 1.0), "mask_c3_over_c1": (0.8, 1.5)}
+ER_RANGE, PLANE_MM, H_MAX_MM = (3.0, 4.8), (0.15, 1.6), 0.6
+SEEDS = {"offset_fit": 1101, "offset_held": 2202, "masked_fit": 3303, "masked_held": 4404,
+         "multi": 5505}
+COUNTS = {"offset_fit": 600, "offset_held": 600, "masked_fit": 180, "masked_held": 160,
+          "multi": 24}
+MM_DIGITS, ER_DIGITS = 6, 4  # sampled dimensions rounded (compact, exactly reproducible records)
+_PAIR = ("one", "ln_w_over_b", "t_over_b", "ln_s_over_b", "t_over_s", "t_over_s*t_over_s",
+         "t_over_b*t_over_s", "ln_er_near_over_far", "t_over_s*ln_w_over_b",
+         "t_over_s*ln_s_over_b")
+OFFSET_FEATURES = {"single": ("one", "ln_w_over_b", "t_over_b", "ln_er_near_over_far"),
+                   "even": _PAIR, "odd": _PAIR}
+MASK_FEATURES = {
+    "k_even": ("one", "ln_mask_c1_over_h", "mask_gap_fill", "ln_s_over_w",
+               "ln_mask_c3_over_c1", "ln_mask_c2_over_h", "er", "mask_er"),
+    "d_even": ("t_over_s", "t_over_s*ln_s_over_w"),
+    "k_odd": ("one", "mask_gap_fill", "ln_mask_c2_over_h", "ln_s_over_h", "mask_c3_over_s",
+              "ln_mask_c3_over_c1", "ln_mask_c2_over_c1", "t_over_w", "er"),
+    "d_odd": ("t_over_s*ln_w_over_h", "t_over_s*t_over_s")}
+MASK_TARGET_SCALE = 1.07     # grid: bare closed form 7 % above the masked target (mask ~ -7 %)
+GAP_FLOOR_MM = 0.11          # grid: smallest pair gap (t/S 0.32 at 1 oz)
 WIDTH_START_MM, WIDTH_WALK = 3.0, 0.9
-FD_DIGITS = 10               # significant digits kept of each FD impedance
-COEF_DIGITS = 9
+FD_DIGITS, OUT_DIGITS, COEF_DIGITS = 10, 12, 9
 CHECK_TOL = 1e-8              # --check float tolerance (Windows vs Linux libm: 6.5e-12 rel)
 FORMS = {
-    fb.OFFSET: "Z_mode = Z_image_mode / (1 + e_mode), e_mode = sum_f c_f(a) x_f, x = 1, "
-               "ln(W/b), t/b (+ ln(S/b) for pairs), c_f piecewise-linear in the asymmetry a "
-               "over `knots` (0 at a = 0.5); est_error_pct per knot interval (single z0, pair "
-               "z_diff)",
-    fb.MASKED: "Z_even = Z_even_bare r^k_even, Z_odd = Z_odd_bare r^k_odd, r = Z_coated / Z_bare "
-               "of the single-ended Wan-Hoorfar microstrip of the same width, k = sum_f k_f x_f, "
-               "x = 1, ln(W/h), ln(S/h), (c3 + t)/S; est_error_pct refers to z_diff",
+    fb.OFFSET: "Z_mode = Z_image_mode / (1 + e_mode), e_mode = sum_f c_f(a) x_f, c_f "
+               "piecewise-linear in the asymmetry a over `knots` (every knot fitted); "
+               "est_error_pct: single z0, pair z_diff",
+    fb.MASKED: "Z_mode = Z_bare_mode r^k_mode e^d_mode, r = Z_coated / Z_bare of the "
+               "single-ended Wan-Hoorfar microstrip of the same width, k = sum k_f x_f, "
+               "d = sum d_f x_f; est_error_pct refers to z_diff",
     fb.MULTI_PLY: "identity: the closed forms' series (harmonic) mean Er of the plies",
     fb.CPW_FINITE: "identity: Ghione-Naldi CPW with infinite grounds",
     fb.NEAREST: "identity: the nearest closed form (outside published validity); est is the "
@@ -98,16 +127,23 @@ class Spec:
 
 # ---------------------------------------------------------------- geometry records
 def geometry_to_dict(geom: LineGeometry) -> dict[str, Any]:
-    """The fixture's record of a calibration geometry (plies as [thickness, er])."""
+    """The fixture's compact record of a calibration geometry (plies as [thickness, er];
+    None / default fields left out)."""
+    out: dict[str, Any] = {"kind": geom.kind, "pair": geom.pair, "width": geom.width,
+                           "t": geom.t, "below": [[p.thickness, p.er] for p in geom.below],
+                           "above": [[p.thickness, p.er] for p in geom.above]}
+    for key in ("pair_gap", "ground_gap", "ground_width"):
+        if getattr(geom, key) is not None:
+            out[key] = getattr(geom, key)
     m = geom.mask
-    return {"kind": geom.kind, "pair": geom.pair, "width": geom.width, "t": geom.t,
-            "below": [[p.thickness, p.er] for p in geom.below],
-            "above": [[p.thickness, p.er] for p in geom.above], "pair_gap": geom.pair_gap,
-            "ground_gap": geom.ground_gap, "ground_width": geom.ground_width,
-            "mask": None if m is None else {"er": m.er, "over_trace": m.over_trace,
-                                            "over_substrate": m.over_substrate,
-                                            "between": m.between},
-            "etch": geom.etch, "dielectric_copper": [list(x) for x in geom.dielectric_copper]}
+    if m is not None:
+        out["mask"] = {"er": m.er, "over_trace": m.over_trace,
+                       "over_substrate": m.over_substrate, "between": m.between}
+    if geom.etch:
+        out["etch"] = geom.etch
+    if geom.dielectric_copper:
+        out["dielectric_copper"] = [list(x) for x in geom.dielectric_copper]
+    return out
 
 
 def geometry_from_dict(d: Mapping[str, Any]) -> LineGeometry:
@@ -121,7 +157,94 @@ def geometry_from_dict(d: Mapping[str, Any]) -> LineGeometry:
                         dielectric_copper=tuple(tuple(x) for x in d.get("dielectric_copper", ())))
 
 
-# ---------------------------------------------------------------- grids
+# ---------------------------------------------------------------- random grids
+def _logu(rng: random.Random, lo: float, hi: float) -> float:
+    return math.exp(rng.uniform(math.log(lo), math.log(hi)))
+
+
+def _mm(value: float) -> float:
+    return round(value, MM_DIGITS)
+
+
+def _ply(thickness: float, er: float) -> Ply:
+    return Ply(_mm(thickness), round(er, ER_DIGITS))
+
+
+def _accept(geom: LineGeometry, cause: str, box: Mapping[str, tuple[float, float]]) -> bool:
+    """A sampled geometry the closed forms evaluate, of the cause, inside the declared box."""
+    try:
+        tline.evaluate(geom)
+    except ValueError:
+        return False
+    if fb.cause_of(geom) != cause:
+        return False
+    values = fb.domain_values(geom)
+    return all(box[k][0] <= v <= box[k][1] for k, v in values.items() if k in box)
+
+
+def _offset_draw(rng: random.Random, pair: bool) -> LineGeometry | None:
+    box = OFFSET_BOX
+    a, wb, tb = rng.uniform(*box["a"]), _logu(rng, *box["w_over_b"]), _logu(rng, *box["t_over_b"])
+    sb = _logu(rng, *box["s_over_b"])
+    q = 1.0 if rng.random() < 0.5 else _logu(rng, *box["er_near_over_far"])
+    er_near, split = rng.uniform(*ER_RANGE), rng.uniform(0.0, box["side_contrast"][1])
+    two_ply, frac, t = rng.random() < 1 / 3, rng.uniform(0.3, 0.7), rng.choice((T_HALF, T_1OZ))
+    b = t / tb
+    if not PLANE_MM[0] <= b <= PLANE_MM[1]:
+        t = T_1OZ if t == T_HALF else T_HALF
+        b = t / tb
+    if not PLANE_MM[0] <= b <= PLANE_MM[1]:
+        return None
+    h, er_far = b - t, er_near / q
+    far = ((_ply(frac * (1 - a) * h, er_far), _ply((1 - frac) * (1 - a) * h, er_far * (1 + split)))
+           if two_ply else (_ply((1 - a) * h, er_far),))
+    return LineGeometry(kind="stripline", pair="edge" if pair else "single", width=_mm(wb * b),
+                        t=t, below=far, above=(_ply(a * h, er_near),),
+                        pair_gap=_mm(sb * b) if pair else None)
+
+
+def _masked_draw(rng: random.Random) -> LineGeometry | None:
+    box = MASK_BOX
+    wh, sw, th = (_logu(rng, *box[k]) for k in ("w_over_h", "s_over_w", "t_over_h"))
+    er, ratio = rng.uniform(*box["er"]), _logu(rng, 1 / (1 + box["contrast"][1]),
+                                               1 + box["contrast"][1])
+    two_ply, frac, mer = rng.random() < 0.5, rng.uniform(0.3, 0.7), rng.uniform(*box["mask_er"])
+    c1h = _logu(rng, *box["mask_c1_over_h"])
+    c2c1, c3c1 = rng.uniform(*box["mask_c2_over_c1"]), rng.uniform(*box["mask_c3_over_c1"])
+    t = T_1OZ if T_1OZ / th <= H_MAX_MM else T_HALF
+    h = t / th
+    if h > H_MAX_MM:
+        return None
+    below = ((_ply(frac * h, er), _ply((1 - frac) * h, er * ratio)) if two_ply
+             else (_ply(h, er),))
+    mask = MaskModel(er=round(mer, ER_DIGITS), over_trace=_mm(c2c1 * c1h * h),
+                     over_substrate=_mm(c1h * h), between=_mm(c3c1 * c1h * h))
+    return LineGeometry(kind="microstrip", pair="edge", width=_mm(wh * h), t=t, below=below,
+                        above=(), pair_gap=_mm(sw * wh * h), mask=mask)
+
+
+def _multi_draw(rng: random.Random) -> LineGeometry | None:
+    er1, er2 = rng.uniform(2.9, 4.8), rng.uniform(2.9, 4.8)
+    h1, h2, w = _logu(rng, 0.05, 0.25), _logu(rng, 0.05, 0.25), _logu(rng, 0.1, 0.6)
+    if max(er1, er2) / min(er1, er2) - 1 <= 0.12:
+        return None
+    return LineGeometry(kind="microstrip", pair="single", width=_mm(w), t=T_1OZ,
+                        below=(_ply(h1, er1), _ply(h2, er2)), above=())
+
+
+def random_specs(key: str, cause: str, part: str, prefix: str,
+                 draw: Callable[[random.Random, int], LineGeometry | None],
+                 box: Mapping[str, tuple[float, float]]) -> list[Spec]:
+    """COUNTS[key] seeded uniform draws accepted by _accept (rejection keeps them uniform)."""
+    rng, out = random.Random(SEEDS[key]), []
+    while len(out) < COUNTS[key]:
+        geom = draw(rng, len(out))
+        if geom is not None and _accept(geom, cause, box):
+            out.append(Spec(f"{prefix}_rand_{key}_{len(out):03d}", cause, part, geom))
+    return out
+
+
+# ---------------------------------------------------------------- named grids
 def _cms(w: float, s: float, below: tuple[Ply, ...], t: float = T_1OZ,
          mask: MaskModel | None = JLC_MASK) -> LineGeometry:
     return LineGeometry(kind="microstrip", pair="edge", width=w, t=t, below=below, above=(),
@@ -151,12 +274,11 @@ def _masked_cell(name: str, part: str, ratio: float, target: float, below: tuple
 def masked_specs() -> list[Spec]:
     out = []
     for h, er in ((0.0994, 4.1), (0.2104, 4.4), (0.508, 3.66)):
-        below = (Ply(h, er),)
         for part, ratio, target in (("fit", 0.5, 90.0), ("fit", 1.0, 90.0), ("fit", 2.0, 90.0),
                                     ("held_out", 0.75, 100.0), ("held_out", 1.5, 100.0),
-                                    ("held_out", 3.0, 90.0)):
-            out.append(_masked_cell(f"MSK_{part}_h{h}_sw{ratio:g}_z{target:g}", part, ratio,
-                                    target, below))
+                                    ("held_out", 2.5, 90.0)):
+            out.append(_masked_cell(f"MSK_grid_{part}_h{h}_sw{ratio:g}_z{target:g}", part,
+                                    ratio, target, (Ply(h, er),)))
     b7628, held = (Ply(0.2104, 4.4),), "held_out"
     thick = MaskModel(er=3.8, over_trace=0.025, over_substrate=0.04, between=0.04)
     thin = MaskModel(er=3.5, over_trace=0.01, over_substrate=0.02, between=0.02)
@@ -177,27 +299,15 @@ def masked_specs() -> list[Spec]:
             _masked_cell("MSK_var_jlc6_outer_sw1.5", held, 1.5, 100.0, jlc6_outer)]
 
 
-def _osl(w: float, a: float, b0: float, er_near: float, t: float, s: float | None = None,
-         er_far: float | None = None) -> LineGeometry:
+def _osl(w: float, a: float, b0: float, er: float, t: float, s: float | None = None
+         ) -> LineGeometry:
     """Offset stripline: the near reference above at a (b0 - t), the far one below."""
     h = b0 - t
     return LineGeometry(kind="stripline", pair="single" if s is None else "edge", width=w, t=t,
-                        below=(Ply((1 - a) * h, er_far or er_near),), above=(Ply(a * h, er_near),),
-                        pair_gap=s)
+                        below=(Ply((1 - a) * h, er),), above=(Ply(a * h, er),), pair_gap=s)
 
 
-def _offset_build(tag: str, part: str, asym: Sequence[float], b0: float, er: float, t: float,
-                  widths: Sequence[float], pairs: Sequence[tuple[float, float]]) -> list[Spec]:
-    out = []
-    for a in asym:
-        out += [Spec(f"OSL_{tag}_a{a:g}_w{w:g}", fb.OFFSET, part, _osl(w, a, b0, er, t))
-                for w in widths]
-        out += [Spec(f"OSL_{tag}_pair_a{a:g}_w{w:g}_s{s:g}", fb.OFFSET, part,
-                     _osl(w, a, b0, er, t, s)) for w, s in pairs]
-    return out
-
-
-def _named_offset_specs() -> list[Spec]:
+def offset_specs() -> list[Spec]:
     def off(w: float, s: float | None = None) -> LineGeometry:      # D7.14 SL50_off / DSL100_off
         return LineGeometry(kind="stripline", pair="single" if s is None else "edge", width=w,
                             t=T_HALF, below=(Ply(0.55, 4.6),), above=(Ply(0.1088, 4.16),),
@@ -210,36 +320,19 @@ def _named_offset_specs() -> list[Spec]:
                             below=(adj, adj, dielectric_copper_ply(T_HALF, adj), Ply(0.3, 4.41)),
                             dielectric_copper=(("In3.Cu", 4.4),))
 
+    grid = [Spec(f"OSL_grid_a{a:g}_w{w:g}" + ("" if s is None else f"_s{s:g}"), fb.OFFSET, "fit",
+                 _osl(w, a, 0.6, 4.4, T_HALF, s))
+            for a in (0.15, 0.2, 0.25, 0.3, 0.35)
+            for w, s in ((0.1, None), (0.2, None), (0.3, None), (0.1, 0.15), (0.15, 0.2))]
     held = "held_out"
-    out = [Spec("SL50_off@W_FD", fb.OFFSET, held, off(0.13474641701088028), 50.0),
-           Spec("SL50_off@W_cf", fb.OFFSET, held, off(0.15364761993288997)),
-           Spec("DSL100_off@W_FD", fb.OFFSET, held, off(0.08943079170736003, 0.15), 100.0),
-           Spec("DSL100_off@W_cf", fb.OFFSET, held, off(0.1003147764503956, 0.15))]
-    out += [Spec(f"JLC6_2116_In2_dual@{w:g}", fb.OFFSET, held, in2(w)) for w in (0.1, 0.15, 0.25)]
-    out += [Spec(f"JLC6_2116_In2_dual_pair@{w:g}", fb.OFFSET, held, in2(w, 0.15))
-            for w in (0.1, 0.15)]
-    for a in (0.2, 0.3):
-        for w in (0.1, 0.2):
-            out += [Spec(f"OSL_ro_fr_a{a:g}_w{w:g}", fb.OFFSET, held,
-                         _osl(w, a, 0.6, 3.66, T_HALF, er_far=4.6)),
-                    Spec(f"OSL_fr_ro_a{a:g}_w{w:g}", fb.OFFSET, held,
-                         _osl(w, a, 0.6, 4.6, T_HALF, er_far=3.66)),
-                    Spec(f"OSL_ro_fr_pair_a{a:g}_w{w:g}", fb.OFFSET, held,
-                         _osl(w, a, 0.6, 3.66, T_HALF, 0.15, er_far=4.6))]
-    return out
-
-
-def offset_specs() -> list[Spec]:
-    fit_a, off_knot = KNOTS[:-1], (0.125, 0.175, 0.275, 0.325, 0.425)
-    return [*_offset_build("fitA", "fit", fit_a, 0.6, 4.4, T_HALF, (0.06, 0.1, 0.15, 0.2, 0.3, 0.4),
-                           [(w, s) for w in (0.08, 0.15) for s in (0.1, 0.15, 0.3)]),
-            *_offset_build("fitB", "fit", fit_a, 0.4, 4.4, T_1OZ, (0.06, 0.1, 0.15, 0.25),
-                           [(w, s) for w in (0.08, 0.15) for s in (0.1, 0.2)]),
-            *_offset_build("heldC", "held_out", off_knot, 0.8, 3.66, T_1OZ, (0.1, 0.3),
-                           [(0.1, 0.2), (0.3, 0.2)]),
-            *_offset_build("heldD", "held_out", off_knot, 0.3, 4.2, T_HALF, (0.12,),
-                           [(0.1, 0.12)]),
-            *_named_offset_specs()]
+    named = [Spec("SL50_off@W_FD", fb.OFFSET, held, off(0.13474641701088028), 50.0),
+             Spec("SL50_off@W_cf", fb.OFFSET, held, off(0.15364761993288997)),
+             Spec("DSL100_off@W_FD", fb.OFFSET, held, off(0.08943079170736003, 0.15), 100.0),
+             Spec("DSL100_off@W_cf", fb.OFFSET, held, off(0.1003147764503956, 0.15))]
+    named += [Spec(f"JLC6_2116_In2_dual@{w:g}", fb.OFFSET, held, in2(w)) for w in (0.1, 0.15, 0.25)]
+    named += [Spec(f"JLC6_2116_In2_dual_pair@{w:g}", fb.OFFSET, held, in2(w, 0.15))
+              for w in (0.1, 0.15)]
+    return [*grid, *named]
 
 
 def measured_specs() -> list[Spec]:
@@ -266,7 +359,19 @@ def measured_specs() -> list[Spec]:
 
 
 def all_specs() -> list[Spec]:
-    specs = [*masked_specs(), *offset_specs(), *measured_specs()]
+    o, m = fb.OFFSET, fb.MASKED
+    specs = [*masked_specs(),
+             *random_specs("masked_fit", m, "fit", "MSK", lambda r, i: _masked_draw(r), MASK_BOX),
+             *random_specs("masked_held", m, "held_out", "MSK", lambda r, i: _masked_draw(r),
+                           MASK_BOX),
+             *offset_specs(),
+             *random_specs("offset_fit", o, "fit", "OSL", lambda r, i: _offset_draw(r, i % 2 == 1),
+                           OFFSET_BOX),
+             *random_specs("offset_held", o, "held_out", "OSL",
+                           lambda r, i: _offset_draw(r, i % 2 == 1), OFFSET_BOX),
+             *measured_specs(),
+             *random_specs("multi", fb.MULTI_PLY, "measured", "MULTI", lambda r, i: _multi_draw(r),
+                           {})]
     for spec in specs:
         if fb.cause_of(spec.geom) != spec.cause:
             raise ValueError(f"{spec.name}: geometry has cause {fb.cause_of(spec.geom)!r}, "
@@ -277,26 +382,33 @@ def all_specs() -> list[Spec]:
 
 
 # ---------------------------------------------------------------- FD runs
-def _sig(value: float | None) -> float | None:
-    return None if value is None else float(f"{value:.{FD_DIGITS}g}")
+def _sig(value: float, digits: int = FD_DIGITS) -> float:
+    return float(f"{value:.{digits}g}")
 
 
-def run_fd(specs: Sequence[Spec], grid: str = GRID) -> dict[str, Any]:
-    """Solve every point with fieldsolve2d; the calibration record {fd, points}."""
+def _solve(job: tuple[LineGeometry, str]) -> tuple[dict[str, float], float]:
+    import fieldsolve2d as fd
+
+    res = fd.solve(job[0], grid=job[1])
+    keys = ("z0",) if res.z_diff is None else ("z_even", "z_odd")
+    return {k: _sig(getattr(res, k)) for k in keys}, res.seconds
+
+
+def run_fd(specs: Sequence[Spec], grid: str = GRID, jobs: int = 1) -> dict[str, Any]:
+    """Solve every point with fieldsolve2d (jobs worker processes); the record {fd, points}."""
     import fieldsolve2d as fd
 
     backend = fd.available()
     if backend == "none":
         raise SystemExit("tline_calibrate: no FD backend; pip install -r server/requirements.txt")
-    points, start = [], time.perf_counter()
-    for i, spec in enumerate(specs, 1):
-        res = fd.solve(spec.geom, grid=grid)
-        points.append({"name": spec.name, "cause": spec.cause, "set": spec.set, "ref": spec.ref,
-                       "geometry": geometry_to_dict(spec.geom),
-                       "fd": {k: _sig(getattr(res, k)) for k in ("z0", "z_even", "z_odd",
-                                                                  "z_diff")}})
-        print(f"[{i}/{len(specs)}] {spec.name}: {res.seconds:.1f} s", flush=True)
-    print(f"FD: {len(specs)} points in {time.perf_counter() - start:.1f} s ({backend}, {grid})")
+    start, work = time.perf_counter(), [(s.geom, grid) for s in specs]
+    with ProcessPoolExecutor(max(1, jobs)) as pool:
+        solved = list(pool.map(_solve, work, chunksize=4))
+    points = [{"name": s.name, "cause": s.cause, "set": s.set, "ref": s.ref,
+               "geometry": geometry_to_dict(s.geom), "fd": values}
+              for s, (values, _) in zip(specs, solved, strict=True)]
+    print(f"FD: {len(specs)} points, {sum(sec for _, sec in solved):.1f} s solver time, "
+          f"{time.perf_counter() - start:.1f} s wall ({backend}, {grid}, {jobs} jobs)")
     return {"fd": {"solver": "fieldsolve2d", "version": fd.FD_VERSION, "grid": grid},
             "points": points}
 
@@ -309,16 +421,13 @@ def fd_points_from_fixture(doc: Mapping[str, Any]) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- fits
 def _hat(a: float) -> list[float]:
-    """Piecewise-linear basis over KNOTS without the last knot (pinned to 0)."""
-    out = [0.0] * (len(KNOTS) - 1)
-    a = min(max(a, KNOTS[0]), KNOTS[-1])
+    """Piecewise-linear basis over KNOTS (one function per knot)."""
+    out, a = [0.0] * len(KNOTS), min(max(a, KNOTS[0]), KNOTS[-1])
     for i, (a0, a1) in enumerate(pairwise(KNOTS)):
         if a0 <= a <= a1:
             f = (a - a0) / (a1 - a0)
-            out[i] += 1.0 - f
-            if i + 1 < len(out):
-                out[i + 1] += f
-            return out
+            out[i], out[i + 1] = 1.0 - f, f
+            break
     return out
 
 
@@ -329,52 +438,51 @@ def _round(value: float) -> float:
 def _modes(point: Mapping[str, Any], closed: LineResult) -> dict[str, tuple[float, float]]:
     """(closed form, FD) impedance per mode of a point."""
     fd = point["fd"]
-    if fd["z_diff"] is None:
+    if "z0" in fd:
         return {"single": (closed.z0, fd["z0"])}
     return {"even": (closed.z_even, fd["z_even"]), "odd": (closed.z_odd, fd["z_odd"])}
 
 
-def fit_offset(points: Sequence[Mapping[str, Any]], geoms: Sequence[LineGeometry],
-               closed: Sequence[LineResult]) -> dict[str, dict[str, list[float]]]:
-    """Per mode: e = Z_image / Z_FD - 1 regressed on hat(a) x feature (numpy lstsq)."""
+def _lstsq(rows: Sequence[Sequence[float]], ys: Sequence[float]) -> list[float]:
     import numpy as np
 
+    return [_round(float(v)) for v in np.linalg.lstsq(np.array(rows), np.array(ys),
+                                                       rcond=None)[0]]
+
+
+def fit_offset(fit: Sequence[tuple[Mapping[str, Any], LineGeometry, LineResult]]
+               ) -> dict[str, dict[str, list[float]]]:
+    """Per mode: e = Z_image / Z_FD - 1 regressed on hat(a) x feature."""
     rows: dict[str, list] = {m: [] for m in fb.OFFSET_MODES}
     ys: dict[str, list] = {m: [] for m in fb.OFFSET_MODES}
-    for p, g, c in zip(points, geoms, closed, strict=True):
-        if p["cause"] != fb.OFFSET or p["set"] != "fit":
-            continue
-        a, x = fb.domain_values(g)["a"], fb.features(g)
+    for p, g, c in fit:
+        values = fb.domain_values(g)
         for mode, (z, z_fd) in _modes(p, c).items():
-            rows[mode].append([h * x[f] for f in fb.OFFSET_MODES[mode] for h in _hat(a)])
+            rows[mode].append([h * fb.feature_value(f, values) for f in OFFSET_FEATURES[mode]
+                               for h in _hat(values["a"])])
             ys[mode].append(z / z_fd - 1.0)
-    terms = {}
-    for mode, feats in fb.OFFSET_MODES.items():
-        coef = np.linalg.lstsq(np.array(rows[mode]), np.array(ys[mode]), rcond=None)[0]
-        n = len(KNOTS) - 1
-        terms[mode] = {f: [_round(float(v)) for v in coef[i * n:(i + 1) * n]] + [0.0]
-                       for i, f in enumerate(feats)}
+    n, terms = len(KNOTS), {}
+    for mode, feats in OFFSET_FEATURES.items():
+        coef = _lstsq(rows[mode], ys[mode])
+        terms[mode] = {f: coef[i * n:(i + 1) * n] for i, f in enumerate(feats)}
     return terms
 
 
-def fit_masked(points: Sequence[Mapping[str, Any]], geoms: Sequence[LineGeometry],
-               closed: Sequence[LineResult]) -> dict[str, dict[str, float]]:
-    """Per mode: ln(Z_FD / Z_bare) regressed on ln(r) x feature (numpy lstsq)."""
-    import numpy as np
-
-    data: dict[str, tuple[list, list]] = {k: ([], []) for k in MASK_K}
-    for p, g, c in zip(points, geoms, closed, strict=True):
-        if p["cause"] != fb.MASKED or p["set"] != "fit":
-            continue
-        x, lr = fb.features(g), math.log(fb.mask_ratio(g))
-        for key, z, z_fd in (("k_even", c.z_even, p["fd"]["z_even"]),
-                             ("k_odd", c.z_odd, p["fd"]["z_odd"])):
-            data[key][0].append([lr * x[f] for f in MASK_K[key]])
-            data[key][1].append(math.log(z_fd / z))
+def fit_masked(fit: Sequence[tuple[Mapping[str, Any], LineGeometry, LineResult]]
+               ) -> dict[str, dict[str, float]]:
+    """Per mode: ln(Z_FD / Z_bare) regressed on ln(r) x k-features + d-features."""
     out = {}
-    for key, (a_rows, y) in data.items():
-        coef = np.linalg.lstsq(np.array(a_rows), np.array(y), rcond=None)[0]
-        out[key] = {f: _round(float(v)) for f, v in zip(MASK_K[key], coef, strict=True)}
+    for mode in ("even", "odd"):
+        k_f, d_f = MASK_FEATURES[f"k_{mode}"], MASK_FEATURES[f"d_{mode}"]
+        rows, ys = [], []
+        for p, g, c in fit:
+            x, lr = fb.domain_values(g), math.log(fb.mask_ratio(g))
+            rows.append([lr * fb.feature_value(f, x) for f in k_f]
+                        + [fb.feature_value(f, x) for f in d_f])
+            ys.append(math.log(p["fd"][f"z_{mode}"] / getattr(c, f"z_{mode}")))
+        coef = _lstsq(rows, ys)
+        out[f"k_{mode}"] = dict(zip(k_f, coef[:len(k_f)], strict=True))
+        out[f"d_{mode}"] = dict(zip(d_f, coef[len(k_f):], strict=True))
     return out
 
 
@@ -384,39 +492,26 @@ def ceil_tenth(value: float) -> float:
     return math.floor(value * 10.0 + 1.0) / 10.0
 
 
+def _est(worst: float) -> float:
+    return ceil_tenth(EST_MARGIN * worst)
+
+
 def _zq(res: Any) -> float:
     return res.z0 if res.z_diff is None else res.z_diff
 
 
-def _errors(points: Sequence[Mapping[str, Any]], results: Sequence[LineResult]) -> list[dict]:
-    """Per point: error (%) of the est quantity (z0 / z_diff) and of z_even vs FD."""
+def _errors(points: Sequence[Mapping[str, Any]], results: Sequence[LineResult],
+            geoms: Sequence[LineGeometry], table: fb.FallbackTable) -> list[dict]:
+    """Per point: error (%) of the est quantity (z0 / z_diff) and of z_even vs FD, and whether
+    it lies inside its cause's calibrated domain."""
     out = []
-    for p, r in zip(points, results, strict=True):
+    for p, r, g in zip(points, results, geoms, strict=True):
         fd = p["fd"]
-        ref = fd["z0"] if fd["z_diff"] is None else fd["z_diff"]
-        even = None if fd["z_even"] is None else 100.0 * (r.z_even / fd["z_even"] - 1.0)
-        out.append({"z": 100.0 * (_zq(r) / ref - 1.0), "z_even": even})
+        ref = fd["z0"] if "z0" in fd else 2.0 * fd["z_odd"]
+        even = None if "z0" in fd else 100.0 * (r.z_even / fd["z_even"] - 1.0)
+        out.append({"z": 100.0 * (_zq(r) / ref - 1.0), "z_even": even,
+                    "inside": not fb.outside_notes(g, table=table)})
     return out
-
-
-def _interval_est(knots: Sequence[float], a_values: Sequence[float],
-                  errs: Sequence[float]) -> list[float]:
-    """Per knot interval [lo, hi]: the next 0.1 % above the worst |error| of its points."""
-    out = []
-    for lo, hi in pairwise(knots):
-        inside = [abs(e) for a, e in zip(a_values, errs, strict=True) if lo <= a <= hi]
-        if not inside:
-            raise ValueError(f"asymmetry interval [{lo}, {hi}] has no calibration point")
-        out.append(ceil_tenth(max(inside)))
-    return out
-
-
-def _hull(values: Sequence[Mapping[str, float]], fixed: Mapping[str, list] | None = None
-          ) -> dict[str, list[float]]:
-    names = sorted({k for v in values for k in v})
-    out = {k: [min(v[k] for v in values if k in v), max(v[k] for v in values if k in v)]
-           for k in names}
-    return {**out, **(fixed or {})}
 
 
 def _stats(errs: Sequence[float]) -> dict[str, float]:
@@ -436,46 +531,49 @@ def _part_stats(sel: Sequence[tuple[Mapping[str, Any], dict]], part: str,
     return out
 
 
+def _domain(box: Mapping[str, tuple[float, float]], coords: Sequence[str],
+            sampled: Sequence[Mapping[str, float]]) -> dict[str, list[float]]:
+    """The declared box, plus the sampled range of each derived coordinate."""
+    return {c: list(box[c]) if c in box else [min(v[c] for v in sampled),
+                                              max(v[c] for v in sampled)] for c in coords}
+
+
 # ---------------------------------------------------------------- documents
 def _offset_entry(sel: Sequence[tuple[Mapping[str, Any], dict, LineGeometry]],
                   terms: Mapping[str, Any]) -> dict[str, Any]:
-    a = [fb.domain_values(g)["a"] for _, _, g in sel]
-    single = [(ai, e["z"]) for ai, (p, e, _) in zip(a, sel, strict=True)
-              if p["fd"]["z_diff"] is None]
-    pair = [(ai, e["z"], e["z_even"]) for ai, (p, e, _) in zip(a, sel, strict=True)
-            if p["fd"]["z_diff"] is not None]
-    keys = {"single": lambda p, e: e["z"] if p["fd"]["z_diff"] is None else None,
-            "pair_z_diff": lambda p, e: e["z"] if p["fd"]["z_diff"] is not None else None,
+    inner = [(p, e) for p, e, _ in sel if e["inside"]]
+    single = [abs(e["z"]) for p, e in inner if "z0" in p["fd"]]
+    pair = [(abs(e["z"]), abs(e["z_even"])) for p, e in inner if "z0" not in p["fd"]]
+    keys = {"single": lambda p, e: e["z"] if "z0" in p["fd"] else None,
+            "pair_z_diff": lambda p, e: None if "z0" in p["fd"] else e["z"],
             "pair_z_even": lambda p, e: e["z_even"]}
-    pairs = [(p, e) for p, e, _ in sel]
-    return {"form": FORMS[fb.OFFSET], "knots": list(KNOTS), "terms": terms,
-            "est_error_pct": {"single": _interval_est(KNOTS, [x[0] for x in single],
-                                                      [x[1] for x in single]),
-                              "pair": _interval_est(KNOTS, [x[0] for x in pair],
-                                                    [x[1] for x in pair])},
-            "z_even_error_pct": _interval_est(KNOTS, [x[0] for x in pair], [x[2] for x in pair]),
-            "domain": _hull([fb.domain_values(g) for _, _, g in sel], {"a": [min(a), KNOTS[-1]]}),
-            "fit": _part_stats(pairs, "fit", keys),
-            "held_out": _part_stats(pairs, "held_out", keys)}
+    return {"form": FORMS[fb.OFFSET], "features": {m: list(f) for m, f in OFFSET_FEATURES.items()},
+            "knots": list(KNOTS), "terms": terms, "est_margin": EST_MARGIN,
+            "est_error_pct": {"single": _est(max(single)), "pair": _est(max(x[0] for x in pair))},
+            "z_even_error_pct": _est(max(x[1] for x in pair)),
+            "domain": _domain(OFFSET_BOX, fb.OFFSET_COORDS, []),
+            "fit": _part_stats(inner, "fit", keys),
+            "held_out": _part_stats(inner, "held_out", keys)}
 
 
 def _masked_entry(sel: Sequence[tuple[Mapping[str, Any], dict, LineGeometry]],
-                  k: Mapping[str, Any]) -> dict[str, Any]:
+                  coef: Mapping[str, Any]) -> dict[str, Any]:
     keys = {"z_diff": lambda p, e: e["z"], "z_even": lambda p, e: e["z_even"]}
-    pairs = [(p, e) for p, e, _ in sel]
-    return {"form": FORMS[fb.MASKED], **k,
-            "est_error_pct": ceil_tenth(max(abs(e["z"]) for _, e, _ in sel)),
-            "z_even_error_pct": ceil_tenth(max(abs(e["z_even"]) for _, e, _ in sel)),
-            "domain": _hull([fb.domain_values(g) for _, _, g in sel]),
-            "fit": _part_stats(pairs, "fit", keys),
-            "held_out": _part_stats(pairs, "held_out", keys)}
+    inner = [(p, e) for p, e, _ in sel if e["inside"]]
+    sampled = [fb.domain_values(g) for p, _, g in sel if "_rand_" in p["name"]]
+    return {"form": FORMS[fb.MASKED], **coef, "est_margin": EST_MARGIN,
+            "est_error_pct": _est(max(abs(e["z"]) for _, e in inner)),
+            "z_even_error_pct": _est(max(abs(e["z_even"]) for _, e in inner)),
+            "domain": _domain(MASK_BOX, fb.MASK_COORDS, sampled),
+            "fit": _part_stats(inner, "fit", keys),
+            "held_out": _part_stats(inner, "held_out", keys)}
 
 
 def _identity_entry(cause: str, errs: Sequence[float]) -> dict[str, Any]:
     worst = max((abs(e) for e in errs), default=None)
-    est = PLACEHOLDER_PCT[cause] if worst is None else max(PLACEHOLDER_PCT[cause],
-                                                           ceil_tenth(worst))
-    return {"form": FORMS[cause], "est_error_pct": est, "placeholder_pct": PLACEHOLDER_PCT[cause],
+    est = PLACEHOLDER_PCT[cause] if worst is None else max(PLACEHOLDER_PCT[cause], _est(worst))
+    return {"form": FORMS[cause], "est_error_pct": est, "est_margin": EST_MARGIN,
+            "placeholder_pct": PLACEHOLDER_PCT[cause],
             "measured": None if worst is None else {"points": len(errs), "worst_pct": worst}}
 
 
@@ -487,7 +585,7 @@ def calibration_digest(points: Sequence[Mapping[str, Any]]) -> str:
 
 
 def _data_doc(cal: Mapping[str, Any], geoms: Sequence[LineGeometry], errs: Sequence[dict],
-              terms: Mapping[str, Any], k: Mapping[str, Any]) -> dict[str, Any]:
+              terms: Mapping[str, Any], coef: Mapping[str, Any]) -> dict[str, Any]:
     points = cal["points"]
 
     def sel(cause: str) -> list:
@@ -495,7 +593,7 @@ def _data_doc(cal: Mapping[str, Any], geoms: Sequence[LineGeometry], errs: Seque
                 if p["cause"] == cause]
 
     causes = {fb.OFFSET: _offset_entry(sel(fb.OFFSET), terms),
-              fb.MASKED: _masked_entry(sel(fb.MASKED), k)}
+              fb.MASKED: _masked_entry(sel(fb.MASKED), coef)}
     for cause in fb.IDENTITY_CAUSES:
         causes[cause] = _identity_entry(cause, [e["z"] for _, e, _ in sel(cause)])
     return {"schema": fb.SCHEMA, "generated_by": GENERATED_BY,
@@ -508,11 +606,22 @@ def _data_doc(cal: Mapping[str, Any], geoms: Sequence[LineGeometry], errs: Seque
 
 def _fixture_point(p: Mapping[str, Any], c: LineResult, f: LineResult,
                    e: Mapping[str, Any]) -> dict[str, Any]:
-    return {**p, "closed_form": {"class": c.accuracy_class, "model": c.model, "z": _zq(c),
-                                 "est_error_pct": c.est_error_pct},
-            "fallback": {"model": f.model, "z": _zq(f), "z_even": f.z_even,
-                         "est_error_pct": f.est_error_pct},
-            "error_pct": e["z"], "z_even_error_pct": e["z_even"]}
+    out = {**p, "closed_form": {"class": c.accuracy_class, "z": _sig(_zq(c), OUT_DIGITS),
+                                "est_error_pct": _sig(c.est_error_pct, OUT_DIGITS)},
+           "fallback": {"z": _sig(_zq(f), OUT_DIGITS), "est_error_pct": f.est_error_pct},
+           "error_pct": _sig(e["z"], OUT_DIGITS)}
+    if e["z_even"] is not None:
+        out["fallback"]["z_even"] = _sig(f.z_even, OUT_DIGITS)
+        out["z_even_error_pct"] = _sig(e["z_even"], OUT_DIGITS)
+    return out
+
+
+def _draft_table(cal: Mapping[str, Any], geoms: Sequence[LineGeometry], terms: Mapping[str, Any],
+                 coef: Mapping[str, Any]) -> fb.FallbackTable:
+    """The fitted forms with placeholder estimates (to measure the errors the estimates are
+    derived from); every point counts as inside here."""
+    errs = [{"z": 1.0, "z_even": 1.0, "inside": True}] * len(geoms)
+    return fb.parse_table(_data_doc(cal, geoms, errs, terms, coef), source="draft")
 
 
 def build_outputs(cal: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -520,12 +629,17 @@ def build_outputs(cal: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any
     points = cal["points"]
     geoms = [geometry_from_dict(p["geometry"]) for p in points]
     closed = [tline.evaluate(g) for g in geoms]
-    terms, k = fit_offset(points, geoms, closed), fit_masked(points, geoms, closed)
-    draft = _data_doc(cal, geoms, [{"z": 1.0, "z_even": 1.0}] * len(points), terms, k)
-    draft_table = fb.parse_table(draft, source="draft")
-    errs = _errors(points, [fb.correct(g, c, table=draft_table)
-                            for g, c in zip(geoms, closed, strict=True)])
-    data = _data_doc(cal, geoms, errs, terms, k)
+    fit = [(p, g, c) for p, g, c in zip(points, geoms, closed, strict=True) if p["set"] == "fit"]
+    terms = fit_offset([x for x in fit if x[0]["cause"] == fb.OFFSET])
+    coef = fit_masked([x for x in fit if x[0]["cause"] == fb.MASKED])
+    draft = _draft_table(cal, geoms, terms, coef)
+    errs = _errors(points, [fb.correct(g, c, table=draft) for g, c in zip(geoms, closed,
+                                                                           strict=True)],
+                   geoms, draft)
+    for p, e in zip(points, errs, strict=True):
+        if p["set"] == "fit" and not e["inside"]:
+            raise ValueError(f"{p['name']}: a fit point outside the calibrated domain")
+    data = _data_doc(cal, geoms, errs, terms, coef)
     table = fb.parse_table(data, source="calibration")
     final = [fb.correct(g, c, table=table) for g, c in zip(geoms, closed, strict=True)]
     for p, f, e in zip(points, final, errs, strict=True):
@@ -580,7 +694,9 @@ def check(data: Mapping[str, Any], fixture: Mapping[str, Any], data_path: Path,
 def report(data: Mapping[str, Any]) -> str:
     out = []
     for cause, entry in data["causes"].items():
-        out.append(f"{cause}: est_error_pct {entry['est_error_pct']}")
+        out.append(f"{cause}: est_error_pct {entry['est_error_pct']}"
+                   + (f", z_even {entry['z_even_error_pct']}" if "z_even_error_pct" in entry
+                      else ""))
         for part in ("fit", "held_out"):
             if part in entry:
                 out.append(f"  {part}: {entry[part]['points']} points, worst "
@@ -595,17 +711,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--refit", action="store_true", help="refit the committed FD data (no FD)")
     ap.add_argument("--check", action="store_true", help="refit and compare; write nothing")
     ap.add_argument("--grid", default=GRID, choices=("medium", "fine"))
+    ap.add_argument("--jobs", type=int, default=1, help="FD worker processes")
     ap.add_argument("--data", type=Path, default=DATA_OUT)
     ap.add_argument("--fixture", type=Path, default=FIXTURE_OUT)
     ap.add_argument("--fd-source", type=Path, default=None,
                     help="fixture whose FD values --refit/--check reuse (default: --fixture)")
+    ap.add_argument("--save-fd", type=Path, default=None,
+                    help="also write the raw FD record (an --fd-source) before fitting")
     args = ap.parse_args(argv)
     start = time.perf_counter()
     if args.refit or args.check:
         source = args.fd_source or args.fixture
         cal = fd_points_from_fixture(json.loads(source.read_text(encoding="utf-8")))
     else:
-        cal = run_fd(all_specs(), args.grid)
+        cal = run_fd(all_specs(), args.grid, args.jobs)
+        if args.save_fd:
+            args.save_fd.write_text(json.dumps(cal), encoding="utf-8", newline="\n")
     data, fixture = build_outputs(cal)
     print(report(data))
     if args.check:

@@ -84,13 +84,17 @@ def conn_edges(design: Mapping) -> dict[str, str]:
 
 
 def check_design(design: Mapping) -> None:
-    """BuildError for an unknown "edge", an "at" part that also has x / y / rot,
-    or a malformed "at" or side on an "at" part."""
+    """BuildError for an unknown "edge", a non-boolean board_only / dnp / in_bom, an
+    "at" part that also has x / y / rot, or a malformed "at" or side on an "at" part."""
     for c in design["components"]:
         ref = c.get("ref", "?")
         if c.get("edge") is not None and c["edge"] not in EDGES:
             raise BuildError(f"{ref}: 'edge' must be one of {', '.join(EDGES)} (null = top), "
                              f"got {c['edge']!r}")
+        try:
+            swig_anchor.attr_setters(c)               # D4 flags; the message names the ref
+        except ValueError as e:
+            raise BuildError(str(e)) from e
         if not anchored(c):
             continue
         both = [k for k in ("x", "y", "rot") if c.get(k) is not None]

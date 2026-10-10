@@ -24,6 +24,14 @@ resolves to NO coordinate is an error: the script prints ``{"ok": false,
 sidecar key the symbol itself does not have (a pad id from another KiCad
 version) is honoured but listed in the success result's ``warnings``.
 
+Component flags (ROADMAP_DECISIONS D4; booleans, anything else is a
+ValueError): a ``"board_only": true`` part is on the board only -- it gets no
+symbol (and needs no lib_id), its pads get no label or no_connect flag, and a
+net left with only such pads is not in the schematic; the other pins of its
+nets keep their labels. ``"dnp": true`` writes ``(dnp yes)`` and
+``"in_bom": false`` writes ``(in_bom no)`` on every placement of the part. The
+success result lists the skipped parts under ``board_only`` when there are any.
+
 Usage:
   <venv-python> sch_build.py <netlist.json> <out.kicad_sch> <symbols> [sidecar_dirs]
 
@@ -57,7 +65,8 @@ from symlib import (SYM_ONLY_TAGS, S, SymbolLibError, SymbolSource, dumps,  # no
 __all__ = ["S", "SYM_ONLY_TAGS", "SymbolLibError", "dumps", "embed", "first",
            "flatten", "is_", "kids", "lib_path", "load_lib", "pin_etypes", "pin_numbers",
            "pin_offsets", "unit_pins", "uid", "q", "load_sidecars", "default_sidecar_dirs",
-           "read_library_map", "symbol_source", "build", "main"]
+           "read_library_map", "symbol_source", "FLAG_KEYS", "component_flag",
+           "is_board_only", "board_only_refs", "schematic_design", "build", "main"]
 
 # every schematic gets the power library's flag, written (lib_id "power:PWR_FLAG")
 PWR_FLAG_LIB_ID = f"{libtable.POWER_LIBRARY}:PWR_FLAG"
@@ -66,6 +75,8 @@ CENTRAL_PINS_DIR = Path(_HERE).parent / "pins"     # the plugin's sidecars for s
 PROJECT_PINS_DIR = "pins"                           # <netlist dir>/pins: project parts (D1)
 LIBRARY_MAP_SUFFIX = ".json"
 NUL = "\x00"
+# the D4 component flags; each is a boolean when present
+FLAG_KEYS = ("board_only", "dnp", "in_bom")
 
 # One grid cell per (component, unit); origins and spacings are multiples of
 # 1.27 mm so pins land on KiCad's connection grid. PWR_FLAGs go in a column on
@@ -180,6 +191,52 @@ def symbol_source(netlist_path: str, symbols: str) -> SymbolSource:
     return libtable.LibraryResolver.for_netlist(netlist_path, symbols, None)
 
 
+# --- D4 component flags: the design as the schematic sees it -----------------------
+def component_flag(comp: Mapping, key: str) -> bool | None:
+    """A component's D4 flag ``key`` (None when absent). ValueError unless it
+    is a boolean (the board builder refuses the same values)."""
+    value = comp.get(key)
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(f"{comp.get('ref', '?')}: '{key}' must be true or false, "
+                         f"got {value!r}")
+    return value
+
+
+def is_board_only(comp: Mapping) -> bool:
+    """``"board_only": true``: on the board, not in the schematic (D4)."""
+    return component_flag(comp, "board_only") is True
+
+
+def board_only_refs(design: Mapping) -> list[str]:
+    """The references of the board-only components, in netlist order."""
+    return [c["ref"] for c in design["components"] if is_board_only(c)]
+
+
+def schematic_design(design: Mapping) -> dict:
+    """``design`` as the schematic sees it (D4). Every component's flags are
+    checked (ValueError for a non-boolean); board-only components are dropped
+    together with their pads in ``nets`` and ``no_connect`` (a board-only pad
+    never gets a label or a no_connect flag), and so is a net whose every pad
+    was board-only. A new dict: ``design`` itself is not modified. Without
+    board-only parts the result equals ``design``."""
+    for comp in design["components"]:
+        for key in FLAG_KEYS:
+            component_flag(comp, key)
+    dropped = set(board_only_refs(design))
+    if not dropped:
+        return dict(design)
+    nets = {}
+    for net, conns in design.get("nets", {}).items():
+        kept = [[ref, pad] for ref, pad in conns if ref not in dropped]
+        if kept or not conns:
+            nets[net] = kept
+    return {**design,
+            "components": [c for c in design["components"] if c["ref"] not in dropped],
+            "nets": nets,
+            "no_connect": [[ref, pad] for ref, pad in design.get("no_connect", [])
+                           if ref not in dropped]}
+
+
 # --- symbols and the power-flag rule -----------------------------------------------
 @dataclass(frozen=True)
 class _Symbols:
@@ -268,6 +325,15 @@ def _header_lines(root: str, blocks: tuple[str, ...]) -> list[str]:
             '\t(lib_symbols', *blocks, '\t)']
 
 
+def _attribute_lines(c: Mapping) -> list[str]:
+    """The placement's attribute lines: ``in_bom: false`` -> (in_bom no),
+    ``dnp: true`` -> (dnp yes); absent flags keep the defaults."""
+    in_bom = "no" if component_flag(c, "in_bom") is False else "yes"
+    dnp = "yes" if component_flag(c, "dnp") is True else "no"
+    return ['\t\t(exclude_from_sim no)', f'\t\t(in_bom {in_bom})', '\t\t(on_board yes)',
+            f'\t\t(dnp {dnp})']
+
+
 def _instance_lines(c: Mapping, unit: int, xy: tuple[float, float], pins: list,
                     project: str, root: str) -> list[str]:
     """One placement symbol: component ``c``'s ``unit`` at ``xy``."""
@@ -277,7 +343,7 @@ def _instance_lines(c: Mapping, unit: int, xy: tuple[float, float], pins: list,
         f'\t\t(lib_id {q(c["lib_id"])})',
         f'\t\t(at {x} {y} 0)',
         f'\t\t(unit {unit})',
-        '\t\t(exclude_from_sim no)', '\t\t(in_bom yes)', '\t\t(on_board yes)', '\t\t(dnp no)',
+        *_attribute_lines(c),
         f'\t\t(uuid "{uid()}")',
         f'\t\t(property "Reference" {q(c["ref"])} (at {x} {y - 7.62} 0)'
         ' (effects (font (size 1.27 1.27))))',
@@ -402,11 +468,14 @@ def build(netlist_path: str, out_path: str, symbols: SymbolSource,
     """Write ``out_path`` from ``netlist_path``. ``symbols`` is a directory, a
     LibraryResolver or a library map (symlib.lib_path); ``sidecars`` is a list
     of sidecar directories searched in order (a bare str is one directory).
-    Returns {"ok": True, "sch", "components", "nets", "warnings"}, or
-    {"ok": False, "error", "missing_pins"} without writing anything; an
-    unresolvable library raises SymbolLibError."""
+    Returns {"ok": True, "sch", "components", "nets", "warnings"} (counts of
+    what the schematic holds; plus "board_only": [refs] when parts were left
+    to the board), or {"ok": False, "error", "missing_pins"} without writing
+    anything; an unresolvable library raises SymbolLibError, a non-boolean D4
+    flag ValueError."""
     with open(netlist_path, encoding="utf-8") as f:
-        design = json.load(f)
+        netlist = json.load(f)
+    design = schematic_design(netlist)
     root = uid()
     lib_ids = list(dict.fromkeys(c["lib_id"] for c in design["components"]))
     syms = _load_symbols(symbols, lib_ids)
@@ -424,10 +493,12 @@ def build(netlist_path: str, out_path: str, symbols: SymbolSource,
                 "missing_pins": missing}
     lines += pin_lines + _flag_lines(design, flag_nets, root) + list(FOOTER)
     Path(out_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    board_only = board_only_refs(netlist)
     return {"ok": True, "sch": out_path,
             "components": len(design["components"]),
             "nets": len(design.get("nets", {})),
-            "warnings": warnings}
+            "warnings": warnings,
+            **({"board_only": board_only} if board_only else {})}
 
 
 def main(argv: list[str] | None = None) -> int:
