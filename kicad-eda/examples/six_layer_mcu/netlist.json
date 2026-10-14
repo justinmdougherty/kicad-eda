@@ -24,6 +24,22 @@
       "override": "copper_layers"
     },
     {
+      "id": "lines.usb_pair_gap",
+      "topic": "USB 90 ohm pair coupling",
+      "value": "gap 0.15 mm (tightly coupled)",
+      "rationale": "the USB pair is declared with gap 0.15 mm instead of the width-tied default: on JLC06161H-2116 (0.2234 mm of prepreg over the In1.Cu GND plane) the default pair solves to 0.39 mm lines at a 0.39 mm gap, wider than the 0.3 mm pads at 0.5 mm pitch of the USB-C receptacle and the LQFP-48 it lands on, which leaves 0.1575 mm to the neighbouring pad under the 0.2 mm default clearance and makes Freerouting loop without a result; at gap 0.15 mm the FD-verified pair is 0.255 mm wide and lands with 0.22 mm to spare. 0.15 mm is JLCPCB's reference USB pair gap and above its 0.09 mm 6-layer minimum; a neck-down at the pads is the alternative the pipeline does not generate in wave 2a",
+      "confidence": "high",
+      "override": "net_specs.USB_DP.gap"
+    },
+    {
+      "id": "lines.pa0_cpwg",
+      "topic": "PA0 50 ohm line type",
+      "value": "cpwg, ground_gap 0.15 mm, primary In2.Cu, F.Cu for the pad escape",
+      "rationale": "PA0 (the first U1-J3 GPIO) runs primarily on In2.Cu as the dual stripline between the GND and +3V3 planes (0.235 mm, ST-W10) and is allowed on F.Cu only for the pad escape, where it is laid out as a grounded coplanar line (ground gap 0.15 mm, 0.28 mm wide): a plain 50 ohm microstrip on this build is 0.385 mm wide and cannot land on the LQFP-48's 0.3 mm pads at 0.5 mm pitch under the 0.2 mm default clearance (0.1575 mm would be left to the neighbouring pad). In2.Cu is listed first so it is the primary layer: the net class carries the inner width and the F.Cu width travels as the per-layer Freerouting rule (ADR D7.9), which keeps the G4 open-field width check (class width = the primary width) consistent with the wider F.Cu segments. The coplanar ground on F.Cu needs the outer GND pour the post-route unify step adds; 2b's R10 check will judge its presence",
+      "confidence": "med",
+      "override": "net_specs.PA0"
+    },
+    {
       "id": "parts.usb_shield",
       "topic": "USB-C shield legs",
       "value": "no_connect (J1.SHIELD)",
@@ -806,15 +822,18 @@
     "USB_DP": {
       "diff": 90,
       "diff_pair": "USB_DM",
+      "gap": 0.15,
       "layers": [
         "F.Cu"
       ]
     },
     "PA0": {
       "impedance": 50,
+      "line": "cpwg",
+      "ground_gap": 0.15,
       "layers": [
-        "F.Cu",
-        "In2.Cu"
+        "In2.Cu",
+        "F.Cu"
       ]
     }
   },

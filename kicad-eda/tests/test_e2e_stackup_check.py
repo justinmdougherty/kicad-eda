@@ -92,22 +92,31 @@ def test_2l_mixed_is_the_d722_2l_example_with_cpwg_feeds() -> None:
 
 
 def test_six_layer_mcu_is_the_d722_6l_preset_with_usb_and_a_dual_stripline_gpio() -> None:
-    """stm32f103_dev on the JLC06161H-2116 preset: the recorded deviation is the USB-C
-    shield as a no_connect by pin NAME (KiCad 9 keys the legs S1, 10 and 11 SH)."""
+    """stm32f103_dev on the JLC06161H-2116 preset. Recorded deviations: the USB-C shield
+    as a no_connect by pin NAME (KiCad 9 keys the legs S1, 10 and 11 SH); the USB pair
+    at gap 0.15 mm and PA0 as a CPWG (ground gap 0.15 mm, In2.Cu primary), because the
+    width-tied pair (0.39 mm) and a plain microstrip (0.385 mm) are wider than the 0.3 mm
+    pads at 0.5 mm pitch they land on and leave 0.1575 mm to the neighbouring pad under
+    the 0.2 mm clearance: Freerouting then never finishes (no session in 1500 s on 9.0.4
+    and 10.0.5); In2 primary keeps the class width at the narrower inner width."""
     design, base = _example("six_layer_mcu"), _example("stm32f103_dev")
     assert design["stackup"] == _fixture_stackup("d722_6l_2116")
+    assert design["class"] == base["class"] == 3
     assert design["components"] == base["components"]
     assert design["nets"] == {n: [p for p in pins if p != ["J1", "SH"]]
                               for n, pins in base["nets"].items()}
     assert design["no_connect"] == [*base["no_connect"], ["J1", "SHIELD"]]
     specs = design["net_specs"]
-    assert specs["USB_DP"] == {"diff": 90, "diff_pair": "USB_DM", "layers": ["F.Cu"]}
+    assert specs["USB_DP"] == {"diff": 90, "diff_pair": "USB_DM", "gap": 0.15,
+                               "layers": ["F.Cu"]}
     first_gpio = next(n for n, pins in base["nets"].items()
                       if {r for r, _ in pins} == {"U1", "J3"})
     assert first_gpio == "PA0"
-    assert specs["PA0"] == {"impedance": 50, "layers": ["F.Cu", "In2.Cu"]}
+    assert specs["PA0"] == {"impedance": 50, "line": "cpwg", "ground_gap": 0.15,
+                            "layers": ["In2.Cu", "F.Cu"]}   # In2 first = the primary layer
     assert {k: v for k, v in specs.items() if k not in ("USB_DP", "PA0")} == base["net_specs"]
-    assert "parts.usb_shield" in {a["id"] for a in design["assumptions"]}
+    ids = {a["id"] for a in design["assumptions"]}
+    assert {"parts.usb_shield", "lines.usb_pair_gap", "lines.pa0_cpwg"} <= ids
 
 
 def test_hybrid_4l_is_the_d722_hybrid_with_v5_on_in2() -> None:
@@ -432,6 +441,23 @@ def test_run_checks_needs_the_run_files(tmp_path: Path) -> None:
                                            encoding="utf-8")
     with pytest.raises(ck.CheckError, match="pipeline report"):
         ck.run_checks(ck.Args(str(tmp_path), None))
+
+
+def test_read_text_names_the_os_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreadable file is never reported as 'no file': the OS error surfaces."""
+    assert ck._read_text(tmp_path / "none.txt") is None
+    locked = tmp_path / "locked.kicad_dru"
+    locked.write_text("(version 1)\n", encoding="utf-8")
+    assert ck._read_text(locked) == "(version 1)\n"
+
+    def boom(self: Path, *a: Any, **k: Any) -> str:
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(Path, "read_text", boom)
+    with pytest.raises(ck.CheckError, match="Permission denied"):
+        ck._read_text(locked)
+    run = ck.RunFiles(tmp_path, "locked", {}, passing_report(), {}, "")
+    rules = ck._rules_check(run)
+    assert rules["ok"] is False and "Permission denied" in rules["problems"][0]
 
 
 def test_main_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:

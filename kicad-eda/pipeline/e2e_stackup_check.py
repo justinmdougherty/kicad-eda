@@ -524,10 +524,14 @@ def _read_json(path: Path, what: str, required: bool = True) -> dict | None:
 
 
 def _read_text(path: Path) -> str | None:
-    try:
-        return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else None
-    except OSError:
+    """The file's text; None when there is no such file; CheckError naming the
+    reason when it exists but cannot be read (never a silent 'no file')."""
+    if not path.is_file():
         return None
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise CheckError(f"cannot read {path}: {exc}") from exc
 
 
 def load_run(folder: Path) -> RunFiles:
@@ -593,6 +597,16 @@ def _copper_checks(run: RunFiles, exp: Expectation | None) -> dict[str, dict]:
                                     compared=len(refs))}
 
 
+def _rules_check(run: RunFiles) -> dict:
+    """The rules check; an unreadable rules file is a problem naming the OS error."""
+    dru = dw.dru_path_for(run.folder / f"{run.stem}{dw.BOARD_SUFFIX}")
+    try:
+        text = _read_text(dru)
+    except CheckError as exc:
+        return _check([f"the rules file cannot be read: {exc}"], path=str(dru))
+    return _check(rules_problems(run.report, text), path=str(dru))
+
+
 def _copper_count_problems(run: RunFiles, exp: Expectation | None) -> list[str]:
     if exp is None:
         return []
@@ -613,9 +627,7 @@ def run_checks(args: Args) -> dict:
                            expected=list(exp.st_codes) if exp else []),
         "stackup": _check(stackup_problems(run.design, run.artifact, run.board_text)
                           + _copper_count_problems(run, exp), copper=list(roles_of(run.artifact))),
-        "rules": _check(rules_problems(run.report,
-                                       _read_text(dw.dru_path_for(run.folder / f"{run.stem}"
-                                                                  f"{dw.BOARD_SUFFIX}")))),
+        "rules": _rules_check(run),
         "drc": _check(drc_problems(run.report, _read_json(run.folder / f"{run.stem}{DRC_SUFFIX}",
                                                           "DRC report", required=False))),
         **_copper_checks(run, exp), **_fab_checks(run, exp)}
