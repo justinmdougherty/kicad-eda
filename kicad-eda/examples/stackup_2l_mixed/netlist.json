@@ -1,0 +1,148 @@
+{
+  "name": "stackup_2l_mixed",
+  "title": "50-ohm CPWG through-line coupon on a 2-layer FR-4 build (B.Cu mixed GND)",
+  "class": 3,
+  "board": {
+    "w": 40,
+    "h": 25
+  },
+  "copper_layers": 2,
+  "stackup": {
+    "fab": "jlcpcb",
+    "finish": "ENIG",
+    "rationale": "2L: one RF feed, low density",
+    "layers": [
+      {
+        "type": "copper",
+        "oz": 1,
+        "role": "signal"
+      },
+      {
+        "type": "dielectric",
+        "kind": "core",
+        "material": "generic.fr4",
+        "thickness": 1.51,
+        "dk": 4.5
+      },
+      {
+        "type": "copper",
+        "oz": 1,
+        "role": "mixed",
+        "net": "GND"
+      }
+    ]
+  },
+  "assumptions": [
+    {
+      "id": "board.copper_layers",
+      "topic": "copper layer count",
+      "value": 2,
+      "rationale": "2 layers: one coplanar RF feed and two DC blocks on a cheap build; the B.Cu mixed GND pour is the CPWG reference (ADR D7.2.2 2L example). JLCPCB does not control impedance on 2 layers (ST-W3): the CPWG geometry is computed from the 1.51 mm core",
+      "confidence": "high",
+      "override": "copper_layers"
+    },
+    {
+      "id": "parts.dc_block_size",
+      "topic": "DC-block capacitor package",
+      "value": "0603",
+      "rationale": "a 50 ohm CPWG line on a 1.51 mm core is about 0.87 mm wide: on an 0402 (0.96 mm pitch) the RF_IN and RF_MID line ends would sit 0.1 mm apart, under the 0.2 mm coplanar gap; 0603 pads (1.55 mm pitch) take the line with 0.69 mm between the ends",
+      "confidence": "high",
+      "override": "components[C1,C2].footprint"
+    }
+  ],
+  "components": [
+    {
+      "ref": "J1",
+      "lib_id": "Connector:Conn_Coaxial",
+      "value": "SMA_IN",
+      "footprint": "Connector_Coaxial:SMA_Amphenol_132289_EdgeMount"
+    },
+    {
+      "ref": "C1",
+      "lib_id": "Device:C",
+      "value": "100pF",
+      "footprint": "Capacitor_SMD:C_0603_1608Metric"
+    },
+    {
+      "ref": "C2",
+      "lib_id": "Device:C",
+      "value": "100pF",
+      "footprint": "Capacitor_SMD:C_0603_1608Metric"
+    },
+    {
+      "ref": "J2",
+      "lib_id": "Connector:Conn_Coaxial",
+      "value": "SMA_OUT",
+      "footprint": "Connector_Coaxial:SMA_Amphenol_132289_EdgeMount"
+    }
+  ],
+  "nets": {
+    "RF_IN": [
+      [
+        "J1",
+        "1"
+      ],
+      [
+        "C1",
+        "1"
+      ]
+    ],
+    "RF_MID": [
+      [
+        "C1",
+        "2"
+      ],
+      [
+        "C2",
+        "1"
+      ]
+    ],
+    "RF_OUT": [
+      [
+        "C2",
+        "2"
+      ],
+      [
+        "J2",
+        "1"
+      ]
+    ],
+    "GND": [
+      [
+        "J1",
+        "2"
+      ],
+      [
+        "J2",
+        "2"
+      ]
+    ]
+  },
+  "net_specs": {
+    "RF_IN": {
+      "impedance": 50,
+      "line": "cpwg",
+      "ground_gap": 0.2,
+      "layers": [
+        "F.Cu"
+      ]
+    },
+    "RF_MID": {
+      "impedance": 50,
+      "line": "cpwg",
+      "ground_gap": 0.2,
+      "layers": [
+        "F.Cu"
+      ]
+    },
+    "RF_OUT": {
+      "impedance": 50,
+      "line": "cpwg",
+      "ground_gap": 0.2,
+      "layers": [
+        "F.Cu"
+      ]
+    }
+  },
+  "no_connect": []
+}

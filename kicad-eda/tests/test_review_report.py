@@ -122,9 +122,10 @@ def test_buck_review_has_every_d5_section_in_order(buck_report, buck_napkin, buc
     md = rr.render_review(buck_report, buck_decisions, buck_napkin, analysis, buck_sources)
     headings = re.findall(r"^## (.+)$", md, re.M)
     assert tuple(headings) == rr.SECTIONS
-    assert rr.SECTIONS == ("Summary", "Assumptions", "Decisions", "Parts", "Gate verdicts",
-                           "Auto-remediations", "Accepted risks and warnings", "Routing",
-                           "Board file", "Renders", "Fab package", "Open items")
+    assert rr.SECTIONS == ("Summary", "Assumptions", "Decisions", "Parts", "Import / rebuild",
+                           "Gate verdicts", "Auto-remediations", "Accepted risks and warnings",
+                           "Routing", "Stackup and impedance", "Board file", "Renders",
+                           "Fab package", "Mechanical", "Open items")
     assert md.startswith("# Design review: LM2596 12V->5V 3A Buck Regulator\n")
     assert rr.HUMAN_REVIEW not in md                     # 12 V buck: not safety-relevant
     assert md.endswith("\n")
@@ -611,6 +612,106 @@ def test_charger_banner_and_the_re_exported_safety_api(buck_report, buck_design)
     assert rr.safety_warnings(design)[0].startswith(f"{rr.HUMAN_REVIEW}: Li-ion charging: U9")
 
 
+# --- X-03 section hooks: Import / rebuild, Stackup and impedance, Mechanical -------------
+
+MECH_DIR = "/work/netlist_mech"
+MECHANICAL = {"ok": True, "dir": MECH_DIR, "hausdorff_mm": 0.0, "warnings": [],
+              "step": f"{MECH_DIR}/netlist.step", "dxf": f"{MECH_DIR}/netlist_outline.dxf",
+              "datum_cpl": f"{MECH_DIR}/netlist_datum_cpl.csv",
+              "step_bbox": {"x": [-10.0, 50.0], "y": [-10.0, 30.0], "z": [0.0, 1.51]}}
+SOURCE = {"kind": "kicad", "path": "src/buck.kicad_pro", "sha256": "ab" * 32}
+FAITHFUL = {"active": True, "kind": "kicad", "rebuild": "keep",
+            "equivalence": {"G2": {"equal": True, "summary": "5 nets equal", "differences": []},
+                            "G4": {"equal": False, "summary": "1 net differs",
+                                   "differences": ["GND: C4.2 moved to V5"]}}}
+PHYSICS = {"ok": True, "stackup": {
+               "source": "preset", "preset": "jlcpcb:JLC04161H-7628", "fab": "jlcpcb",
+               "copper_layers": 4, "rationale": "4L for a solid GND return",
+               "copper": [{"name": "F.Cu", "role": "signal", "thickness": 0.035},
+                          {"name": "In1.Cu", "role": "plane", "net": "GND"}]},
+           "lines": {"SW": {"kind": "single", "z_target": 50, "layers": {"F.Cu": {
+               "status": "fallback_unverified", "width": 0.3, "line": "microstrip",
+               "accuracy_class": "C", "est_error_pct": 10}}}}}
+
+
+def _d2_report(buck_report: dict, **extra) -> dict:    # a faithful + outline + stackup run
+    return {**buck_report, "faithful": FAITHFUL, "mechanical": MECHANICAL, "physics": PHYSICS,
+            **extra}
+
+
+def _d2_design(buck_design: dict) -> dict:
+    return {**buck_design, "source": SOURCE, "rebuild": "keep",
+            "board": {"w": 60, "h": 40, "datum": [10, 30], "cutouts": [{"circle": [30, 20, 3]}]}}
+
+
+def test_three_hook_sections_render_in_sections_order(buck_report, buck_design):
+    """The acceptance case: a synthetic faithful + outline + stackup report."""
+    md = rr.render_review(_d2_report(buck_report), [], _d2_design(buck_design))
+    headings = re.findall(r"^## (.+)$", md, re.M)
+    assert tuple(headings) == rr.SECTIONS
+    assert headings.index("Parts") + 1 == headings.index("Import / rebuild")
+    assert headings.index("Routing") + 1 == headings.index("Stackup and impedance")
+    assert headings.index("Fab package") + 1 == headings.index("Mechanical")
+    imp = _section(md, "Import / rebuild")
+    assert "- Source: kicad `src/buck.kicad_pro` (sha256 abababababab, tool not recorded)" in imp
+    assert "| G4 | no | 1 net differs | GND: C4.2 moved to V5 |" in imp
+    assert "## Import / rebuild" not in imp              # the module's own heading is not doubled
+    stack = _section(md, "Stackup and impedance")
+    assert "- Build: preset `jlcpcb:JLC04161H-7628` (fab jlcpcb), 4 copper layers" in stack
+    assert "### Impedance" in stack and "**UNVERIFIED** (class C fallback)" in stack
+    mech = _section(md, "Mechanical")
+    assert f"- STEP: `{MECH_DIR}/netlist.step` (board only); bbox x [-10, 50]" in mech
+    assert "Hausdorff 0 mm" in mech and "- Datum: (10, 30) in the board frame" in mech
+    items = _section(md, "Open items")
+    assert "G4: connectivity differs from the source: 1 net differs" in items
+    assert "Confirm the impedance of SW on F.Cu with the fab's field solver" in items
+
+
+def test_hook_sections_say_not_produced_when_the_run_stopped_early(buck_report, buck_design):
+    rep = {"netlist": "/w/netlist.json", "gates": [], "error": "RuntimeError: boom"}
+    md = rr.render_review(rep, [], buck_design)
+    assert tuple(re.findall(r"^## (.+)$", md, re.M)) == rr.SECTIONS
+    assert _section(md, "Import / rebuild").strip() == ""      # no source: [] by contract
+    assert "- Not produced: the run stopped before the physical-design stage (after G2)." in \
+        _section(md, "Stackup and impedance")
+    assert "- Not produced: the run stopped before G5" in _section(md, "Mechanical")
+    legacy = {**buck_report, "mechanical": {"skipped": "rectangular board without datum"}}
+    md = rr.render_review(legacy, [], buck_design)
+    assert "- Not recorded: the pipeline report has no physics section" in \
+        _section(md, "Stackup and impedance")
+    assert _section(md, "Mechanical").strip() == ("- Skipped: rectangular board without datum "
+                                                  "(a legacy board has no Fusion round-trip "
+                                                  "exports; the fab package is unaffected)")
+    assert "- Not recorded: the pipeline report has no mechanical record" in \
+        _section(rr.render_review(buck_report, [], buck_design), "Mechanical")
+    odd = {**buck_report, "faithful": "junk", "mechanical": 5, "physics": {"stackup": "x"}}
+    md = rr.render_review(odd, [], {**buck_design, "source": "not a mapping", "board": "x"})
+    assert tuple(re.findall(r"^## (.+)$", md, re.M)) == rr.SECTIONS
+    assert "- Malformed: " in _section(md, "Mechanical")
+
+
+def test_import_report_is_loaded_beside_the_netlist(tmp_path, buck_report, buck_design):
+    """By the D1 rule: beside the netlist the report names, or beside netlist_path
+    (the CLI passes it); the import's open items join the open-items section."""
+    netlist, design = tmp_path / "netlist.json", _d2_design(buck_design)
+    netlist.write_text(json.dumps(design), encoding="utf-8")
+    (tmp_path / "import_report.json").write_text(json.dumps({
+        "counts": {"components": 10, "nets": 5}, "mismatches": [],
+        "human_steps": [{"id": "hs-1", "action": "export as KiCad", "blocking": True}]}),
+        encoding="utf-8")
+    md = rr.render_review(_d2_report(buck_report, netlist=str(netlist)), [], design)
+    assert "- Counts: components 10, nets 5" in _section(md, "Import / rebuild")
+    assert "Human step: [blocking] hs-1: export as KiCad" in _section(md, "Open items")
+    docker = _d2_report(buck_report, netlist="/work/netlist.json")   # a container path
+    md = rr.render_review(docker, [], design, netlist_path=str(netlist))
+    assert "- Counts: components 10, nets 5" in _section(md, "Import / rebuild")
+    (tmp_path / "netlist_pipeline_report.json").write_text(json.dumps(docker), encoding="utf-8")
+    assert rr.main([str(netlist)]) == 0                                # the CLI passes the path
+    out = (tmp_path / "netlist_review.md").read_text(encoding="utf-8")
+    assert tuple(re.findall(r"^## (.+)$", out, re.M)) == rr.SECTIONS
+    assert "- Counts: components 10, nets 5" in _section(out, "Import / rebuild")
+
+
 # --- files + CLI --------------------------------------------------------------------
 
 def test_review_path():
@@ -686,7 +787,8 @@ def test_module_is_pure():
             imported |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
-    local = {"gates", "decisions", "netlist_schema", "safety_screen"}
+    local = {"gates", "decisions", "netlist_schema", "safety_screen",
+             "import_review", "review_mechanical", "review_stackup"}      # X-03 section hooks
     assert imported - local <= set(sys.stdlib_module_names), imported
 
 

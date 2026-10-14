@@ -3,7 +3,8 @@
   "title": "Outline e2e: LM358 dual buffer + AP2112K on a Fusion 360 outline DXF (60 x 40 r=4 with a stadium slot and a round hole), parts placed in the Fusion frame",
   "board": {
     "outline": {
-      "dxf": "mech/outline.dxf"
+      "dxf": "mech/outline.dxf",
+      "layer": "0"
     }
   },
   "copper_layers": 4,

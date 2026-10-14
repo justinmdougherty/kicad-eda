@@ -210,6 +210,49 @@ offset by the class gap, same layer, via both at the same `t`.
 **7. Zones.** Do not draw copper on a plane layer (`In1.Cu`, `In2.Cu`
 carrying a plane); the planes are zones and `route_check` refills them.
 
+## Layer roles and the managed rules (stackups, ADR D7)
+
+A board built from a netlist that declares a stackup (`stackup`,
+`copper_layers`; `${CLAUDE_PLUGIN_ROOT}/docs/STACKUP.md`) comes with the
+physical-design artifact `<stem>.stackup.json` beside the netlist (and a
+byte-identical `<board stem>.stackup.json` when the board's stem differs) and
+the managed rules file `<board stem>.kicad_dru` beside the board. Read the
+artifact before the first batch; it replaces the 4-layer assumptions above:
+
+- `stackup.copper[*]` gives every layer's `role` and `net`: `plane` layers
+  (one net, a full pour, no foreign copper: rule R8) replace the fixed
+  "In1.Cu = GND, In2.Cu = rail" picture, `mixed` layers pour `net` and may be
+  routed by any net, `signal` layers route, an `unused` layer (single-sided
+  B.Cu) is never touched. `dsn.plane_nets` lists the plane net per layer.
+- `lines[<net>].layers[<layer>]` gives each impedance net its allowed layers,
+  the solved `width` and `width_window` per layer, and `ref` (the reference
+  layers and nets). Route such a net only on those layers, at that layer's
+  width (`route_net(pcb, net, path, width=<layer width>)`), with a
+  return-path via or decoupling capacitor within 2 mm of every layer change
+  whose references differ (R27), and never run another net parallel over a
+  dual stripline for more than 5 mm (R28).
+- The DRU is the guard: every `route_check` DRC reads `<board stem>.kicad_dru`
+  (a KiCad 11 save never rewrites it, and the `X.k9` snapshot copies it), so a
+  foreign track on a plane layer (R8, `kicad_eda_plane_<layer>`), an impedance
+  net off its layers (R7, `kicad_eda_offlayer_<net>_<layer>`) or outside its
+  width window (R6, `kicad_eda_width_<net>_<layer>`) comes back as a
+  `track_width` / `items_not_allowed` violation — fix it like any other, by
+  rip-up and re-route on the right layer at the right width. Keep your own
+  rules outside the `# kicad-eda managed begin` / `end` markers.
+- Never move, rip up or re-lay locked copper: it is a preroute (a width-class
+  power path, an LGA escape, in 2b an RF feed); route around it.
+- Never change the layer set or the stackup through the API (no
+  `set_enabled_layers`, no stackup edits): the stackup is authored in the
+  netlist and spliced by the builder. The API-level guards are wave 3
+  (`board_overview` reporting the stackup and roles, `route_net` refusing
+  foreign copper on plane layers and enforcing the RF mode); until then the
+  managed rules and this text are the guard.
+
+In waves 2a / 2b the harness never hands a board with impedance-controlled
+nets, R27 / R28 role rules or RF chains to this flow (its G4 checks need a
+KiCad 9/10 board; G4 fails instead of handing off), so you meet such boards
+only when a user drives you on them directly.
+
 ## Batch → `route_check` → repair
 
 Read each violation's `items` (two per clearance violation: the offender and

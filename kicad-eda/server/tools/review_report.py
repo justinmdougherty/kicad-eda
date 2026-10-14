@@ -16,14 +16,24 @@ output (DFA line; its findings stand in for a missing G2 verdict).
 without it the column reads "not supplied" (nothing was looked up, which
 is not "unknown": a library that resolved nowhere).
 
+Three sections are rendered by their own modules (X-03): 'Import / rebuild'
+after Parts (import_review: the design's ``source`` block, the import report
+loaded beside the netlist by the D1 path rule, the report's ``faithful``
+record; [] for a design without a source), 'Stackup and impedance' after
+Routing (review_stackup: ``physics``, ``dru``, ``layer_roles``, ``fab.stackup``)
+and 'Mechanical' after Fab package (review_mechanical: ``mechanical``, the
+outline feature's G5 exports). Their open items join the open-items section.
+A renderer whose data the run never produced says so in one line.
+
 Safety-relevant designs (mains / > 50 V, Li-ion charging) open with **HUMAN
 REVIEW REQUIRED**; the screen lives in safety_screen (re-exported here:
 ``detect_safety`` documents every heuristic, ``safety_warnings`` gives the
 G5 warning lines). Every rendered line is one Markdown line: report text
 (gate warnings carry stderr tails) is flattened, so it cannot add headings
-or close a code fence. Pure: stdlib + gates + decisions + safety_screen, no
-KiCad. CLI (regenerates a review from a finished run's files; it resolves
-no libraries, so the parts table says "not supplied"):
+or close a code fence. Pure: stdlib + the section modules above, no KiCad;
+the only file read is the import report of a rebuild. CLI (regenerates a
+review from a finished run's files; it resolves no libraries, so the parts
+table says "not supplied"):
   <python> review_report.py <netlist.json>   -> writes <stem>_review.md
 """
 from __future__ import annotations
@@ -39,13 +49,17 @@ from typing import Any, Callable, Iterable, Mapping, NamedTuple, Sequence
 
 import decisions as dec
 import gates
+import import_review
+import review_mechanical
+import review_stackup
 from safety_screen import (HUMAN_REVIEW, SAFETY_LABELS, SAFETY_LIION, SAFETY_MAINS,  # noqa: F401
                            SafetyFlag, detect_safety, safety_lines, safety_warnings)
 
 SECTIONS: tuple[str, ...] = (
-    "Summary", "Assumptions", "Decisions", "Parts", "Gate verdicts", "Auto-remediations",
-    "Accepted risks and warnings", "Routing", "Board file", "Renders", "Fab package",
-    "Open items")
+    "Summary", "Assumptions", "Decisions", "Parts", import_review.SECTION_TITLE,
+    "Gate verdicts", "Auto-remediations", "Accepted risks and warnings", "Routing",
+    review_stackup.SECTION_TITLE, "Board file", "Renders", "Fab package",
+    review_mechanical.SECTION_TITLE, "Open items")
 GATE_ORDER: tuple[str, ...] = ("G1", "G2", "G3", "G4", "G5")
 GATE_KEYS: tuple[str, ...] = ("gate", "name", "feeds", "passed", "blockers", "warnings")
 LIBRARY_SOURCES: tuple[str, ...] = ("stock", "project", "generated", "unknown")
@@ -232,6 +246,7 @@ class _Review(NamedTuple):
     sources: dict[str, dict[str, str]] | None
     flags: list[SafetyFlag]
     netlist: str
+    import_report: Mapping | None = None      # import_review.load_import_report (X-03)
 
 
 def _decision_split(entries: Any, extra_errors: Sequence[str]) -> tuple[list[dict], list[str]]:
@@ -397,6 +412,23 @@ def _parts(r: _Review) -> list[str]:
         lines.append(f"DFA: {dfa.get('placements')} placements, "
                      f"{dfa.get('unique_line_items')} unique line items.")
     return lines
+
+
+def _import_section(r: _Review) -> list[str]:
+    """import_review's section without its own heading (render_review adds
+    the SECTIONS one); [] for a design without a source, by its contract."""
+    lines = import_review.render_import_section(r.report, r.design, r.import_report)
+    if lines[:1] == [import_review.HEADING]:
+        lines = lines[1:]
+    return lines[1:] if lines[:1] == [""] else lines
+
+
+def _stackup(r: _Review) -> list[str]:
+    return review_stackup.render(r)
+
+
+def _mechanical(r: _Review) -> list[str]:
+    return review_mechanical.render(r.report, r.design)
 
 
 def _gate_verdicts(r: _Review) -> list[str]:
@@ -626,31 +658,39 @@ def _open_items(r: _Review) -> list[str]:
         if r.report.get(key):
             items.append(f"{what}: {_flat(r.report[key])}")
     items += _analysis_open_items(r) + _confirm_items(r) + _supply_items(r)
+    items += import_review.open_items(r.report, r.design, r.import_report)
+    items += review_stackup.open_items(r)
     return [f"{i}. {_flat(item)}" for i, item in enumerate(items, 1)] or ["- None."]
 
 
 _RENDERERS: tuple[Callable[[_Review], list[str]], ...] = (
-    _summary, _assumptions, _decisions, _parts, _gate_verdicts, _remediations, _risks,
-    _routing, _board_file, _renders, _fab, _open_items)
+    _summary, _assumptions, _decisions, _parts, _import_section, _gate_verdicts, _remediations,
+    _risks, _routing, _stackup, _board_file, _renders, _fab, _mechanical, _open_items)
 
 
 def render_review(pipeline_report: Mapping, decisions: Sequence[Mapping], design: Mapping,
                   analysis: Mapping | None = None,
                   library_sources: Mapping[str, Any] | None = None, *,
-                  decision_errors: Sequence[str] = ()) -> str:
+                  decision_errors: Sequence[str] = (),
+                  netlist_path: str | os.PathLike | None = None) -> str:
     """The ``<stem>_review.md`` Markdown for one run (see the module doc for
     the inputs). Never mutates its inputs. Malformed decision entries and
     ``decision_errors`` (decisions.load_decisions().errors) become open items
     rather than errors; a report that is not a pipeline report, a design that
-    is not an object, or an invalid library source raises ValueError."""
+    is not an object, or an invalid library source raises ValueError. A
+    rebuild's import report is loaded beside ``netlist_path`` (default: the
+    netlist the report names); an unreadable one is an open item."""
     gate_list = _check_report(pipeline_report)
     if not isinstance(design, Mapping):
         raise ValueError(f"the design must be the netlist JSON object, got {type(design).__name__}")
     good, bad = _decision_split(decisions, decision_errors)
     sources = (None if library_sources is None else
                {str(ref): _part_sources(str(ref), v) for ref, v in library_sources.items()})
+    netlist = str(pipeline_report.get("netlist") or "")
+    where = os.fspath(netlist_path) if netlist_path is not None else netlist
     review = _Review(pipeline_report, gate_list, design, analysis, good, bad, sources,
-                     detect_safety(design), str(pipeline_report.get("netlist") or ""))
+                     detect_safety(design), netlist,
+                     import_review.load_import_report(design, where or None))
     title = _flat(design.get("title") or design.get("name") or _basename(_stem(review.netlist)))
     lines = _banner(review) + [f"# Design review: {title or '(untitled)'}"]
     for heading, render in zip(SECTIONS, _RENDERERS):
@@ -689,7 +729,8 @@ def main(argv: list[str] | None = None) -> int:
         log = dec.load_decisions(netlist)
         out = write_review(netlist, render_review(report, list(log.entries),
                                                   _read_json(netlist, "netlist"),
-                                                  decision_errors=log.errors))
+                                                  decision_errors=log.errors,
+                                                  netlist_path=netlist))
     except (OSError, ValueError) as e:
         print(f"review_report: {e}", file=sys.stderr)
         return 1

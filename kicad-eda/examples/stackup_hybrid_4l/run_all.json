@@ -1,0 +1,8 @@
+{
+  "w": 35,
+  "h": 30,
+  "expect": "PASS",
+  "post_checks": [
+    {"script": "pipeline/e2e_stackup_check.py", "python": "venv", "args": ["{dir}"]}
+  ]
+}

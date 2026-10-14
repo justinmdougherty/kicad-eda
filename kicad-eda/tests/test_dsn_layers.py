@@ -31,6 +31,8 @@ import pytest
 import dsn_canon
 import dsn_layers as dl
 import dsn_sexpr as ds
+import outline as ol
+import swig_export_dsn as sed
 
 HERE = Path(__file__).resolve().parent
 FIX = HERE / "fixtures" / "dsn_layers"
@@ -505,3 +507,76 @@ def test_module_is_stdlib_py311_small_and_regex_free() -> None:
         assert fn.returns is not None, fn.name
         args = [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]
         assert all(a.annotation is not None for a in args if a.arg != "self"), fn.name
+
+
+# ----------------------------------------------------------------------------
+# the swig_export_dsn.py argv[3] hook (the policy applied in KiCad's python)
+# ----------------------------------------------------------------------------
+class _FakePcbnew:
+    """A pcbnew stand-in whose ExportSpecctraDSN writes a fixed DSN text."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def ExportSpecctraDSN(self, board: object, path: str) -> bool:  # noqa: N802 (pcbnew API)
+        Path(path).write_bytes(self.text.encode("utf-8"))
+        return True
+
+
+@pytest.fixture
+def export_with(monkeypatch, tmp_path: Path, capsys):
+    """export_with(*argv_tail) -> (rc, JSON line, dsn path, raw text): main()
+    on a fake rectangular board whose KiCad export is the cp2102n fixture
+    (CRLF, as KiCad writes it on Windows)."""
+    raw = fixture("cp2102n", "\r\n")
+    monkeypatch.setattr(sed, "pcbnew", _FakePcbnew(raw))
+    monkeypatch.setattr(sed.bo, "load_board", lambda path: object())
+    monkeypatch.setattr(sed.bo, "outline_from_board",
+                        lambda b: (ol.from_board_block({"w": 50, "h": 50}), (100.0, 80.0)))
+
+    def run(*extra: str) -> tuple[int, dict, Path, str]:
+        dsn = tmp_path / "board.dsn"
+        rc = sed.main([str(tmp_path / "board.kicad_pcb"), str(dsn), *extra])
+        lines = [x for x in capsys.readouterr().out.splitlines() if x.strip()]
+        assert len(lines) == 1, lines
+        return rc, json.loads(lines[0]), dsn, raw
+    return run
+
+
+def test_export_without_argv3_is_unchanged(export_with) -> None:
+    rc, res, dsn, raw = export_with()
+    assert rc == 0 and dsn.read_bytes() == raw.encode("utf-8") and "dsn_policy" not in res
+
+
+def test_export_with_an_artifact_applies_the_layer_policy(export_with, tmp_path: Path) -> None:
+    art = tmp_path / "board.stackup.json"
+    art.write_text(json.dumps({"schema": "kicad-eda/physical@1", "dsn": POLICY_4L}),
+                   encoding="utf-8")
+    rc, res, dsn, raw = export_with(str(art))
+    want, report = dl.postprocess(raw, POLICY_4L)
+    assert rc == 0 and dsn.read_bytes() == want.encode("utf-8")
+    assert res["dsn_policy"] == json.loads(json.dumps(report))
+    assert res["dsn_policy"]["nets_moved"] == {"+3V3": "kicad_eda_plane_+3V3",
+                                               "GND": "kicad_eda_plane_GND"}
+
+
+def test_a_bad_policy_fails_and_removes_the_dsn(export_with, tmp_path: Path) -> None:
+    stale = tmp_path / "stale.json"
+    stale.write_text(json.dumps({**POLICY_4L, "signal_layers": ["F.Cu", "In3.Cu", "B.Cu"]}),
+                     encoding="utf-8")
+    rc, res, dsn, _raw = export_with(str(stale))
+    assert rc == 1 and res["stage"] == "dsn_policy" and "In3.Cu" in res["error"]
+    assert res["dsn_removed"] is True and not dsn.exists()
+
+
+def test_a_missing_policy_file_fails_and_removes_the_dsn(export_with, tmp_path: Path) -> None:
+    rc, res, dsn, _raw = export_with(str(tmp_path / "absent.stackup.json"))
+    assert rc == 1 and res["stage"] == "dsn_policy" and res["dsn_removed"] is True
+    assert not dsn.exists()
+
+
+def test_argv3_may_not_be_the_board_or_the_dsn(tmp_path: Path, capsys) -> None:
+    pcb, dsn = tmp_path / "b.kicad_pcb", tmp_path / "b.dsn"
+    for third in (pcb, dsn):
+        assert sed.main([str(pcb), str(dsn), str(third)]) == 2
+        assert json.loads(capsys.readouterr().out)["stage"] == "usage"
